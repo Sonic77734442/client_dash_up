@@ -1,0 +1,26 @@
+[
+  {
+    "id": "meta:act_1",
+    "client_id": "11111111-1111-1111-1111-111111111111",
+    "platform": "meta",
+    "external_id": "1234567890",
+    "name": "Meta Main",
+    "currency": "USD"
+  },
+  {
+    "id": "google:main",
+    "client_id": "11111111-1111-1111-1111-111111111111",
+    "platform": "google",
+    "external_id": "1234567890",
+    "name": "Google Main",
+    "currency": "USD"
+  },
+  {
+    "id": "tiktok:main",
+    "client_id": "11111111-1111-1111-1111-111111111111",
+    "platform": "tiktok",
+    "external_id": "987654321",
+    "name": "TikTok Main",
+    "currency": "USD"
+  }
+]

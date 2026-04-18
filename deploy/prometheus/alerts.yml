@@ -1,0 +1,57 @@
+groups:
+  - name: envidicy-api-alerts
+    rules:
+      - alert: EnvidicyApiDown
+        expr: up{job="envidicy_api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Envidicy API target is down"
+          description: "Prometheus cannot scrape envidicy_api for more than 2 minutes."
+
+      - alert: EnvidicyHigh5xxRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+          ) > 0.02
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "High 5xx error ratio"
+          description: "5xx ratio > 2% over last 5m."
+
+      - alert: EnvidicyHighLatencyAvg
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_sum[5m]))
+            /
+            clamp_min(sum(rate(http_request_duration_seconds_count[5m])), 0.001)
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: medium
+        annotations:
+          summary: "Average request latency is high"
+          description: "Average latency > 1s over last 10m."
+
+      - alert: EnvidicySyncRunFailureSpike
+        expr: sum(rate(http_requests_total{path="/ad-accounts/sync/run",status=~"5.."}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          summary: "Sync run failures detected"
+          description: "Server-side failures on /ad-accounts/sync/run are elevated."
+
+      - alert: EnvidicyReadinessFailing
+        expr: sum(rate(http_requests_total{path="/readyz",status="503"}[5m])) > 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Readiness endpoint failing"
+          description: "Readiness returned 503 in the last 5 minutes."

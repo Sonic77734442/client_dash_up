@@ -1,0 +1,371 @@
+{
+  "status": "ok",
+  "db_path": "storage/budgets.db",
+  "users": {
+    "admin": {
+      "id": "8b385442-ae15-45d1-a0dd-c9d03258ed4c",
+      "email": "admin@demo.local",
+      "name": "Demo Admin",
+      "role": "admin",
+      "status": "active",
+      "created_at": "2026-04-18T16:24:42.071759",
+      "updated_at": "2026-04-18T16:24:42.071759"
+    },
+    "agency": {
+      "id": "d5bc8b73-8b94-4542-ba0a-1ad6c526e91d",
+      "email": "agency@demo.local",
+      "name": "Demo Agency",
+      "role": "agency",
+      "status": "active",
+      "created_at": "2026-04-18T16:24:42.079314",
+      "updated_at": "2026-04-18T16:24:42.079314"
+    },
+    "client": {
+      "id": "ef58abfc-10a1-41c6-91e5-2ae43cad3d94",
+      "email": "client@demo.local",
+      "name": "Demo Client User",
+      "role": "client",
+      "status": "active",
+      "created_at": "2026-04-18T16:24:42.085452",
+      "updated_at": "2026-04-18T16:24:42.085452"
+    }
+  },
+  "agencies": [
+    {
+      "id": "7d0e29ed-f144-4a19-95d8-1c550a720ff6",
+      "name": "Demo Growth Agency",
+      "slug": "demo-growth",
+      "status": "active",
+      "plan": "starter",
+      "notes": null,
+      "created_at": "2026-04-18T16:24:42.133813",
+      "updated_at": "2026-04-18T16:24:42.133813"
+    }
+  ],
+  "clients": [
+    {
+      "id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+      "name": "Acme Travel",
+      "legal_name": null,
+      "status": "active",
+      "default_currency": "USD",
+      "timezone": "UTC",
+      "notes": null,
+      "created_at": "2026-04-18T16:24:42.114247",
+      "updated_at": "2026-04-18T16:24:42.114247"
+    },
+    {
+      "id": "46945d3f-96ab-424c-b156-ab97ac72b309",
+      "name": "Nova Fitness",
+      "legal_name": null,
+      "status": "active",
+      "default_currency": "USD",
+      "timezone": "UTC",
+      "notes": null,
+      "created_at": "2026-04-18T16:24:42.122855",
+      "updated_at": "2026-04-18T16:24:42.122855"
+    }
+  ],
+  "ad_accounts": [
+    {
+      "id": "2b74e1d3-9a48-4110-b42f-3214bd2a6809",
+      "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+      "platform": "meta",
+      "external_account_id": "demo-meta-acme",
+      "name": "Acme Meta",
+      "currency": "USD",
+      "timezone": null,
+      "status": "active",
+      "metadata": null,
+      "last_sync_at": null,
+      "sync_status": null,
+      "sync_error": null,
+      "sync_error_code": null,
+      "sync_error_category": null,
+      "sync_retryable": null,
+      "sync_next_retry_at": null,
+      "created_at": "2026-04-18T16:24:42.190585",
+      "updated_at": "2026-04-18T16:24:42.190585"
+    },
+    {
+      "id": "ee18c912-dde9-47d9-9901-42aeff3376ad",
+      "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+      "platform": "google",
+      "external_account_id": "demo-google-acme",
+      "name": "Acme Google",
+      "currency": "USD",
+      "timezone": null,
+      "status": "active",
+      "metadata": null,
+      "last_sync_at": null,
+      "sync_status": null,
+      "sync_error": null,
+      "sync_error_code": null,
+      "sync_error_category": null,
+      "sync_retryable": null,
+      "sync_next_retry_at": null,
+      "created_at": "2026-04-18T16:24:42.201707",
+      "updated_at": "2026-04-18T16:24:42.201707"
+    },
+    {
+      "id": "f2bf4151-180f-4d19-9dee-2563f3654b71",
+      "client_id": "46945d3f-96ab-424c-b156-ab97ac72b309",
+      "platform": "tiktok",
+      "external_account_id": "demo-tiktok-nova",
+      "name": "Nova TikTok",
+      "currency": "USD",
+      "timezone": null,
+      "status": "active",
+      "metadata": null,
+      "last_sync_at": null,
+      "sync_status": null,
+      "sync_error": null,
+      "sync_error_code": null,
+      "sync_error_category": null,
+      "sync_retryable": null,
+      "sync_next_retry_at": null,
+      "created_at": "2026-04-18T16:24:42.213155",
+      "updated_at": "2026-04-18T16:24:42.213155"
+    }
+  ],
+  "budgets": [
+    {
+      "id": "b0f21199-f3fc-45f2-8790-f2e4ed704560",
+      "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+      "scope": "client",
+      "account_id": null,
+      "amount": "2500",
+      "currency": "USD",
+      "period_type": "monthly",
+      "start_date": "2026-04-01",
+      "end_date": "2026-04-30",
+      "status": "active",
+      "version": 1,
+      "note": "Acme monthly budget",
+      "created_by": null,
+      "created_at": "2026-04-18T16:24:42.229478",
+      "updated_at": "2026-04-18T16:24:42.229478"
+    },
+    {
+      "id": "4f834dd9-96d9-4113-a126-4d7aa426970f",
+      "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+      "scope": "account",
+      "account_id": "2b74e1d3-9a48-4110-b42f-3214bd2a6809",
+      "amount": "1200",
+      "currency": "USD",
+      "period_type": "monthly",
+      "start_date": "2026-04-01",
+      "end_date": "2026-04-30",
+      "status": "active",
+      "version": 1,
+      "note": "Acme Meta budget",
+      "created_by": null,
+      "created_at": "2026-04-18T16:24:42.240766",
+      "updated_at": "2026-04-18T16:24:42.240766"
+    }
+  ],
+  "sessions": {
+    "admin_token": "0AJxfvJv2MELCylA0znDDo0vP8GlkvSDLJb0WChC3leXvEYY",
+    "agency_token": "cycbN9EM4Hlay4HIGBZaWpb4Z7gJVo4vuIQbL369KmJtg9PI"
+  },
+  "samples": {
+    "insights_overview_client_a": {
+      "range": {
+        "date_from": "2026-04-01",
+        "date_to": "2026-04-30",
+        "as_of_date": "2026-04-15",
+        "timezone_policy": "UTC calendar dates, inclusive period day-count (start/end included)."
+      },
+      "scope": {
+        "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+        "account_id": null
+      },
+      "spend_summary": {
+        "spend": 730.0,
+        "impressions": 17000,
+        "clicks": 1400,
+        "conversions": 60.0,
+        "ctr": 0.08,
+        "cpc": 0.52,
+        "cpm": 42.94
+      },
+      "budget_summary": {
+        "budget": 2500.0,
+        "spend": 730.0,
+        "remaining": 1770.0,
+        "usage_percent": 29.2,
+        "expected_spend_to_date": 1250.0,
+        "forecast_spend": 1460.0,
+        "pace_status": "underspending",
+        "pace_delta": -520.0,
+        "pace_delta_percent": -41.6,
+        "budget_source": "client",
+        "budget_id": "b0f21199-f3fc-45f2-8790-f2e4ed704560"
+      },
+      "breakdowns": {
+        "platforms": [
+          {
+            "platform": "google",
+            "spend": 310.0,
+            "impressions": 7000,
+            "clicks": 500,
+            "conversions": 28.0,
+            "ctr": 0.07,
+            "cpc": 0.62,
+            "cpm": 44.29
+          },
+          {
+            "platform": "meta",
+            "spend": 420.0,
+            "impressions": 10000,
+            "clicks": 900,
+            "conversions": 32.0,
+            "ctr": 0.09,
+            "cpc": 0.47,
+            "cpm": 42.0
+          }
+        ],
+        "accounts": [
+          {
+            "account_id": "2b74e1d3-9a48-4110-b42f-3214bd2a6809",
+            "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+            "name": "Acme Meta",
+            "platform": "meta",
+            "spend": 420.0,
+            "impressions": 10000,
+            "clicks": 900,
+            "conversions": 32.0,
+            "ctr": 0.09,
+            "cpc": 0.47,
+            "cpm": 42.0
+          },
+          {
+            "account_id": "ee18c912-dde9-47d9-9901-42aeff3376ad",
+            "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+            "name": "Acme Google",
+            "platform": "google",
+            "spend": 310.0,
+            "impressions": 7000,
+            "clicks": 500,
+            "conversions": 28.0,
+            "ctr": 0.07,
+            "cpc": 0.62,
+            "cpm": 44.29
+          }
+        ]
+      }
+    },
+    "agency_overview": {
+      "range": {
+        "date_from": "2026-04-01",
+        "date_to": "2026-04-30",
+        "as_of_date": "2026-04-18",
+        "timezone_policy": "UTC calendar dates, inclusive period day-count (start/end included)."
+      },
+      "totals": {
+        "spend": 1240.0,
+        "impressions": 32000,
+        "clicks": 2500,
+        "conversions": 100.0,
+        "ctr": 0.08,
+        "cpc": 0.5,
+        "cpm": 38.75
+      },
+      "per_platform": [
+        {
+          "platform": "google",
+          "spend": 310.0,
+          "impressions": 7000,
+          "clicks": 500,
+          "conversions": 28.0,
+          "ctr": 0.07,
+          "cpc": 0.62,
+          "cpm": 44.29
+        },
+        {
+          "platform": "meta",
+          "spend": 420.0,
+          "impressions": 10000,
+          "clicks": 900,
+          "conversions": 32.0,
+          "ctr": 0.09,
+          "cpc": 0.47,
+          "cpm": 42.0
+        },
+        {
+          "platform": "tiktok",
+          "spend": 510.0,
+          "impressions": 15000,
+          "clicks": 1100,
+          "conversions": 40.0,
+          "ctr": 0.07,
+          "cpc": 0.46,
+          "cpm": 34.0
+        }
+      ],
+      "per_client": [
+        {
+          "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+          "spend": 730.0,
+          "impressions": 17000,
+          "clicks": 1400,
+          "conversions": 60.0,
+          "ctr": 0.08,
+          "cpc": 0.52,
+          "cpm": 42.94
+        },
+        {
+          "client_id": "46945d3f-96ab-424c-b156-ab97ac72b309",
+          "spend": 510.0,
+          "impressions": 15000,
+          "clicks": 1100,
+          "conversions": 40.0,
+          "ctr": 0.07,
+          "cpc": 0.46,
+          "cpm": 34.0
+        }
+      ],
+      "per_account": [
+        {
+          "account_id": "2b74e1d3-9a48-4110-b42f-3214bd2a6809",
+          "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+          "name": "Acme Meta",
+          "platform": "meta",
+          "spend": 420.0,
+          "impressions": 10000,
+          "clicks": 900,
+          "conversions": 32.0,
+          "ctr": 0.09,
+          "cpc": 0.47,
+          "cpm": 42.0
+        },
+        {
+          "account_id": "ee18c912-dde9-47d9-9901-42aeff3376ad",
+          "client_id": "2cdf36dd-da38-4009-aa17-67372d4f36ea",
+          "name": "Acme Google",
+          "platform": "google",
+          "spend": 310.0,
+          "impressions": 7000,
+          "clicks": 500,
+          "conversions": 28.0,
+          "ctr": 0.07,
+          "cpc": 0.62,
+          "cpm": 44.29
+        },
+        {
+          "account_id": "f2bf4151-180f-4d19-9dee-2563f3654b71",
+          "client_id": "46945d3f-96ab-424c-b156-ab97ac72b309",
+          "name": "Nova TikTok",
+          "platform": "tiktok",
+          "spend": 510.0,
+          "impressions": 15000,
+          "clicks": 1100,
+          "conversions": 40.0,
+          "ctr": 0.07,
+          "cpc": 0.46,
+          "cpm": 34.0
+        }
+      ]
+    }
+  }
+}
