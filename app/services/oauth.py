@@ -140,7 +140,9 @@ class FacebookOAuthAdapter:
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "state": state,
-            "scope": "email,public_profile",
+            # Keep FB login scope minimal for broader app-mode compatibility.
+            # Some app setups reject `email` until additional configuration/review.
+            "scope": "public_profile",
             "response_type": "code",
         }
         return f"https://www.facebook.com/v19.0/dialog/oauth?{urlencode(params)}"
