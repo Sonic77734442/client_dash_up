@@ -135,6 +135,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Allow Vercel preview/production domains without enumerating each one.
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
 )
 
 

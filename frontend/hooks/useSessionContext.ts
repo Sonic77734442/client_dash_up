@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { SessionContext } from "../lib/types";
+import { AuthMeResponse, SessionContext } from "../lib/types";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
@@ -14,24 +14,19 @@ export function useSessionContext() {
     try {
       const apiBase = localStorage.getItem("ops_api_base") || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
       const token = localStorage.getItem("ops_session_token") || "";
-      if (!token) {
-        setContext(null);
-        return;
-      }
-      const res = await fetch(`${apiBase.replace(/\/$/, "")}/auth/internal/facade/sessions/context`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ token }),
+      const headers: HeadersInit = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const res = await fetch(`${apiBase.replace(/\/$/, "")}/auth/me`, {
+        method: "GET",
+        headers,
+        credentials: "include",
       });
       if (!res.ok) {
         setContext(null);
         return;
       }
-      const body = (await res.json()) as SessionContext;
-      setContext(body);
+      const body = (await res.json()) as AuthMeResponse;
+      setContext(body.session || null);
     } catch {
       setContext(null);
     } finally {
