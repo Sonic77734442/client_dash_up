@@ -34,6 +34,14 @@ function providerStatusClass(status: IntegrationProvider["status"]) {
   return "bad";
 }
 
+function asSyncPlatform(provider: string): "meta" | "google" | "tiktok" | null {
+  const p = (provider || "").toLowerCase().trim();
+  if (p === "meta" || p === "facebook") return "meta";
+  if (p === "google" || p === "google_ads") return "google";
+  if (p === "tiktok" || p === "tt") return "tiktok";
+  return null;
+}
+
 function safeErrorMessage(raw?: string | null) {
   const msg = String(raw || "").toLowerCase();
   if (!msg) return "";
@@ -68,6 +76,7 @@ export default function SyncMonitorPage() {
   const [status, setStatus] = useState<"all" | "success" | "error">("all");
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState("");
+  const [syncLoading, setSyncLoading] = useState(false);
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -135,22 +144,39 @@ export default function SyncMonitorPage() {
 
   const providerOptions = useMemo(() => ["all", ...Array.from(new Set(jobs.map((j) => j.provider))).sort()], [jobs]);
 
+  function connectProvider(providerName: "google" | "facebook") {
+    const base = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
+    localStorage.setItem("ops_api_base", base);
+    window.location.href = `${base}/auth/${providerName}/start?next=/sync-monitor`;
+  }
+
+  async function runSync(opts?: { platform?: "meta" | "google" | "tiktok"; accountId?: string }) {
+    try {
+      setSyncLoading(true);
+      const payload: Record<string, unknown> = { force: true };
+      if (opts?.platform) payload.platform = opts.platform;
+      if (opts?.accountId) payload.account_ids = [opts.accountId];
+      await req("/ad-accounts/sync/run", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const scope = opts?.accountId ? "account" : opts?.platform || "all providers";
+      push(`Sync queued (${scope})`, "success");
+      await loadData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Sync failed";
+      push(msg, "error");
+    } finally {
+      setSyncLoading(false);
+    }
+  }
+
   async function retrySelected() {
     if (!selected?.ad_account_id) {
       push("Select a sync job first", "info");
       return;
     }
-    try {
-      await req("/ad-accounts/sync/run", {
-        method: "POST",
-        body: JSON.stringify({ account_ids: [selected.ad_account_id] }),
-      });
-      push("Retry queued", "success");
-      await loadData();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Retry failed";
-      push(msg, "error");
-    }
+    await runSync({ accountId: selected.ad_account_id });
   }
 
   const kpis = useMemo(() => {
@@ -214,8 +240,15 @@ export default function SyncMonitorPage() {
 
           <section className="panel" style={{ marginTop: 12 }}>
             <div className="panel-head">
-              <h3 style={{ margin: 0 }}>Provider Connection State</h3>
-              <div className="panel-subtitle">Transparent auth/readiness for Google, Meta, TikTok.</div>
+              <div>
+                <h3 style={{ margin: 0 }}>Provider Connection State</h3>
+                <div className="panel-subtitle">Transparent auth/readiness for Google, Meta, TikTok.</div>
+              </div>
+              <div className="session-controls">
+                <button className="ghost-btn" onClick={() => connectProvider("google")}>Connect Google</button>
+                <button className="ghost-btn" onClick={() => connectProvider("facebook")}>Connect Facebook</button>
+                <button className="primary-btn" onClick={() => void runSync()} disabled={syncLoading}>Sync All</button>
+              </div>
             </div>
             <div className="kpi-grid" style={{ marginTop: 10 }}>
               {(integrations?.providers || []).map((p) => (
@@ -227,6 +260,22 @@ export default function SyncMonitorPage() {
                   </div>
                   <div className="muted-note">
                     Missing: {p.missing_requirements?.length ? p.missing_requirements.join(", ") : "none"}
+                  </div>
+                  <div style={{ marginTop: 8 }}>
+                    <button
+                      className="ghost-btn"
+                      onClick={() => {
+                        const platform = asSyncPlatform(p.provider);
+                        if (!platform) {
+                          push("Provider is not supported for sync run", "info");
+                          return;
+                        }
+                        void runSync({ platform });
+                      }}
+                      disabled={syncLoading}
+                    >
+                      Sync {providerLabel(p.provider)}
+                    </button>
                   </div>
                 </article>
               ))}
