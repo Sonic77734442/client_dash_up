@@ -322,8 +322,7 @@ class SqliteAuthStore:
             if not user or user["status"] != "active":
                 return SessionValidationResponse(valid=False, reason="user_inactive")
 
-            conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now.isoformat(), row["id"]))
-            conn.commit()
+            # Keep validation read-only to reduce write-lock contention on sqlite under concurrent auth checks.
             return SessionValidationResponse(
                 valid=True,
                 reason=None,
