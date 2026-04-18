@@ -16,13 +16,6 @@ export function useAuth(defaultApiBase: string) {
   const refresh = useCallback(async () => {
     const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
     const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
-    if (!token) {
-      setAuthenticated(false);
-      setRole(null);
-      setMe(null);
-      setReady(true);
-      return;
-    }
 
     try {
       const headers: HeadersInit = {};

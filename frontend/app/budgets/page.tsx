@@ -124,6 +124,7 @@ function defaultCreateForm(): BudgetForm {
 
 export default function BudgetsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
 
@@ -186,9 +187,9 @@ export default function BudgetsPage() {
   }, [req, preset, status, clientId]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load budgets"));
-  }, [ready, session.token, loadData]);
+  }, [ready, loadData]);
 
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
@@ -631,35 +632,39 @@ export default function BudgetsPage() {
               <div className="panel-subtitle">Precision tracking for active organizational allocations.</div>
             </div>
             <div className="session-controls">
-              <input
-                type="text"
-                value={session.apiBase}
-                onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                placeholder="API base"
-              />
-              <input
-                type="password"
-                value={session.token}
-                onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                placeholder="Session token"
-              />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
-                  persist(next);
-                  setSession(next);
-                  try {
-                    await loadData();
-                    push("Session saved", "success");
-                  } catch (err) {
-                    setWarning(err instanceof Error ? err.message : "Load failed");
-                  }
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
+              {tokenLoginEnabled ? (
+                <>
+                  <input
+                    type="text"
+                    value={session.apiBase}
+                    onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
+                    placeholder="API base"
+                  />
+                  <input
+                    type="password"
+                    value={session.token}
+                    onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
+                    placeholder="Session token"
+                  />
+                  <button
+                    className="ghost-btn"
+                    onClick={async () => {
+                      const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
+                      persist(next);
+                      setSession(next);
+                      try {
+                        await loadData();
+                        push("Session saved", "success");
+                      } catch (err) {
+                        setWarning(err instanceof Error ? err.message : "Load failed");
+                      }
+                    }}
+                    disabled={!ready}
+                  >
+                    Save
+                  </button>
+                </>
+              ) : null}
               <button className="primary-btn" onClick={openCreateModal}>Create Budget</button>
             </div>
           </header>

@@ -41,6 +41,7 @@ function fmtDate(v?: string) {
 
 export default function ClientsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
 
@@ -70,9 +71,9 @@ export default function ClientsPage() {
   }, [req]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void loadClients().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load clients"));
-  }, [ready, session.token, loadClients]);
+  }, [ready, loadClients]);
 
   const kpis = useMemo(() => {
     const active = items.filter((x) => x.status === "active").length;
@@ -239,35 +240,39 @@ export default function ClientsPage() {
               <div className="panel-subtitle">Manage client entities before account and budget operations.</div>
             </div>
             <div className="session-controls">
-              <input
-                type="text"
-                value={session.apiBase}
-                onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                placeholder="API base"
-              />
-              <input
-                type="password"
-                value={session.token}
-                onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                placeholder="Session token"
-              />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
-                  persist(next);
-                  setSession(next);
-                  try {
-                    await loadClients();
-                    push("Session saved", "success");
-                  } catch (err) {
-                    setWarning(err instanceof Error ? err.message : "Load failed");
-                  }
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
+              {tokenLoginEnabled ? (
+                <>
+                  <input
+                    type="text"
+                    value={session.apiBase}
+                    onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
+                    placeholder="API base"
+                  />
+                  <input
+                    type="password"
+                    value={session.token}
+                    onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
+                    placeholder="Session token"
+                  />
+                  <button
+                    className="ghost-btn"
+                    onClick={async () => {
+                      const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
+                      persist(next);
+                      setSession(next);
+                      try {
+                        await loadClients();
+                        push("Session saved", "success");
+                      } catch (err) {
+                        setWarning(err instanceof Error ? err.message : "Load failed");
+                      }
+                    }}
+                    disabled={!ready}
+                  >
+                    Save
+                  </button>
+                </>
+              ) : null}
               <button className="primary-btn" onClick={openCreate}>Create Client</button>
             </div>
           </header>

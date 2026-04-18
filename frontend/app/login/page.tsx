@@ -11,6 +11,7 @@ export default function LoginPage() {
   const router = useRouter();
   const search = useSearchParams();
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [token, setToken] = useState("");
@@ -93,26 +94,31 @@ export default function LoginPage() {
     <main className="login-shell">
       <section className="login-card">
         <h1>Sign In</h1>
-        <p className="panel-subtitle">Backend-owned session is required to access the platform.</p>
+        <p className="panel-subtitle">Sign in using your connected provider.</p>
 
-        <label>
-          API base
-          <input value={apiBase} onChange={(e) => setApiBase(e.target.value)} placeholder="http://127.0.0.1:8000" />
-        </label>
+        {tokenLoginEnabled ? (
+          <>
+            <div className="login-divider">Internal token login</div>
+            <label>
+              API base
+              <input value={apiBase} onChange={(e) => setApiBase(e.target.value)} placeholder="http://127.0.0.1:8000" />
+            </label>
 
-        <label>
-          Session token
-          <input
-            type="password"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="Paste session token"
-          />
-        </label>
+            <label>
+              Session token
+              <input
+                type="password"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                placeholder="Paste session token"
+              />
+            </label>
 
-        <button className="primary-btn" onClick={() => void signInWithToken()} disabled={loading}>
-          {loading ? "Signing in..." : "Sign In"}
-        </button>
+            <button className="primary-btn" onClick={() => void signInWithToken()} disabled={loading}>
+              {loading ? "Signing in..." : "Sign In"}
+            </button>
+          </>
+        ) : null}
 
         <div className={`warning ${error ? "" : "hidden"}`}>{error}</div>
 
@@ -129,7 +135,7 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        <div className="login-divider">OAuth providers (next step)</div>
+        <div className="login-divider">OAuth providers</div>
         <div className="login-oauth-row">
           <button
             className="ghost-btn"

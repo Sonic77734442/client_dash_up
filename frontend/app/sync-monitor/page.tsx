@@ -54,6 +54,7 @@ function safeErrorMessage(raw?: string | null) {
 
 export default function SyncMonitorPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
 
@@ -87,9 +88,9 @@ export default function SyncMonitorPage() {
   }, [req]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load sync monitor"));
-  }, [ready, session.token, loadData]);
+  }, [ready, loadData]);
 
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
@@ -171,33 +172,35 @@ export default function SyncMonitorPage() {
               <AppTopTabs active="sync_monitor" />
               <div className="topbar-title">Sync Monitor</div>
             </div>
-            <div className="session-controls">
-              <input
-                type="text"
-                value={session.apiBase}
-                onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                placeholder="API base"
-              />
-              <input
-                type="password"
-                value={session.token}
-                onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                placeholder="Session token"
-              />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
-                  persist(next);
-                  setSession(next);
-                  await loadData();
-                  push("Session saved", "success");
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
-            </div>
+            {tokenLoginEnabled ? (
+              <div className="session-controls">
+                <input
+                  type="text"
+                  value={session.apiBase}
+                  onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
+                  placeholder="API base"
+                />
+                <input
+                  type="password"
+                  value={session.token}
+                  onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
+                  placeholder="Session token"
+                />
+                <button
+                  className="ghost-btn"
+                  onClick={async () => {
+                    const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
+                    persist(next);
+                    setSession(next);
+                    await loadData();
+                    push("Session saved", "success");
+                  }}
+                  disabled={!ready}
+                >
+                  Save
+                </button>
+              </div>
+            ) : null}
           </header>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>

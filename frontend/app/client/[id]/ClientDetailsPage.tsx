@@ -40,7 +40,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
   const request = async <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init);
 
   useEffect(() => {
-    if (!ready || !session.token || !clientId) return;
+    if (!ready || !clientId) return;
     const run = async () => {
       try {
         setWarning("");
@@ -63,7 +63,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
       }
     };
     void run();
-  }, [ready, session.token, session.apiBase, clientId, periodDays, listActions]);
+  }, [ready, session.apiBase, clientId, periodDays, listActions]);
 
   const clientBudget = useMemo(() => {
     const rows = (budgets || []).filter((b) => b.scope === "client");

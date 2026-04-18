@@ -6,7 +6,7 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson, getQuery } from "../../lib/api";
-import { AdAccount, Budget, OperationalAction, Overview, SessionContext } from "../../lib/types";
+import { AdAccount, AuthMeResponse, Budget, OperationalAction, Overview, SessionContext } from "../../lib/types";
 
 function fmtMoney(v: number | null | undefined) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(v || 0);
@@ -29,6 +29,7 @@ function dateRange(periodDays: number) {
 
 export default function ClientPortalPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
 
@@ -48,20 +49,15 @@ export default function ClientPortalPage() {
   );
 
   const loadContext = useCallback(async () => {
-    if (!session.token) return null;
-    const payload = await fetchJson<SessionContext>(session.apiBase, "/auth/internal/facade/sessions/context", undefined, {
-      method: "POST",
-      body: JSON.stringify({ token: session.token }),
-      headers: { "Content-Type": "application/json" },
-    });
-    setCtx(payload);
-    return payload;
+    const payload = await fetchJson<AuthMeResponse>(session.apiBase, "/auth/me", session.token);
+    setCtx(payload.session);
+    return payload.session;
   }, [session.apiBase, session.token]);
 
   const loadData = useCallback(async () => {
     const context = (await loadContext()) || ctx;
     if (!context?.valid) {
-      setWarning("Invalid session. Please set valid token and click Save.");
+      setWarning("Invalid or expired session. Please sign in again.");
       return;
     }
     if (context.role !== "client") {
@@ -94,9 +90,9 @@ export default function ClientPortalPage() {
   }, [ctx, loadContext, periodDays, req, selectedClientId]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load portal"));
-  }, [ready, session.token, loadData]);
+  }, [ready, loadData]);
 
   const kpis = useMemo(() => {
     const spend = Number(overview?.spend_summary?.spend || 0);
@@ -130,33 +126,35 @@ export default function ClientPortalPage() {
               <div className="topbar-title">Client Overview</div>
               <div className="panel-subtitle">Read-only performance and budget tracking</div>
             </div>
-            <div className="session-controls">
-              <input
-                type="text"
-                value={session.apiBase}
-                onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                placeholder="API base"
-              />
-              <input
-                type="password"
-                value={session.token}
-                onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                placeholder="Session token"
-              />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
-                  persist(next);
-                  setSession(next);
-                  await loadData();
-                  push("Session saved", "success");
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
-            </div>
+            {tokenLoginEnabled ? (
+              <div className="session-controls">
+                <input
+                  type="text"
+                  value={session.apiBase}
+                  onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
+                  placeholder="API base"
+                />
+                <input
+                  type="password"
+                  value={session.token}
+                  onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
+                  placeholder="Session token"
+                />
+                <button
+                  className="ghost-btn"
+                  onClick={async () => {
+                    const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
+                    persist(next);
+                    setSession(next);
+                    await loadData();
+                    push("Session saved", "success");
+                  }}
+                  disabled={!ready}
+                >
+                  Save
+                </button>
+              </div>
+            ) : null}
           </header>
 
           <section className="filters">

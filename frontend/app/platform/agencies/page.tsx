@@ -13,6 +13,7 @@ import {
   AgencyInviteOut,
   AgencyMemberOut,
   AgencyOut,
+  AuthMeResponse,
   ClientOut,
   SessionContext,
 } from "../../../lib/types";
@@ -34,6 +35,7 @@ function fmtDate(v?: string | null) {
 
 export default function PlatformAgenciesPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
 
@@ -111,21 +113,18 @@ export default function PlatformAgenciesPage() {
   );
 
   const reloadAll = useCallback(async () => {
-    const sessionCtx = await req<SessionContext>("/auth/internal/facade/sessions/context", {
-      method: "POST",
-      body: JSON.stringify({ token: session.token }),
-    });
-    setCtx(sessionCtx);
+    const me = await req<AuthMeResponse>("/auth/me");
+    setCtx(me.session);
 
     await Promise.all([loadRefData(), loadAgencies()]);
-  }, [loadAgencies, loadRefData, req, session.token]);
+  }, [loadAgencies, loadRefData, req]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void reloadAll().catch((err) => {
       setWarning(err instanceof Error ? err.message : "Failed to load platform admin data");
     });
-  }, [ready, session.token, reloadAll]);
+  }, [ready, reloadAll]);
 
   useEffect(() => {
     if (!selectedAgencyId) {
@@ -357,35 +356,39 @@ export default function PlatformAgenciesPage() {
               <div className="panel-subtitle">Provision agencies, attach members, and grant tenant access.</div>
             </div>
             <div className="session-controls">
-              <input
-                type="text"
-                value={session.apiBase}
-                onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                placeholder="API base"
-              />
-              <input
-                type="password"
-                value={session.token}
-                onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                placeholder="Session token"
-              />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
-                  persist(next);
-                  setSession(next);
-                  try {
-                    await reloadAll();
-                    push("Session saved", "success");
-                  } catch (err) {
-                    setWarning(err instanceof Error ? err.message : "Load failed");
-                  }
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
+              {tokenLoginEnabled ? (
+                <>
+                  <input
+                    type="text"
+                    value={session.apiBase}
+                    onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
+                    placeholder="API base"
+                  />
+                  <input
+                    type="password"
+                    value={session.token}
+                    onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
+                    placeholder="Session token"
+                  />
+                  <button
+                    className="ghost-btn"
+                    onClick={async () => {
+                      const next = { apiBase: session.apiBase.trim().replace(/\/$/, "") || defaultApiBase, token: session.token.trim() };
+                      persist(next);
+                      setSession(next);
+                      try {
+                        await reloadAll();
+                        push("Session saved", "success");
+                      } catch (err) {
+                        setWarning(err instanceof Error ? err.message : "Load failed");
+                      }
+                    }}
+                    disabled={!ready}
+                  >
+                    Save
+                  </button>
+                </>
+              ) : null}
               <button className="primary-btn" onClick={() => setCreateOpen(true)} disabled={adminOnly === true}>Create Agency</button>
             </div>
           </header>

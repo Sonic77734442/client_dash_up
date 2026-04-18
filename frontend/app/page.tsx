@@ -75,6 +75,7 @@ function paceClass(status: string) {
 
 export default function HomePage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const router = useRouter();
   const { toasts, push } = useToast();
@@ -93,7 +94,7 @@ export default function HomePage() {
   const [agencyOverview, setAgencyOverview] = useState<AgencyOverview | null>(null);
   const [budgets, setBudgets] = useState<Budget[]>([]);
 
-  const [warning, setWarning] = useState("Set API base and session token, then click Save and Apply Filters.");
+  const [warning, setWarning] = useState("");
 
   const [clientOpsSearch, setClientOpsSearch] = useState("");
   const [clientOpsChip, setClientOpsChip] = useState<"all" | "at_risk" | "overspending" | "no_budget" | "has_alerts">("all");
@@ -153,14 +154,14 @@ export default function HomePage() {
   }, [loadOverviewData, loadClientOpsData]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void loadClients();
-  }, [ready, session.token, loadClients]);
+  }, [ready, loadClients]);
 
   useEffect(() => {
-    if (!ready || !session.token) return;
+    if (!ready) return;
     void refresh();
-  }, [ready, session.token, periodDays, clientId, platform, refresh]);
+  }, [ready, periodDays, clientId, platform, refresh]);
 
   const groupedTimeline = useMemo(() => {
     if (!overview) return [] as TimelinePoint[];
@@ -374,29 +375,31 @@ export default function HomePage() {
                 <button className={`chip-btn ${view === "client_ops" ? "active" : ""}`} onClick={() => setView("client_ops")}>Client Ops Mode</button>
               </div>
             </div>
-            <div className="session-controls">
-              <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base (http://localhost:8000)" />
-              <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
-              <button
-                className="ghost-btn"
-                onClick={async () => {
-                  const apiBase = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
-                  const token = session.token.trim();
-                  const next = { apiBase, token };
-                  persist(next);
-                  setSession(next);
-                  try {
-                    await loadClients();
-                    await refresh();
-                  } catch (err) {
-                    setWarning(err instanceof Error ? err.message : "Save failed");
-                  }
-                }}
-                disabled={!ready}
-              >
-                Save
-              </button>
-            </div>
+            {tokenLoginEnabled ? (
+              <div className="session-controls">
+                <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base (http://localhost:8000)" />
+                <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
+                <button
+                  className="ghost-btn"
+                  onClick={async () => {
+                    const apiBase = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
+                    const token = session.token.trim();
+                    const next = { apiBase, token };
+                    persist(next);
+                    setSession(next);
+                    try {
+                      await loadClients();
+                      await refresh();
+                    } catch (err) {
+                      setWarning(err instanceof Error ? err.message : "Save failed");
+                    }
+                  }}
+                  disabled={!ready}
+                >
+                  Save
+                </button>
+              </div>
+            ) : null}
           </header>
 
           <section className="filters">

@@ -26,9 +26,10 @@ Set API base via env (optional):
 ```bash
 # frontend/.env.local
 NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000
+NEXT_PUBLIC_ENABLE_TOKEN_LOGIN=false
 ```
 
-Or set API base + token in the top session controls in UI and press `Save`.
+`NEXT_PUBLIC_ENABLE_TOKEN_LOGIN=true` enables internal token login controls for local/debug use only.
 
 ## Notes
 
