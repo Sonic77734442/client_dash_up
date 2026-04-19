@@ -9,6 +9,12 @@ def normalize_customer_id(customer_id: str) -> str:
     return "".join(ch for ch in str(customer_id or "") if ch.isdigit())
 
 
+def _api_version() -> str:
+    # Keep explicit API version to avoid accidental calls to sunset versions
+    # on older client libs/deploy images.
+    return (os.getenv("GOOGLE_ADS_API_VERSION", "v18") or "v18").strip()
+
+
 def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
     normalized = normalize_customer_id(str(customer_id or ""))
     if len(normalized) != 10:
@@ -57,8 +63,9 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     try:
         client = ads_client(config_override)
-        customer_service = client.get_service("CustomerService")
-        ga_service = client.get_service("GoogleAdsService")
+        version = _api_version()
+        customer_service = client.get_service("CustomerService", version=version)
+        ga_service = client.get_service("GoogleAdsService", version=version)
         response = customer_service.list_accessible_customers()
         out: List[Dict[str, object]] = []
         seen: set[str] = set()
@@ -145,7 +152,7 @@ def fetch_insights(
     config_override: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, object]], Optional[str]]:
     client = ads_client(config_override)
-    ga_service = client.get_service("GoogleAdsService")
+    ga_service = client.get_service("GoogleAdsService", version=_api_version())
 
     currency = None
     for row in ga_service.search(customer_id=customer_id, query="SELECT customer.currency_code FROM customer LIMIT 1"):
@@ -194,7 +201,7 @@ def fetch_daily(
     config_override: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, object]]:
     client = ads_client(config_override)
-    ga_service = client.get_service("GoogleAdsService")
+    ga_service = client.get_service("GoogleAdsService", version=_api_version())
     queries = [
         f"""
             SELECT
