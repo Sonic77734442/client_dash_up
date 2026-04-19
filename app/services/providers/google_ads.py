@@ -12,7 +12,7 @@ def normalize_customer_id(customer_id: str) -> str:
 def _api_version() -> str:
     # Keep explicit API version to avoid accidental calls to sunset versions
     # on older client libs/deploy images.
-    return (os.getenv("GOOGLE_ADS_API_VERSION", "v18") or "v18").strip()
+    return (os.getenv("GOOGLE_ADS_API_VERSION", "v19") or "v19").strip()
 
 
 def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
