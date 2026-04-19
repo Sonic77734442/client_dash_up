@@ -86,6 +86,8 @@ def test_oauth_callback_issues_internal_session_and_redirects_frontend():
     params = parse_qs(parsed.query)
     next_path = params.get("next", [""])[0]
     assert next_path == "/platform/agencies"
+    fragment = parse_qs(parsed.fragment)
+    assert fragment.get("token", [""])[0] != ""
 
     set_cookie = callback.headers.get("set-cookie", "")
     assert "ops_session=" in set_cookie
