@@ -65,6 +65,15 @@ function safeErrorMessage(raw?: string | null) {
   if (msg.includes("credential") || msg.includes("not set")) {
     return "Provider credentials are missing or incomplete.";
   }
+  if (msg.includes("customer") && msg.includes("not found")) {
+    return "Google account is not accessible in the connected MCC/customer scope.";
+  }
+  if (msg.includes("manager") && msg.includes("hierarchy")) {
+    return "Google account is outside current manager hierarchy. Check MCC access/link.";
+  }
+  if (msg.includes("developer token")) {
+    return "Google developer token is missing/invalid for current credentials.";
+  }
   return "Sync failed. Check provider diagnostics and retry.";
 }
 
@@ -469,6 +478,25 @@ export default function SyncMonitorPage() {
                       <div className="alert-card high" style={{ marginTop: 10 }}>
                         <div className="alert-priority high">ERROR</div>
                         <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>{safeErrorMessage(selected.error_message)}</div>
+                        <div className="muted-note" style={{ marginTop: 8 }}>
+                          code: {selected.error_code || "n/a"} · category: {selected.error_category || "n/a"}
+                        </div>
+                        <div
+                          style={{
+                            marginTop: 8,
+                            padding: 8,
+                            border: "1px solid #f0c9c9",
+                            borderRadius: 6,
+                            background: "#fff7f7",
+                            color: "#8b2525",
+                            fontSize: 12,
+                            lineHeight: 1.4,
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {selected.error_message}
+                        </div>
                       </div>
                     ) : null}
                   </div>
