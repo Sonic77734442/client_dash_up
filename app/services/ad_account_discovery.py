@@ -14,7 +14,7 @@ from app.services.providers import google_ads, meta, tiktok
 
 
 class AccountDiscoverer(Protocol):
-    def __call__(self) -> List[Dict[str, object]]: ...
+    def __call__(self, credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]: ...
 
 
 @dataclass
@@ -71,8 +71,10 @@ class AdAccountDiscoveryService:
         account_store: AdAccountStore,
         *,
         discoverers: Optional[Dict[str, AccountDiscoverer]] = None,
+        credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
     ):
         self.account_store = account_store
+        self.credential_resolver = credential_resolver
         self.discoverers: Dict[str, AccountDiscoverer] = discoverers or {
             "meta": self._discover_meta_accounts,
             "google": self._discover_google_accounts,
@@ -80,9 +82,9 @@ class AdAccountDiscoveryService:
         }
 
     @staticmethod
-    def _discover_meta_accounts() -> List[Dict[str, object]]:
+    def _discover_meta_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
-            rows = meta.list_accounts()
+            rows = meta.list_accounts(credentials)
             if rows:
                 return rows
         except Exception:
@@ -90,9 +92,9 @@ class AdAccountDiscoveryService:
         return _fallback_meta_accounts()
 
     @staticmethod
-    def _discover_google_accounts() -> List[Dict[str, object]]:
+    def _discover_google_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
-            rows = google_ads.list_accounts()
+            rows = google_ads.list_accounts(credentials)
             if rows:
                 return rows
         except Exception:
@@ -100,9 +102,9 @@ class AdAccountDiscoveryService:
         return _fallback_google_accounts()
 
     @staticmethod
-    def _discover_tiktok_accounts() -> List[Dict[str, object]]:
+    def _discover_tiktok_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
-            rows = tiktok.list_accounts()
+            rows = tiktok.list_accounts(credentials)
             if rows:
                 return rows
         except Exception:
@@ -123,6 +125,7 @@ class AdAccountDiscoveryService:
         *,
         provider: Optional[str],
         client_id: UUID,
+        user_id: Optional[UUID] = None,
         upsert_existing: bool = True,
     ) -> DiscoveryResult:
         provider_filter = _normalize_provider(provider)
@@ -151,8 +154,15 @@ class AdAccountDiscoveryService:
             if not discoverer:
                 providers_failed[p] = "Provider discovery not configured"
                 continue
+            provider_credentials: Optional[Dict[str, object]] = None
+            if self.credential_resolver:
+                provider_credentials = self.credential_resolver(p, client_id, user_id)
             try:
-                rows = discoverer() or []
+                try:
+                    rows = discoverer(provider_credentials) or []
+                except TypeError:
+                    # Backward-compatible path for tests/custom discoverers without credentials param.
+                    rows = discoverer() or []
             except Exception as exc:
                 providers_failed[p] = self._safe_provider_error(exc)
                 continue

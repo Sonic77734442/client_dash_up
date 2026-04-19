@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -15,51 +15,98 @@ def _fallback_accounts() -> List[Dict[str, object]]:
     return [{"external_account_id": account_id, "name": f"Meta {account_id}", "currency": "USD", "source": "env"} for account_id in ids]
 
 
-def list_accounts() -> List[Dict[str, object]]:
-    token = os.getenv("META_ACCESS_TOKEN")
+def _access_token(config_override: Optional[Dict[str, Any]] = None) -> str:
+    cfg = config_override or {}
+    return str(cfg.get("access_token") or os.getenv("META_ACCESS_TOKEN") or "").strip()
+
+
+def _business_ids(config_override: Optional[Dict[str, Any]] = None) -> List[str]:
+    cfg = config_override or {}
+    raw_value = cfg.get("business_ids")
+    if isinstance(raw_value, list):
+        return [str(x).strip() for x in raw_value if str(x).strip()]
+    raw = str(raw_value or os.getenv("META_BUSINESS_IDS") or "")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _extract_account_row(row: Dict[str, object], source: str) -> Dict[str, object]:
+    account_id = str(row.get("account_id") or row.get("id") or "").strip().replace("act_", "")
+    return {
+        "external_account_id": account_id,
+        "name": str(row.get("name") or f"Meta {account_id}"),
+        "currency": str(row.get("currency") or "USD"),
+        "source": source,
+    }
+
+
+def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
+    token = _access_token(config_override)
     if not token:
         return _fallback_accounts()
 
-    url = f"https://graph.facebook.com/{API_VERSION}/me/adaccounts"
-    params = {
-        "access_token": token,
-        "fields": "id,account_id,name,currency,account_status",
-        "limit": 200,
-    }
     out: List[Dict[str, object]] = []
-    next_url = url
-    next_params = params
-    while next_url:
-        resp = httpx.get(next_url, params=next_params, timeout=20)
-        if resp.status_code != 200:
-            fallback = _fallback_accounts()
-            if fallback:
-                return fallback
-            raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
-        payload = resp.json()
-        for row in payload.get("data", []):
-            account_id = str(row.get("account_id") or row.get("id") or "").strip()
-            account_id = account_id.replace("act_", "")
-            if not account_id:
-                continue
-            out.append(
-                {
-                    "external_account_id": account_id,
-                    "name": str(row.get("name") or f"Meta {account_id}"),
-                    "currency": str(row.get("currency") or "USD"),
-                    "source": "api",
-                }
-            )
-        paging = payload.get("paging") or {}
-        next_url = paging.get("next")
-        next_params = None
+    seen: set[str] = set()
+
+    def pull(url: str, params: Dict[str, object], source: str) -> None:
+        next_url = url
+        next_params = params
+        while next_url:
+            resp = httpx.get(next_url, params=next_params, timeout=20)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
+            payload = resp.json()
+            for row in payload.get("data", []):
+                parsed = _extract_account_row(row, source)
+                account_id = str(parsed["external_account_id"]).strip()
+                if not account_id or account_id in seen:
+                    continue
+                seen.add(account_id)
+                out.append(parsed)
+            paging = payload.get("paging") or {}
+            next_url = paging.get("next")
+            next_params = None
+
+    try:
+        # Direct user-accessible ad accounts.
+        pull(
+            f"https://graph.facebook.com/{API_VERSION}/me/adaccounts",
+            {
+                "access_token": token,
+                "fields": "id,account_id,name,currency,account_status",
+                "limit": 200,
+            },
+            "api_me",
+        )
+
+        # Business Manager accounts (owned + client/shared).
+        for business_id in _business_ids(config_override):
+            base = f"https://graph.facebook.com/{API_VERSION}/{business_id}"
+            common = {"access_token": token, "fields": "id,account_id,name,currency,account_status", "limit": 200}
+            pull(f"{base}/owned_ad_accounts", common, "api_bm_owned")
+            pull(f"{base}/client_ad_accounts", common, "api_bm_client")
+    except HTTPException:
+        fallback = _fallback_accounts()
+        if fallback:
+            return fallback
+        raise
+    except Exception:
+        fallback = _fallback_accounts()
+        if fallback:
+            return fallback
+        raise HTTPException(status_code=502, detail="Meta account discovery failed")
+
     if out:
         return out
     return _fallback_accounts()
 
 
-def fetch_insights(account_external_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
-    token = os.getenv("META_ACCESS_TOKEN")
+def fetch_insights(
+    account_external_id: str,
+    date_from: str,
+    date_to: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, object]]:
+    token = _access_token(config_override)
     if not token:
         raise HTTPException(status_code=500, detail="META_ACCESS_TOKEN is not set")
 
@@ -77,8 +124,13 @@ def fetch_insights(account_external_id: str, date_from: str, date_to: str) -> Li
     return payload.get("data", [])
 
 
-def fetch_daily(account_external_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
-    token = os.getenv("META_ACCESS_TOKEN")
+def fetch_daily(
+    account_external_id: str,
+    date_from: str,
+    date_to: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, object]]:
+    token = _access_token(config_override)
     if not token:
         raise HTTPException(status_code=500, detail="META_ACCESS_TOKEN is not set")
 

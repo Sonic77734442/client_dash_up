@@ -198,3 +198,29 @@ def test_provider_insights_endpoints_are_admin_only():
         headers=auth_header(agency_token),
     )
     assert denied.status_code == 403
+
+
+def test_discovery_and_sync_are_forbidden_for_client_role():
+    reset_state()
+    admin = mk_user("admin@acl.local", "admin")
+    admin_token = issue_token(admin["id"])
+    c1 = mk_client("Tenant 1", admin_token)
+    a1 = mk_account(c1["id"], "acc-1", admin_token)
+
+    user = mk_user("client-sync@acl.local", "client")
+    user_token = issue_token(user["id"])
+    assign_access(user["id"], c1["id"], "client")
+
+    discover = client.post(
+        "/ad-accounts/discover",
+        json={"provider": "meta", "client_id": c1["id"]},
+        headers=auth_header(user_token),
+    )
+    assert discover.status_code == 403
+
+    sync = client.post(
+        "/ad-accounts/sync/run",
+        json={"account_ids": [a1["id"]]},
+        headers=auth_header(user_token),
+    )
+    assert sync.status_code == 403

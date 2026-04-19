@@ -158,10 +158,12 @@ class AdAccountSyncService:
         account_store: AdAccountStore,
         job_store: AdAccountSyncJobStore,
         *,
-        provider_fetchers: Optional[Dict[str, Callable[[str, str, str], List[Dict[str, object]]]]] = None,
+        provider_fetchers: Optional[Dict[str, Callable[..., List[Dict[str, object]]]]] = None,
+        credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
     ):
         self.account_store = account_store
         self.job_store = job_store
+        self.credential_resolver = credential_resolver
         self.provider_fetchers = provider_fetchers or {
             "meta": self._fetch_meta_daily,
             "google": self._fetch_google_daily,
@@ -207,20 +209,35 @@ class AdAccountSyncService:
         return now + timedelta(minutes=delay_minutes)
 
     @staticmethod
-    def _fetch_meta_daily(external_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
-        return meta.fetch_daily(external_id, meta_safe_date_from(date_from), date_to)
+    def _fetch_meta_daily(
+        external_id: str,
+        date_from: str,
+        date_to: str,
+        credentials: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
+        return meta.fetch_daily(external_id, meta_safe_date_from(date_from), date_to, credentials)
 
     @staticmethod
-    def _fetch_google_daily(external_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
+    def _fetch_google_daily(
+        external_id: str,
+        date_from: str,
+        date_to: str,
+        credentials: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
         customer_id = google_ads.valid_customer_id_or_none(external_id)
         if not customer_id:
             raise HTTPException(status_code=400, detail="Invalid Google customer id")
-        return google_ads.fetch_daily(customer_id, date_from, date_to)
+        return google_ads.fetch_daily(customer_id, date_from, date_to, credentials)
 
     @staticmethod
-    def _fetch_tiktok_daily(external_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
+    def _fetch_tiktok_daily(
+        external_id: str,
+        date_from: str,
+        date_to: str,
+        credentials: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
         advertiser_id = tiktok.normalize_advertiser_id(external_id)
-        return tiktok.fetch_daily(advertiser_id, date_from, date_to)
+        return tiktok.fetch_daily(advertiser_id, date_from, date_to, credentials)
 
     def run_sync(
         self,
@@ -230,6 +247,7 @@ class AdAccountSyncService:
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
         created_by: Optional[UUID] = None,
+        user_id: Optional[UUID] = None,
         force: bool = False,
     ) -> SyncRunResult:
         started_at = datetime.utcnow()
@@ -279,7 +297,14 @@ class AdAccountSyncService:
                 next_retry_at = None
             else:
                 try:
-                    rows = fetcher(account.external_account_id, from_str, to_str)
+                    provider_credentials: Optional[Dict[str, object]] = None
+                    if self.credential_resolver:
+                        provider_credentials = self.credential_resolver(provider, account.client_id, user_id)
+                    try:
+                        rows = fetcher(account.external_account_id, from_str, to_str, provider_credentials)
+                    except TypeError:
+                        # Backward-compatible path for tests/custom fetchers with legacy signature.
+                        rows = fetcher(account.external_account_id, from_str, to_str)
                     status = "success"
                     records = len(rows)
                     error_message = None

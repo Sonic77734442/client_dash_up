@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 from google.ads.googleads.client import GoogleAdsClient
@@ -16,12 +16,13 @@ def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
     return normalized
 
 
-def ads_client() -> GoogleAdsClient:
-    developer_token = os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN")
-    client_id = os.getenv("GOOGLE_ADS_CLIENT_ID")
-    client_secret = os.getenv("GOOGLE_ADS_CLIENT_SECRET")
-    refresh_token = os.getenv("GOOGLE_ADS_REFRESH_TOKEN")
-    login_customer_id = os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or None
+def ads_client(config_override: Optional[Dict[str, Any]] = None) -> GoogleAdsClient:
+    cfg = config_override or {}
+    developer_token = str(cfg.get("developer_token") or os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") or "").strip()
+    client_id = str(cfg.get("client_id") or os.getenv("GOOGLE_ADS_CLIENT_ID") or "").strip()
+    client_secret = str(cfg.get("client_secret") or os.getenv("GOOGLE_ADS_CLIENT_SECRET") or "").strip()
+    refresh_token = str(cfg.get("refresh_token") or os.getenv("GOOGLE_ADS_REFRESH_TOKEN") or "").strip()
+    login_customer_id = str(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "").strip() or None
 
     if not developer_token or not client_id or not client_secret or not refresh_token:
         raise HTTPException(status_code=500, detail="Google Ads API credentials are not set")
@@ -53,17 +54,36 @@ def _fallback_accounts() -> List[Dict[str, object]]:
     ]
 
 
-def list_accounts() -> List[Dict[str, object]]:
+def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     try:
-        client = ads_client()
+        client = ads_client(config_override)
         customer_service = client.get_service("CustomerService")
         ga_service = client.get_service("GoogleAdsService")
         response = customer_service.list_accessible_customers()
         out: List[Dict[str, object]] = []
+        seen: set[str] = set()
+
+        def add_row(customer_id: str, name: str, currency: str, source: str) -> None:
+            if not customer_id or customer_id in seen:
+                return
+            seen.add(customer_id)
+            out.append(
+                {
+                    "external_account_id": customer_id,
+                    "name": name or f"Google {customer_id}",
+                    "currency": currency or "USD",
+                    "source": source,
+                }
+            )
+
+        root_ids: List[str] = []
         for resource_name in list(response.resource_names or []):
-            customer_id = normalize_customer_id(str(resource_name).split("/")[-1])
-            if not customer_id:
-                continue
+            cid = normalize_customer_id(str(resource_name).split("/")[-1])
+            if cid:
+                root_ids.append(cid)
+
+        # 1) Add root accessible accounts.
+        for customer_id in root_ids:
             name = f"Google {customer_id}"
             currency = "USD"
             try:
@@ -79,14 +99,38 @@ def list_accounts() -> List[Dict[str, object]]:
                     break
             except Exception:
                 pass
-            out.append(
-                {
-                    "external_account_id": customer_id,
-                    "name": name,
-                    "currency": currency,
-                    "source": "api",
-                }
-            )
+            add_row(customer_id, name, currency, "api_root")
+
+        # 2) Traverse MCC hierarchy and include leaf/client accounts.
+        hierarchy_query = """
+            SELECT
+              customer_client.id,
+              customer_client.descriptive_name,
+              customer_client.currency_code,
+              customer_client.manager,
+              customer_client.level
+            FROM customer_client
+            WHERE customer_client.level <= 10
+        """
+        for manager_id in root_ids:
+            try:
+                rows = ga_service.search(customer_id=manager_id, query=hierarchy_query)
+            except Exception:
+                continue
+            for row in rows:
+                child_id = normalize_customer_id(str(row.customer_client.id or ""))
+                if not child_id:
+                    continue
+                if bool(row.customer_client.manager):
+                    # Keep only non-manager clients in final list for registry.
+                    continue
+                add_row(
+                    child_id,
+                    str(row.customer_client.descriptive_name or f"Google {child_id}"),
+                    str(row.customer_client.currency_code or "USD"),
+                    "api_mcc",
+                )
+
         if out:
             return out
     except Exception:
@@ -94,8 +138,13 @@ def list_accounts() -> List[Dict[str, object]]:
     return _fallback_accounts()
 
 
-def fetch_insights(customer_id: str, date_from: str, date_to: str) -> Tuple[List[Dict[str, object]], Optional[str]]:
-    client = ads_client()
+def fetch_insights(
+    customer_id: str,
+    date_from: str,
+    date_to: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, object]], Optional[str]]:
+    client = ads_client(config_override)
     ga_service = client.get_service("GoogleAdsService")
 
     currency = None
@@ -138,8 +187,13 @@ def fetch_insights(customer_id: str, date_from: str, date_to: str) -> Tuple[List
     return campaigns, currency
 
 
-def fetch_daily(customer_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
-    client = ads_client()
+def fetch_daily(
+    customer_id: str,
+    date_from: str,
+    date_to: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, object]]:
+    client = ads_client(config_override)
     ga_service = client.get_service("GoogleAdsService")
     queries = [
         f"""

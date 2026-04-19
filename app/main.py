@@ -74,6 +74,9 @@ from app.schemas import (
     GoogleInsightsResponse,
     MetaInsightsResponse,
     IntegrationsOverviewResponse,
+    IntegrationCredentialCreate,
+    IntegrationCredentialOut,
+    IntegrationCredentialPatch,
     OverviewResponse,
     TikTokInsightsResponse,
 )
@@ -96,6 +99,11 @@ from app.services.budgets import BudgetStore, InMemoryBudgetStore, SqliteBudgetS
 from app.services.clients import ClientStore, InMemoryClientStore, SqliteClientStore
 from app.services.insights import get_google_insights, get_meta_insights, get_tiktok_insights
 from app.services.integrations import build_integrations_overview
+from app.services.integration_credentials import (
+    InMemoryIntegrationCredentialStore,
+    IntegrationCredentialStore,
+    SqliteIntegrationCredentialStore,
+)
 from app.services.overview import OverviewService
 from app.services.operational_insights import OperationalInsightsService
 from app.services.operational_actions import (
@@ -147,9 +155,28 @@ app.add_middleware(
 # Default production stores (sqlite runtime)
 client_store: ClientStore = SqliteClientStore(settings.budgets_db_path)
 ad_account_store: AdAccountStore = SqliteAdAccountStore(settings.budgets_db_path, client_store)
+integration_credential_store: IntegrationCredentialStore = SqliteIntegrationCredentialStore(settings.budgets_db_path)
 ad_account_sync_job_store = SqliteAdAccountSyncJobStore(settings.budgets_db_path)
-ad_account_sync_service = AdAccountSyncService(account_store=ad_account_store, job_store=ad_account_sync_job_store)
-ad_account_discovery_service = AdAccountDiscoveryService(account_store=ad_account_store)
+
+
+def _resolve_provider_credentials(
+    provider: str,
+    client_id: UUID,
+    user_id: Optional[UUID],
+) -> Optional[dict]:
+    resolved = integration_credential_store.resolve_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    return dict(resolved.credentials) if resolved else None
+
+
+ad_account_sync_service = AdAccountSyncService(
+    account_store=ad_account_store,
+    job_store=ad_account_sync_job_store,
+    credential_resolver=_resolve_provider_credentials,
+)
+ad_account_discovery_service = AdAccountDiscoveryService(
+    account_store=ad_account_store,
+    credential_resolver=_resolve_provider_credentials,
+)
 ad_stats_store: AdStatsStore = SqliteAdStatsStore(settings.budgets_db_path, ad_account_store)
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
@@ -163,6 +190,7 @@ auth_facade = AuthFacadeService(auth_store=auth_store)
 
 app.state.client_store = client_store
 app.state.ad_account_store = ad_account_store
+app.state.integration_credential_store = integration_credential_store
 app.state.ad_account_sync_service = ad_account_sync_service
 app.state.ad_account_discovery_service = ad_account_discovery_service
 app.state.ad_stats_store = ad_stats_store
@@ -393,9 +421,20 @@ def use_inmemory_stores():
     # Helper for tests to avoid file I/O and cross-test state leakage.
     c = InMemoryClientStore()
     a = InMemoryAdAccountStore(c)
+    integration_creds = InMemoryIntegrationCredentialStore()
+    def _resolve_provider_credentials_inmemory(provider: str, client_id: UUID, user_id: Optional[UUID]) -> Optional[dict]:
+        resolved = integration_creds.resolve_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        return dict(resolved.credentials) if resolved else None
     sync_jobs = InMemoryAdAccountSyncJobStore()
-    sync_service = AdAccountSyncService(account_store=a, job_store=sync_jobs)
-    discovery_service = AdAccountDiscoveryService(account_store=a)
+    sync_service = AdAccountSyncService(
+        account_store=a,
+        job_store=sync_jobs,
+        credential_resolver=_resolve_provider_credentials_inmemory,
+    )
+    discovery_service = AdAccountDiscoveryService(
+        account_store=a,
+        credential_resolver=_resolve_provider_credentials_inmemory,
+    )
     s = InMemoryAdStatsStore(a)
     b = InMemoryBudgetStore()
     auth = InMemoryAuthStore()
@@ -403,6 +442,7 @@ def use_inmemory_stores():
     oauth_states = InMemoryOAuthStateStore()
     app.state.client_store = c
     app.state.ad_account_store = a
+    app.state.integration_credential_store = integration_creds
     app.state.ad_account_sync_service = sync_service
     app.state.ad_account_discovery_service = discovery_service
     app.state.ad_stats_store = s
@@ -427,6 +467,10 @@ def _client_store() -> ClientStore:
 
 def _ad_account_store() -> AdAccountStore:
     return app.state.ad_account_store
+
+
+def _integration_credential_store() -> IntegrationCredentialStore:
+    return app.state.integration_credential_store
 
 
 def _ad_stats_store() -> AdStatsStore:
@@ -1172,6 +1216,76 @@ def auth_list_provider_configs(ctx: Optional[RequestContext] = Depends(optional_
 
 
 @app.post(
+    "/platform/integration-credentials",
+    response_model=IntegrationCredentialOut,
+    summary="[INTERNAL/TEMP] Upsert tenant integration credential",
+    description=(
+        "Temporary internal/admin-only endpoint. Stores provider credentials at "
+        "scope: global | agency | client. Runtime resolution priority: client -> agency -> global."
+    ),
+)
+def create_integration_credential(
+    payload: IntegrationCredentialCreate,
+    ctx: RequestContext = Depends(auth_context),
+):
+    ensure_admin(ctx)
+    payload_with_actor = payload.model_copy(update={"created_by": payload.created_by or ctx.user_id})
+    return _integration_credential_store().upsert(payload_with_actor)
+
+
+@app.get(
+    "/platform/integration-credentials",
+    summary="[INTERNAL/TEMP] List tenant integration credentials",
+    description="Temporary internal/admin-only endpoint for provider credential registry.",
+)
+def list_integration_credentials(
+    status: str = Query(default="active", pattern="^(active|archived|all)$"),
+    provider: Optional[str] = None,
+    scope_type: Optional[str] = Query(default=None, pattern="^(global|agency|client)$"),
+    scope_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    ensure_admin(ctx)
+    rows = _integration_credential_store().list(
+        status=status,
+        provider=provider,
+        scope_type=scope_type,
+        scope_id=scope_id,
+    )
+    return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+
+
+@app.patch(
+    "/platform/integration-credentials/{credential_id}",
+    response_model=IntegrationCredentialOut,
+    summary="[INTERNAL/TEMP] Patch tenant integration credential",
+    description="Temporary internal/admin-only endpoint for provider credential registry.",
+)
+def patch_integration_credential(
+    credential_id: UUID,
+    payload: IntegrationCredentialPatch,
+    ctx: RequestContext = Depends(auth_context),
+):
+    ensure_admin(ctx)
+    payload_with_actor = payload.model_copy(update={"created_by": payload.created_by or ctx.user_id})
+    return _integration_credential_store().patch(credential_id, payload_with_actor)
+
+
+@app.delete(
+    "/platform/integration-credentials/{credential_id}",
+    response_model=IntegrationCredentialOut,
+    summary="[INTERNAL/TEMP] Archive tenant integration credential",
+    description="Temporary internal/admin-only endpoint for provider credential registry.",
+)
+def archive_integration_credential(
+    credential_id: UUID,
+    ctx: RequestContext = Depends(auth_context),
+):
+    ensure_admin(ctx)
+    return _integration_credential_store().archive(credential_id)
+
+
+@app.post(
     "/platform/agencies",
     response_model=AgencyOut,
     summary="[INTERNAL/TEMP] Create agency tenant",
@@ -1539,10 +1653,16 @@ def archive_ad_account(account_id: UUID, ctx: RequestContext = Depends(auth_cont
     ),
 )
 def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can run account discovery"},
+        )
     target_client_id = _resolve_discovery_client_id(ctx, payload.client_id)
     result = _ad_account_discovery_service().discover(
         provider=payload.provider,
         client_id=target_client_id,
+        user_id=ctx.user_id,
         upsert_existing=payload.upsert_existing,
     )
     _audit_event(
@@ -1573,6 +1693,11 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
     ),
 )
 def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can run account sync"},
+        )
     requested_accounts = _ad_account_store().list(status="all")
     if payload.account_ids:
         requested_ids = set(payload.account_ids)
@@ -1599,6 +1724,7 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
         date_from=payload.date_from,
         date_to=payload.date_to,
         created_by=ctx.user_id,
+        user_id=ctx.user_id,
         force=payload.force,
     )
     _audit_event(

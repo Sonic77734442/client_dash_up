@@ -607,6 +607,47 @@ class AuthProviderConfigOut(BaseModel):
     updated_at: datetime
 
 
+class IntegrationCredentialBase(BaseModel):
+    provider: str
+    scope_type: Literal["global", "agency", "client"] = "global"
+    scope_id: Optional[UUID] = None
+    credentials: Dict[str, Any] = Field(default_factory=dict)
+    created_by: Optional[UUID] = None
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if self.scope_type == "global" and self.scope_id is not None:
+            raise ValueError("scope_id must be null for scope_type='global'")
+        if self.scope_type in {"agency", "client"} and self.scope_id is None:
+            raise ValueError("scope_id is required for scope_type='agency' or 'client'")
+        return self
+
+
+class IntegrationCredentialCreate(IntegrationCredentialBase):
+    pass
+
+
+class IntegrationCredentialPatch(BaseModel):
+    provider: Optional[str] = None
+    scope_type: Optional[Literal["global", "agency", "client"]] = None
+    scope_id: Optional[UUID] = None
+    credentials: Optional[Dict[str, Any]] = None
+    status: Optional[Literal["active", "archived"]] = None
+    created_by: Optional[UUID] = None
+
+
+class IntegrationCredentialOut(BaseModel):
+    id: UUID
+    provider: str
+    scope_type: Literal["global", "agency", "client"]
+    scope_id: Optional[UUID] = None
+    credentials: Dict[str, Any] = Field(default_factory=dict)
+    status: Literal["active", "archived"]
+    created_by: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class ExternalIdentityResolveRequest(BaseModel):
     provider: str
     provider_user_id: str

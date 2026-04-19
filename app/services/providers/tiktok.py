@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -12,8 +12,9 @@ def normalize_advertiser_id(advertiser_id: object) -> str:
     return digits or raw
 
 
-def access_token() -> str:
-    token = os.getenv("TIKTOK_ACCESS_TOKEN")
+def access_token(config_override: Optional[Dict[str, Any]] = None) -> str:
+    cfg = config_override or {}
+    token = str(cfg.get("access_token") or os.getenv("TIKTOK_ACCESS_TOKEN") or "").strip()
     if not token:
         raise HTTPException(status_code=500, detail="TIKTOK_ACCESS_TOKEN is not set")
     return token
@@ -34,9 +35,9 @@ def _fallback_accounts() -> List[Dict[str, object]]:
     ]
 
 
-def list_accounts() -> List[Dict[str, object]]:
+def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     url = "https://business-api.tiktok.com/open_api/v1.3/oauth2/advertiser/get/"
-    headers = {"Access-Token": access_token()}
+    headers = {"Access-Token": access_token(config_override)}
     try:
         resp = httpx.get(url, headers=headers, timeout=30)
         if resp.status_code != 200:
@@ -88,6 +89,7 @@ def fetch_report(
     data_level: str,
     dimensions: List[str],
     metrics: List[str],
+    config_override: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, object]]:
     url = "https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/"
 
@@ -107,7 +109,7 @@ def fetch_report(
             "end_date": date_to,
             "page_size": 1000,
         }
-        headers = {"Access-Token": access_token()}
+        headers = {"Access-Token": access_token(config_override)}
         resp = httpx.get(url, params=params, headers=headers, timeout=30)
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"TikTok API error: {resp.text}")
@@ -134,7 +136,12 @@ def fetch_report(
     return results
 
 
-def fetch_daily(advertiser_id: str, date_from: str, date_to: str) -> List[Dict[str, object]]:
+def fetch_daily(
+    advertiser_id: str,
+    date_from: str,
+    date_to: str,
+    config_override: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, object]]:
     rows = fetch_report(
         advertiser_id,
         date_from,
@@ -142,6 +149,7 @@ def fetch_daily(advertiser_id: str, date_from: str, date_to: str) -> List[Dict[s
         "AUCTION_ADVERTISER",
         ["stat_time_day"],
         ["spend", "impressions", "clicks", "ctr", "cpc", "cpm"],
+        config_override=config_override,
     )
     return [
         {

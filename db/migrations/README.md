@@ -17,6 +17,7 @@ Apply in order (idempotent SQL files):
 13. `0013_alter_oauth_states_add_nonce.sql`
 14. `0014_create_agency_invites.sql`
 15. `0015_alter_ad_account_sync_jobs_retry_fields.sql`
+16. `0016_create_integration_credentials.sql`
 
 ## Local PostgreSQL example
 ```bash
@@ -35,6 +36,7 @@ psql "$DATABASE_URL" -f db/migrations/0012_create_oauth_states.sql
 psql "$DATABASE_URL" -f db/migrations/0013_alter_oauth_states_add_nonce.sql
 psql "$DATABASE_URL" -f db/migrations/0014_create_agency_invites.sql
 psql "$DATABASE_URL" -f db/migrations/0015_alter_ad_account_sync_jobs_retry_fields.sql
+psql "$DATABASE_URL" -f db/migrations/0016_create_integration_credentials.sql
 ```
 
 ## SQLite local runtime

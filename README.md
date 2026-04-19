@@ -218,6 +218,20 @@ Prerequisites:
   - `connection_sources` (e.g. `identity_link`, `provider_config`, `env_credentials`)
   - `missing_requirements`
   - `sync_ready`
+
+## Tenant provider credentials (MCC/BM per tenant)
+- New internal/admin plumbing endpoints:
+  - `POST /platform/integration-credentials`
+  - `GET /platform/integration-credentials`
+  - `PATCH /platform/integration-credentials/{credential_id}`
+  - `DELETE /platform/integration-credentials/{credential_id}` (archives credential)
+- Supported scopes:
+  - `global` (fallback)
+  - `agency` (shared by agency for bound clients)
+  - `client` (highest priority for that client)
+- Runtime resolution order for `discover` + `sync`:
+  - `client` -> `agency` -> `global`
+- This enables different Google MCC / Meta BM credentials per client or agency without changing global ENV.
   - `sync_readiness_reason`
   - `identity_linked_users`
 - This is shown in Integrations Hub and Sync Monitor so agency onboarding state is explicit.
