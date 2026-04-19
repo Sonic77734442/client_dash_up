@@ -17,6 +17,17 @@ function itemClass(section: SidebarSection, active: SidebarSection) {
   return `menu-item ${section === active ? "active" : ""}`.trim();
 }
 
+function readCookie(name: string): string {
+  if (typeof document === "undefined") return "";
+  const parts = document.cookie ? document.cookie.split(";") : [];
+  const prefix = `${name}=`;
+  for (const part of parts) {
+    const v = part.trim();
+    if (v.startsWith(prefix)) return decodeURIComponent(v.slice(prefix.length));
+  }
+  return "";
+}
+
 export function AppSidebar({
   active,
   subtitle = "Digital Operations",
@@ -36,6 +47,10 @@ export function AppSidebar({
       const token = localStorage.getItem("ops_session_token") || "";
       const headers: HeadersInit = {};
       if (token) headers.Authorization = `Bearer ${token}`;
+      const csrfHeaderName = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
+      const csrfCookieName = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
+      const csrfToken = readCookie(csrfCookieName);
+      if (csrfToken) headers[csrfHeaderName] = csrfToken;
       await fetch(`${apiBase}/auth/logout`, {
         method: "POST",
         headers,
@@ -45,8 +60,9 @@ export function AppSidebar({
       // noop
     } finally {
       localStorage.removeItem("ops_session_token");
+      localStorage.removeItem("ops_api_base");
       window.dispatchEvent(new Event("ops-session-updated"));
-      window.location.href = "/login";
+      window.location.replace("/login");
     }
   }
 
