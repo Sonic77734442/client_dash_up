@@ -362,6 +362,8 @@ async def auth_security_middleware(request: Request, call_next):
             "/_testing/use-inmemory-stores",
             "/auth/invites/accept",
             "/auth/logout",
+            "/ad-accounts/discover",
+            "/ad-accounts/sync/run",
             "/auth/internal/sessions/issue",
             "/auth/internal/sessions/validate",
             "/auth/internal/sessions/revoke",
