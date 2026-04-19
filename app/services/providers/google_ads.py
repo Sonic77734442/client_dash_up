@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
@@ -10,9 +11,12 @@ def normalize_customer_id(customer_id: str) -> str:
 
 
 def _api_version() -> str:
-    # Keep explicit API version to avoid accidental calls to sunset versions
-    # on older client libs/deploy images.
-    return (os.getenv("GOOGLE_ADS_API_VERSION", "v19") or "v19").strip()
+    # Keep explicit API version and sanitize env input (e.g. `"v19"`, `v19.`, ` V19 `).
+    raw = str(os.getenv("GOOGLE_ADS_API_VERSION", "v19") or "v19").strip().strip("'\"").rstrip(".")
+    m = re.match(r"^v(\d+)$", raw.lower())
+    if not m:
+        return "v19"
+    return f"v{m.group(1)}"
 
 
 def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
@@ -38,6 +42,7 @@ def ads_client(config_override: Optional[Dict[str, Any]] = None) -> GoogleAdsCli
         "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": refresh_token,
+        "version": _api_version(),
         "use_proto_plus": True,
     }
     if login_customer_id:
@@ -64,9 +69,8 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
     strict_mode = config_override is not None
     try:
         client = ads_client(config_override)
-        version = _api_version()
-        customer_service = client.get_service("CustomerService", version=version)
-        ga_service = client.get_service("GoogleAdsService", version=version)
+        customer_service = client.get_service("CustomerService")
+        ga_service = client.get_service("GoogleAdsService")
         response = customer_service.list_accessible_customers()
         out: List[Dict[str, object]] = []
         seen: set[str] = set()
@@ -157,7 +161,7 @@ def fetch_insights(
     config_override: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, object]], Optional[str]]:
     client = ads_client(config_override)
-    ga_service = client.get_service("GoogleAdsService", version=_api_version())
+    ga_service = client.get_service("GoogleAdsService")
 
     currency = None
     for row in ga_service.search(customer_id=customer_id, query="SELECT customer.currency_code FROM customer LIMIT 1"):
@@ -206,7 +210,7 @@ def fetch_daily(
     config_override: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, object]]:
     client = ads_client(config_override)
-    ga_service = client.get_service("GoogleAdsService", version=_api_version())
+    ga_service = client.get_service("GoogleAdsService")
     queries = [
         f"""
             SELECT
