@@ -1129,7 +1129,8 @@ def auth_oauth_callback(
     base = settings.frontend_base_url.rstrip("/")
     next_encoded = quote(consumed.next_path or "/", safe="/?=&")
     token_encoded = quote(resolved.session.token, safe="")
-    redirect_url = f"{base}/login/success?next={next_encoded}#token={token_encoded}"
+    # Some redirect chains can drop URL fragments. Keep token in query as fallback for login completion.
+    redirect_url = f"{base}/login/success?next={next_encoded}&token={token_encoded}#token={token_encoded}"
     response = RedirectResponse(url=redirect_url, status_code=302)
     max_age = (
         max(60, int((resolved.session.expires_at - datetime.utcnow()).total_seconds()))

@@ -21,7 +21,9 @@ export default function LoginSuccessPage() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    const { token, next: nextFromHash } = parseHash();
+    const { token: tokenFromHash, next: nextFromHash } = parseHash();
+    const tokenFromQuery = search.get("token") || "";
+    const token = tokenFromQuery || tokenFromHash;
     const next = search.get("next") || nextFromHash || "/";
     if (token) {
       localStorage.setItem(LS_SESSION_TOKEN, token);
