@@ -34,7 +34,7 @@ def reset_state():
     client.cookies.clear()
 
 
-def test_cookie_session_requires_csrf_header_for_mutation():
+def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt():
     reset_state()
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
@@ -58,12 +58,16 @@ def test_cookie_session_requires_csrf_header_for_mutation():
     assert callback.status_code == 302
     assert client.cookies.get("ops_csrf")
 
-    denied = client.post("/auth/logout")
+    denied = client.post("/auth/session/refresh")
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "csrf_failed"
 
-    ok = client.post("/auth/logout", headers={"X-CSRF-Token": client.cookies.get("ops_csrf")})
+    ok = client.post("/auth/session/refresh", headers={"X-CSRF-Token": client.cookies.get("ops_csrf")})
     assert ok.status_code == 200
+
+    # Logout is intentionally CSRF-exempt to support cross-domain frontend deployments.
+    out = client.post("/auth/logout")
+    assert out.status_code == 200
 
 
 def test_rate_limit_triggers_on_auth_sensitive_routes():

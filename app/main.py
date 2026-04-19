@@ -361,6 +361,7 @@ async def auth_security_middleware(request: Request, call_next):
         csrf_exempt = {
             "/_testing/use-inmemory-stores",
             "/auth/invites/accept",
+            "/auth/logout",
             "/auth/internal/sessions/issue",
             "/auth/internal/sessions/validate",
             "/auth/internal/sessions/revoke",
