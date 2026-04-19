@@ -1824,6 +1824,9 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
             detail={"code": "forbidden", "message": "Only admin/agency can run account sync"},
         )
     requested_accounts = _ad_account_store().list(status="all")
+    if payload.client_id:
+        ensure_client_access(ctx, payload.client_id)
+        requested_accounts = [a for a in requested_accounts if a.client_id == payload.client_id]
     if payload.account_ids:
         requested_ids = set(payload.account_ids)
         requested_accounts = [a for a in requested_accounts if a.id in requested_ids]
@@ -1862,6 +1865,7 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
             "success": result.success,
             "failed": result.failed,
             "account_ids": [str(a.id) for a in requested_accounts],
+            "client_id": str(payload.client_id) if payload.client_id else None,
             "platform_filter": payload.platform,
             "force": payload.force,
         },

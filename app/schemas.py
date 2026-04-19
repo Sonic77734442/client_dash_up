@@ -208,6 +208,7 @@ class AdAccountOut(BaseModel):
 
 class AdAccountSyncRunRequest(BaseModel):
     account_ids: Optional[List[UUID]] = None
+    client_id: Optional[UUID] = None
     platform: Optional[str] = None
     date_from: Optional[date] = None
     date_to: Optional[date] = None

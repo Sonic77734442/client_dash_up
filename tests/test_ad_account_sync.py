@@ -114,6 +114,25 @@ def test_sync_run_empty_selection_processes_zero():
     assert body["processed"] == 0
 
 
+def test_sync_run_supports_client_filter():
+    reset_state()
+    c1 = mk_client("Tenant 1")
+    c2 = mk_client("Tenant 2")
+    a1 = mk_account(c1["id"], "meta", "m-1")
+    mk_account(c2["id"], "meta", "m-2")
+
+    service = app.state.ad_account_sync_service
+    service.provider_fetchers = {
+        "meta": lambda external, date_from, date_to, creds=None: [{"id": external}],
+    }
+
+    run = client.post("/ad-accounts/sync/run", json={"client_id": c1["id"]})
+    assert run.status_code == 200
+    body = run.json()
+    assert body["processed"] == 1
+    assert body["jobs"][0]["ad_account_id"] == a1["id"]
+
+
 def test_sync_retry_backoff_skips_until_force():
     reset_state()
     c = mk_client("Backoff")

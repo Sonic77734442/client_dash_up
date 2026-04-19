@@ -180,6 +180,7 @@ export default function SyncMonitorPage() {
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { force: true };
+      if (discoverClientId) payload.client_id = discoverClientId;
       if (opts?.platform) payload.platform = opts.platform;
       if (opts?.accountId) payload.account_ids = [opts.accountId];
       await req("/ad-accounts/sync/run", {

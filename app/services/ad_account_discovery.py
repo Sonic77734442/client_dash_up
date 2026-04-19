@@ -39,6 +39,19 @@ def _normalize_provider(value: Optional[str]) -> str:
     return raw
 
 
+def _canonical_external_id(provider: str, value: object) -> str:
+    raw = str(value or "").strip()
+    p = (provider or "").strip().lower()
+    if p == "google":
+        normalized = google_ads.normalize_customer_id(raw)
+        return normalized or raw
+    if p == "meta":
+        return raw.replace("act_", "").strip()
+    if p == "tiktok":
+        return tiktok.normalize_advertiser_id(raw)
+    return raw
+
+
 def _fallback_ids_from_env(env_name: str) -> List[str]:
     raw = os.getenv(env_name, "")
     return [x.strip() for x in raw.split(",") if x.strip()]
@@ -137,7 +150,10 @@ class AdAccountDiscoveryService:
             providers = [provider_filter]
 
         existing = {
-            ((a.platform or "").lower().strip(), str(a.external_account_id or "").strip()): a
+            (
+                (a.platform or "").lower().strip(),
+                _canonical_external_id((a.platform or "").lower().strip(), a.external_account_id),
+            ): a
             for a in self.account_store.list(status="all")
         }
         now_iso = datetime.utcnow().isoformat()
@@ -168,7 +184,7 @@ class AdAccountDiscoveryService:
                 continue
 
             for row in rows:
-                external_account_id = str(row.get("external_account_id") or "").strip()
+                external_account_id = _canonical_external_id(p, row.get("external_account_id"))
                 if not external_account_id:
                     skipped += 1
                     continue
@@ -201,20 +217,64 @@ class AdAccountDiscoveryService:
                     updated += 1
                     continue
 
-                created_row = self.account_store.create(
-                    AdAccountCreate(
-                        client_id=client_id,
-                        platform=p,
-                        external_account_id=external_account_id,
-                        name=name,
-                        currency=currency,
-                        status="active",
-                        metadata=discovery_meta,
+                try:
+                    created_row = self.account_store.create(
+                        AdAccountCreate(
+                            client_id=client_id,
+                            platform=p,
+                            external_account_id=external_account_id,
+                            name=name,
+                            currency=currency,
+                            status="active",
+                            metadata=discovery_meta,
+                        )
                     )
-                )
-                existing[key] = created_row
-                items.append(created_row)
-                created += 1
+                    existing[key] = created_row
+                    items.append(created_row)
+                    created += 1
+                except HTTPException as exc:
+                    # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
+                    if exc.status_code != 409:
+                        raise
+                    fallback_existing = existing.get(key)
+                    if not fallback_existing:
+                        refreshed = self.account_store.list(status="all")
+                        fallback_existing = next(
+                            (
+                                a
+                                for a in refreshed
+                                if (a.platform or "").lower().strip() == p
+                                and _canonical_external_id(p, a.external_account_id) == external_account_id
+                            ),
+                            None,
+                        )
+                    if not fallback_existing:
+                        raise
+                    merged_meta = dict(fallback_existing.metadata or {})
+                    merged_meta.update(discovery_meta)
+                    patched = self.account_store.patch(
+                        fallback_existing.id,
+                        AdAccountPatch(
+                            name=name if name and name != fallback_existing.name else None,
+                            currency=currency if currency and currency != fallback_existing.currency else None,
+                            status="active" if fallback_existing.status != "active" else None,
+                            metadata=merged_meta,
+                        ),
+                    )
+                    existing[key] = patched
+                    items.append(patched)
+                    updated += 1
+                
+                
+                
+            # Refresh map after provider batch to absorb possible concurrent updates and prevent stale-key conflicts.
+            existing = {
+                (
+                    (a.platform or "").lower().strip(),
+                    _canonical_external_id((a.platform or "").lower().strip(), a.external_account_id),
+                ): a
+                for a in self.account_store.list(status="all")
+            }
 
         return DiscoveryResult(
             requested_provider=provider_filter,
