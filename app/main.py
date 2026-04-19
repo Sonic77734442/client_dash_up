@@ -4,6 +4,7 @@ import secrets
 import threading
 import time
 import re
+import os
 from datetime import date, datetime
 from typing import List, Optional
 from urllib.parse import quote
@@ -574,6 +575,98 @@ def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
         redirect_uri=cfg.redirect_uri,
         enabled=cfg.enabled,
     )
+
+
+def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
+    out: List[UUID] = []
+    try:
+        agencies = _platform_admin_store().list_agencies(status="active")
+    except Exception:
+        return out
+    for agency in agencies:
+        try:
+            members = _platform_admin_store().list_members(agency.id)
+        except Exception:
+            continue
+        if any(m.user_id == user_id and m.status == "active" for m in members):
+            out.append(agency.id)
+    return out
+
+
+def _integration_credentials_from_oauth(
+    provider: str,
+    oauth_tokens: Optional[dict],
+    cfg: OAuthProviderConfig,
+) -> Optional[dict]:
+    tokens = oauth_tokens or {}
+    p = provider.strip().lower()
+    if p in {"facebook", "meta"}:
+        access_token = str(tokens.get("access_token") or "").strip()
+        if not access_token:
+            return None
+        business_ids = [x.strip() for x in str(os.getenv("META_BUSINESS_IDS", "")).split(",") if x.strip()]
+        return {"access_token": access_token, "business_ids": business_ids}
+
+    if p == "google":
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+        access_token = str(tokens.get("access_token") or "").strip()
+        # For durable sync we prefer refresh_token; fallback to access_token for immediate run.
+        if not refresh_token and not access_token:
+            return None
+        payload = {
+            "client_id": cfg.client_id,
+            "client_secret": cfg.client_secret,
+        }
+        if refresh_token:
+            payload["refresh_token"] = refresh_token
+        if access_token:
+            payload["access_token"] = access_token
+        developer_token = str(os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")).strip()
+        login_customer_id = str(os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")).strip()
+        if developer_token:
+            payload["developer_token"] = developer_token
+        if login_customer_id:
+            payload["login_customer_id"] = login_customer_id
+        return payload
+    return None
+
+
+def _auto_upsert_integration_credentials(
+    *,
+    provider: str,
+    user: UserOut,
+    oauth_tokens: Optional[dict],
+    cfg: OAuthProviderConfig,
+) -> None:
+    credentials = _integration_credentials_from_oauth(provider, oauth_tokens, cfg)
+    if not credentials:
+        return
+    provider_norm = "meta" if provider == "facebook" else provider
+    if user.role == "agency":
+        agency_ids = _agency_scope_ids_for_user(user.id)
+        if not agency_ids:
+            return
+        for agency_id in agency_ids:
+            _integration_credential_store().upsert(
+                IntegrationCredentialCreate(
+                    provider=provider_norm,
+                    scope_type="agency",
+                    scope_id=agency_id,
+                    credentials=credentials,
+                    created_by=user.id,
+                )
+            )
+        return
+    if user.role == "admin":
+        _integration_credential_store().upsert(
+            IntegrationCredentialCreate(
+                provider=provider_norm,
+                scope_type="global",
+                scope_id=None,
+                credentials=credentials,
+                created_by=user.id,
+            )
+        )
 
 
 def _normalize_next_path(next_path: Optional[str]) -> str:
@@ -1156,22 +1249,54 @@ def auth_oauth_callback(
     consumed = _oauth_state_store().consume_state(provider=provider, state=state, nonce=nonce)
     cfg = _oauth_provider_config_or_400(provider)
     identity = adapter.fetch_identity(cfg, code)
-
-    resolved = _auth_facade().resolve_or_create_from_external_identity(
-        ExternalIdentityResolveRequest(
-            provider=provider,
-            provider_user_id=identity.provider_user_id,
-            email=identity.email,
-            email_verified=identity.email_verified,
-            name=identity.name,
-            raw_profile=identity.raw_profile,
-            default_role="client",
-            issue_session=True,
-            session_ttl_minutes=settings.oauth_session_ttl_minutes,
-        )
+    # If user is already authenticated, treat this as provider connect/link for current user.
+    current_token = _get_session_token(
+        request.headers.get("Authorization"),
+        request.headers.get("X-Session-Token"),
+        request.cookies.get(settings.auth_cookie_name),
+        required=False,
     )
+    current_ctx = _auth_facade().get_session_context(current_token) if current_token else None
+
+    if current_ctx and current_ctx.valid and current_ctx.user_id:
+        current_user = _auth_store().get_user(current_ctx.user_id)
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Session user not found")
+        linked = _auth_store().link_identity(
+            AuthIdentityLink(
+                user_id=current_user.id,
+                provider=provider,
+                provider_user_id=identity.provider_user_id,
+                email=identity.email,
+                email_verified=identity.email_verified,
+                raw_profile=identity.raw_profile,
+            )
+        )
+        issued = _auth_facade().issue_session(current_user.id, ttl_minutes=settings.oauth_session_ttl_minutes)
+        resolved = ExternalIdentityResolveResponse(user=current_user, identity=linked, session=issued)
+    else:
+        resolved = _auth_facade().resolve_or_create_from_external_identity(
+            ExternalIdentityResolveRequest(
+                provider=provider,
+                provider_user_id=identity.provider_user_id,
+                email=identity.email,
+                email_verified=identity.email_verified,
+                name=identity.name,
+                raw_profile=identity.raw_profile,
+                default_role="client",
+                issue_session=True,
+                session_ttl_minutes=settings.oauth_session_ttl_minutes,
+            )
+        )
     if not resolved.session:
         raise HTTPException(status_code=500, detail="OAuth session was not issued")
+
+    _auto_upsert_integration_credentials(
+        provider=provider,
+        user=resolved.user,
+        oauth_tokens=identity.oauth_tokens,
+        cfg=cfg,
+    )
 
     base = settings.frontend_base_url.rstrip("/")
     next_encoded = quote(consumed.next_path or "/", safe="/?=&")

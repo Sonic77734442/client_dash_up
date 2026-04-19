@@ -37,6 +37,7 @@ class ExternalIdentityPayload:
     email_verified: Optional[bool]
     name: Optional[str]
     raw_profile: Dict[str, object]
+    oauth_tokens: Optional[Dict[str, object]] = None
 
 
 class OAuthStateStore(Protocol):
@@ -160,7 +161,8 @@ class FacebookOAuthAdapter:
             )
             if token_resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="Facebook token exchange failed")
-            token = token_resp.json().get("access_token")
+            token_json = token_resp.json()
+            token = token_json.get("access_token")
             if not token:
                 raise HTTPException(status_code=400, detail="Facebook access token missing")
 
@@ -183,6 +185,11 @@ class FacebookOAuthAdapter:
             email_verified=None,
             name=str(profile.get("name") or "") or None,
             raw_profile=profile,
+            oauth_tokens={
+                "access_token": token,
+                "token_type": token_json.get("token_type"),
+                "expires_in": token_json.get("expires_in"),
+            },
         )
 
 
@@ -196,8 +203,9 @@ class GoogleOAuthAdapter:
             "response_type": "code",
             "scope": "openid email profile",
             "state": state,
-            "access_type": "online",
+            "access_type": "offline",
             "prompt": "consent",
+            "include_granted_scopes": "true",
         }
         return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
@@ -216,7 +224,8 @@ class GoogleOAuthAdapter:
             )
             if token_resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="Google token exchange failed")
-            token = token_resp.json().get("access_token")
+            token_json = token_resp.json()
+            token = token_json.get("access_token")
             if not token:
                 raise HTTPException(status_code=400, detail="Google access token missing")
 
@@ -238,4 +247,11 @@ class GoogleOAuthAdapter:
             email_verified=bool(profile.get("email_verified")) if profile.get("email_verified") is not None else None,
             name=str(profile.get("name") or "") or None,
             raw_profile=profile,
+            oauth_tokens={
+                "access_token": token_json.get("access_token"),
+                "refresh_token": token_json.get("refresh_token"),
+                "expires_in": token_json.get("expires_in"),
+                "scope": token_json.get("scope"),
+                "token_type": token_json.get("token_type"),
+            },
         )

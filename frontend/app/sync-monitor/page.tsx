@@ -11,6 +11,7 @@ import {
   AdAccount,
   AdAccountDiscoverResponse,
   AdAccountSyncJob,
+  AuthMeResponse,
   ClientOut,
   IntegrationsOverview,
   IntegrationProvider,
@@ -85,6 +86,7 @@ export default function SyncMonitorPage() {
   const [selectedId, setSelectedId] = useState("");
   const [syncLoading, setSyncLoading] = useState(false);
   const [discoverClientId, setDiscoverClientId] = useState("");
+  const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -98,6 +100,8 @@ export default function SyncMonitorPage() {
       req<{ items: ClientOut[] }>("/clients?status=all"),
       req<IntegrationsOverview>("/integrations/overview"),
     ]);
+    const me = await req<AuthMeResponse>("/auth/me");
+    setCurrentRole(me?.user?.role || "unknown");
     setJobs(jobRows.items || []);
     setAccounts(accRows.items || []);
     setClients(clientRows.items || []);
@@ -159,12 +163,20 @@ export default function SyncMonitorPage() {
   const providerOptions = useMemo(() => ["all", ...Array.from(new Set(jobs.map((j) => j.provider))).sort()], [jobs]);
 
   function connectProvider(providerName: "google" | "facebook") {
+    if (currentRole === "client") {
+      push("Provider connection is available only for agency/admin users", "info");
+      return;
+    }
     const base = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
     localStorage.setItem("ops_api_base", base);
     window.location.href = `${base}/auth/${providerName}/start?next=/sync-monitor`;
   }
 
   async function runSync(opts?: { platform?: "meta" | "google" | "tiktok"; accountId?: string }) {
+    if (currentRole === "client") {
+      push("Sync is available only for agency/admin users", "info");
+      return;
+    }
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { force: true };
@@ -186,6 +198,10 @@ export default function SyncMonitorPage() {
   }
 
   async function discoverAccounts(providerName?: "meta" | "google" | "tiktok") {
+    if (currentRole === "client") {
+      push("Discovery is available only for agency/admin users", "info");
+      return;
+    }
     if (!discoverClientId) {
       push("Select client for imported accounts", "info");
       return;
@@ -281,7 +297,9 @@ export default function SyncMonitorPage() {
             <div className="panel-head">
               <div>
                 <h3 style={{ margin: 0 }}>Provider Connection State</h3>
-                <div className="panel-subtitle">Transparent auth/readiness for Google, Meta, TikTok.</div>
+                <div className="panel-subtitle">
+                  Connect provider once (agency/admin) and accounts are discovered automatically. No manual MCC/BM input for clients.
+                </div>
               </div>
               <div className="session-controls">
                 <select
@@ -304,6 +322,11 @@ export default function SyncMonitorPage() {
                 <button className="primary-btn" onClick={() => void runSync()} disabled={syncLoading}>Sync All</button>
               </div>
             </div>
+            {currentRole === "client" ? (
+              <div className="muted-note" style={{ marginTop: 8 }}>
+                Client role is read-only here. Provider connect/discovery/sync is managed by agency/admin.
+              </div>
+            ) : null}
             <div className="kpi-grid" style={{ marginTop: 10 }}>
               {(integrations?.providers || []).map((p) => (
                 <article key={p.provider} className={`kpi-card ${providerStatusClass(p.status)}`}>
