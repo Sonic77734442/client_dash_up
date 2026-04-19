@@ -40,6 +40,7 @@ def _extract_account_row(row: Dict[str, object], source: str) -> Dict[str, objec
 
 
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
+    strict_mode = config_override is not None
     token = _access_token(config_override)
     if not token:
         return _fallback_accounts()
@@ -85,11 +86,15 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
             pull(f"{base}/owned_ad_accounts", common, "api_bm_owned")
             pull(f"{base}/client_ad_accounts", common, "api_bm_client")
     except HTTPException:
+        if strict_mode:
+            raise
         fallback = _fallback_accounts()
         if fallback:
             return fallback
         raise
     except Exception:
+        if strict_mode:
+            raise HTTPException(status_code=502, detail="Meta account discovery failed")
         fallback = _fallback_accounts()
         if fallback:
             return fallback

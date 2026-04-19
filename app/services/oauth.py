@@ -141,9 +141,8 @@ class FacebookOAuthAdapter:
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "state": state,
-            # Keep FB login scope minimal for broader app-mode compatibility.
-            # Some app setups reject `email` until additional configuration/review.
-            "scope": "public_profile",
+            # Include ads scopes for integration-connect flow.
+            "scope": "public_profile,ads_read,business_management",
             "response_type": "code",
         }
         return f"https://www.facebook.com/v19.0/dialog/oauth?{urlencode(params)}"
@@ -201,7 +200,8 @@ class GoogleOAuthAdapter:
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "response_type": "code",
-            "scope": "openid email profile",
+            # Include adwords scope so callback token can be used for Google Ads discovery/sync.
+            "scope": "openid email profile https://www.googleapis.com/auth/adwords",
             "state": state,
             "access_type": "offline",
             "prompt": "consent",

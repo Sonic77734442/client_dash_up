@@ -61,6 +61,7 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 
 
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
+    strict_mode = config_override is not None
     try:
         client = ads_client(config_override)
         version = _api_version()
@@ -140,8 +141,12 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
 
         if out:
             return out
-    except Exception:
-        pass
+    except HTTPException:
+        if strict_mode:
+            raise
+    except Exception as exc:
+        if strict_mode:
+            raise HTTPException(status_code=502, detail=f"Google account discovery failed: {exc}")
     return _fallback_accounts()
 
 

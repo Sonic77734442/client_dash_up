@@ -609,18 +609,14 @@ def _integration_credentials_from_oauth(
 
     if p == "google":
         refresh_token = str(tokens.get("refresh_token") or "").strip()
-        access_token = str(tokens.get("access_token") or "").strip()
-        # For durable sync we prefer refresh_token; fallback to access_token for immediate run.
-        if not refresh_token and not access_token:
+        # Google Ads client requires refresh token for durable server-side sync.
+        if not refresh_token:
             return None
         payload = {
             "client_id": cfg.client_id,
             "client_secret": cfg.client_secret,
+            "refresh_token": refresh_token,
         }
-        if refresh_token:
-            payload["refresh_token"] = refresh_token
-        if access_token:
-            payload["access_token"] = access_token
         developer_token = str(os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")).strip()
         login_customer_id = str(os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")).strip()
         if developer_token:
@@ -647,23 +643,39 @@ def _auto_upsert_integration_credentials(
         if not agency_ids:
             return
         for agency_id in agency_ids:
+            existing = _integration_credential_store().list(
+                status="all",
+                provider=provider_norm,
+                scope_type="agency",
+                scope_id=agency_id,
+            )
+            merged = dict(existing[0].credentials) if existing else {}
+            merged.update(credentials)
             _integration_credential_store().upsert(
                 IntegrationCredentialCreate(
                     provider=provider_norm,
                     scope_type="agency",
                     scope_id=agency_id,
-                    credentials=credentials,
+                    credentials=merged,
                     created_by=user.id,
                 )
             )
         return
     if user.role == "admin":
+        existing = _integration_credential_store().list(
+            status="all",
+            provider=provider_norm,
+            scope_type="global",
+            scope_id=None,
+        )
+        merged = dict(existing[0].credentials) if existing else {}
+        merged.update(credentials)
         _integration_credential_store().upsert(
             IntegrationCredentialCreate(
                 provider=provider_norm,
                 scope_type="global",
                 scope_id=None,
-                credentials=credentials,
+                credentials=merged,
                 created_by=user.id,
             )
         )

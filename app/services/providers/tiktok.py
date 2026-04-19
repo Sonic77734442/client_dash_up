@@ -36,17 +36,22 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 
 
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
+    strict_mode = config_override is not None
     url = "https://business-api.tiktok.com/open_api/v1.3/oauth2/advertiser/get/"
     headers = {"Access-Token": access_token(config_override)}
     try:
         resp = httpx.get(url, headers=headers, timeout=30)
         if resp.status_code != 200:
+            if strict_mode:
+                raise HTTPException(status_code=502, detail=f"TikTok API error: {resp.text}")
             fallback = _fallback_accounts()
             if fallback:
                 return fallback
             raise HTTPException(status_code=502, detail=f"TikTok API error: {resp.text}")
         payload = resp.json()
         if payload.get("code") not in (0, None):
+            if strict_mode:
+                raise HTTPException(status_code=502, detail=f"TikTok API error: {payload}")
             fallback = _fallback_accounts()
             if fallback:
                 return fallback
@@ -76,9 +81,12 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
         if out:
             return out
     except HTTPException:
-        raise
-    except Exception:
+        if strict_mode:
+            raise
         pass
+    except Exception:
+        if strict_mode:
+            raise HTTPException(status_code=502, detail="TikTok account discovery failed")
     return _fallback_accounts()
 
 
