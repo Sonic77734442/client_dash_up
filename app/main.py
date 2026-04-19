@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+import re
 from datetime import date, datetime
 from typing import List, Optional
 from urllib.parse import quote
@@ -208,6 +209,28 @@ class RuntimeMetrics:
 
 app.state.runtime_metrics = RuntimeMetrics()
 
+_VERCEL_ORIGIN_RE = re.compile(r"^https://.*\.vercel\.app$")
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in settings.allowed_origins:
+        return True
+    return bool(_VERCEL_ORIGIN_RE.match(origin))
+
+
+def _attach_cors_headers(request: Request, response: Response) -> Response:
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin or not _origin_allowed(origin):
+        return response
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Headers"] = "authorization,content-type,x-csrf-token"
+    response.headers["Access-Control-Allow-Methods"] = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+    response.headers["Vary"] = "Origin"
+    return response
+
 
 def _status_code_to_error_code(status_code: int) -> str:
     mapping = {
@@ -282,6 +305,7 @@ async def auth_security_middleware(request: Request, call_next):
     started = time.monotonic()
 
     def finalize(resp: Response) -> Response:
+        resp = _attach_cors_headers(request, resp)
         resp.headers["X-Request-Id"] = request_id
         route = request.scope.get("route")
         route_path = getattr(route, "path", path) if route else path
