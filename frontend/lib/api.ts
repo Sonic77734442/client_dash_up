@@ -35,7 +35,10 @@ export async function fetchJson<T>(
     const csrf = readCookie(CSRF_COOKIE_NAME);
     if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
   }
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const resolvedToken =
+    (token || "").trim() ||
+    (typeof window !== "undefined" ? (localStorage.getItem("ops_session_token") || "").trim() : "");
+  if (resolvedToken) headers.set("Authorization", `Bearer ${resolvedToken}`);
 
   const res = await fetch(`${baseUrl}${path}`, {
     ...init,
