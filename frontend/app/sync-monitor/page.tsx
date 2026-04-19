@@ -186,6 +186,10 @@ export default function SyncMonitorPage() {
       push("Sync is available only for agency/admin users", "info");
       return;
     }
+    if (!opts?.accountId && !discoverClientId) {
+      push("Select client before sync", "info");
+      return;
+    }
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { force: true };

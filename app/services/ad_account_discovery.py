@@ -164,6 +164,7 @@ class AdAccountDiscoveryService:
         discovered = 0
         items: List[AdAccountOut] = []
         providers_failed: Dict[str, str] = {}
+        provider_conflicts: Dict[str, int] = {}
 
         for p in providers:
             discoverer = self.discoverers.get(p)
@@ -211,10 +212,17 @@ class AdAccountDiscoveryService:
                         status="active" if existing_account.status != "active" else None,
                         metadata=merged_meta,
                     )
-                    patched = self.account_store.patch(existing_account.id, patch)
-                    existing[key] = patched
-                    items.append(patched)
-                    updated += 1
+                    try:
+                        patched = self.account_store.patch(existing_account.id, patch)
+                        existing[key] = patched
+                        items.append(patched)
+                        updated += 1
+                    except HTTPException as exc:
+                        if exc.status_code == 409:
+                            skipped += 1
+                            provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
+                            continue
+                        raise
                     continue
 
                 try:
@@ -264,6 +272,12 @@ class AdAccountDiscoveryService:
                     existing[key] = patched
                     items.append(patched)
                     updated += 1
+                except HTTPException as exc:
+                    if exc.status_code == 409:
+                        skipped += 1
+                        provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
+                        continue
+                    raise
                 
                 
                 
@@ -275,6 +289,9 @@ class AdAccountDiscoveryService:
                 ): a
                 for a in self.account_store.list(status="all")
             }
+
+        for p, count in provider_conflicts.items():
+            providers_failed[p] = f"conflict_skipped:{count}"
 
         return DiscoveryResult(
             requested_provider=provider_filter,
