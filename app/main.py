@@ -16,6 +16,8 @@ from starlette.responses import Response
 
 from app.schemas import (
     AdAccountCreate,
+    AdAccountDiscoverRequest,
+    AdAccountDiscoverResponse,
     AdAccountOut,
     AdAccountPatch,
     AdAccountSyncJobOut,
@@ -80,6 +82,7 @@ from app.services.ad_account_sync import (
     InMemoryAdAccountSyncJobStore,
     SqliteAdAccountSyncJobStore,
 )
+from app.services.ad_account_discovery import AdAccountDiscoveryService
 from app.services.ad_stats import AdStatsStore, InMemoryAdStatsStore, SqliteAdStatsStore
 from app.services.auth_arch import (
     ROLE_ACCESS_MODEL,
@@ -145,6 +148,7 @@ client_store: ClientStore = SqliteClientStore(settings.budgets_db_path)
 ad_account_store: AdAccountStore = SqliteAdAccountStore(settings.budgets_db_path, client_store)
 ad_account_sync_job_store = SqliteAdAccountSyncJobStore(settings.budgets_db_path)
 ad_account_sync_service = AdAccountSyncService(account_store=ad_account_store, job_store=ad_account_sync_job_store)
+ad_account_discovery_service = AdAccountDiscoveryService(account_store=ad_account_store)
 ad_stats_store: AdStatsStore = SqliteAdStatsStore(settings.budgets_db_path, ad_account_store)
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
@@ -159,6 +163,7 @@ auth_facade = AuthFacadeService(auth_store=auth_store)
 app.state.client_store = client_store
 app.state.ad_account_store = ad_account_store
 app.state.ad_account_sync_service = ad_account_sync_service
+app.state.ad_account_discovery_service = ad_account_discovery_service
 app.state.ad_stats_store = ad_stats_store
 app.state.budget_store = budget_store
 app.state.auth_store = auth_store
@@ -363,6 +368,7 @@ def use_inmemory_stores():
     a = InMemoryAdAccountStore(c)
     sync_jobs = InMemoryAdAccountSyncJobStore()
     sync_service = AdAccountSyncService(account_store=a, job_store=sync_jobs)
+    discovery_service = AdAccountDiscoveryService(account_store=a)
     s = InMemoryAdStatsStore(a)
     b = InMemoryBudgetStore()
     auth = InMemoryAuthStore()
@@ -371,6 +377,7 @@ def use_inmemory_stores():
     app.state.client_store = c
     app.state.ad_account_store = a
     app.state.ad_account_sync_service = sync_service
+    app.state.ad_account_discovery_service = discovery_service
     app.state.ad_stats_store = s
     app.state.budget_store = b
     app.state.auth_store = auth
@@ -401,6 +408,10 @@ def _ad_stats_store() -> AdStatsStore:
 
 def _ad_account_sync_service() -> AdAccountSyncService:
     return app.state.ad_account_sync_service
+
+
+def _ad_account_discovery_service() -> AdAccountDiscoveryService:
+    return app.state.ad_account_discovery_service
 
 
 def _budget_store() -> BudgetStore:
@@ -663,6 +674,26 @@ def _account_or_404(account_id: UUID) -> AdAccountOut:
     if not account:
         raise HTTPException(status_code=404, detail="Ad account not found")
     return account
+
+
+def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optional[UUID]) -> UUID:
+    if requested_client_id:
+        ensure_client_access(ctx, requested_client_id)
+        return requested_client_id
+    if ctx.global_access:
+        candidates = [c.id for c in _client_store().list(status="active")]
+    else:
+        candidates = [cid for cid in ctx.accessible_client_ids if _client_store().get(cid) is not None]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "client_id_required",
+            "message": "client_id is required for discovery when multiple clients are available",
+            "details": {"client_count": len(candidates)},
+        },
+    )
 
 
 @app.get("/health")
@@ -1466,6 +1497,41 @@ def archive_ad_account(account_id: UUID, ctx: RequestContext = Depends(auth_cont
     ensure_account_access(ctx, existing.client_id, account_id=existing.id)
     row = _ad_account_store().archive(account_id)
     return {"status": "archived", "ad_account": row.model_dump(mode="json")}
+
+
+@app.post(
+    "/ad-accounts/discover",
+    response_model=AdAccountDiscoverResponse,
+    summary="Discover/import ad accounts from providers",
+    description=(
+        "Discovers accessible accounts from provider APIs (Meta/Google/TikTok) and imports them into internal "
+        "`ad_accounts` for a target client. Existing rows are matched by `(platform, external_account_id)` and "
+        "updated when `upsert_existing=true`. Budget logic remains internal and independent."
+    ),
+)
+def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext = Depends(auth_context)):
+    target_client_id = _resolve_discovery_client_id(ctx, payload.client_id)
+    result = _ad_account_discovery_service().discover(
+        provider=payload.provider,
+        client_id=target_client_id,
+        upsert_existing=payload.upsert_existing,
+    )
+    _audit_event(
+        event_type="ad_accounts.discover",
+        resource_type="ad_account",
+        ctx=ctx,
+        tenant_client_id=target_client_id,
+        payload={
+            "provider": payload.provider or "all",
+            "client_id": str(target_client_id),
+            "discovered": result.discovered,
+            "created": result.created,
+            "updated": result.updated,
+            "skipped": result.skipped,
+            "providers_failed": result.providers_failed,
+        },
+    )
+    return _ad_account_discovery_service().to_response(result)
 
 
 @app.post(

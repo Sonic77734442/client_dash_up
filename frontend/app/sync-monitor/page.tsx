@@ -7,7 +7,14 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import { AdAccount, AdAccountSyncJob, ClientOut, IntegrationsOverview, IntegrationProvider } from "../../lib/types";
+import {
+  AdAccount,
+  AdAccountDiscoverResponse,
+  AdAccountSyncJob,
+  ClientOut,
+  IntegrationsOverview,
+  IntegrationProvider,
+} from "../../lib/types";
 
 function fmtDate(v?: string | null) {
   if (!v) return "--";
@@ -77,6 +84,7 @@ export default function SyncMonitorPage() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [syncLoading, setSyncLoading] = useState(false);
+  const [discoverClientId, setDiscoverClientId] = useState("");
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -100,6 +108,12 @@ export default function SyncMonitorPage() {
     if (!ready) return;
     void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load sync monitor"));
   }, [ready, loadData]);
+
+  useEffect(() => {
+    if (!discoverClientId && clients.length === 1) {
+      setDiscoverClientId(clients[0].id);
+    }
+  }, [discoverClientId, clients]);
 
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
@@ -165,6 +179,31 @@ export default function SyncMonitorPage() {
       await loadData();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Sync failed";
+      push(msg, "error");
+    } finally {
+      setSyncLoading(false);
+    }
+  }
+
+  async function discoverAccounts(providerName?: "meta" | "google" | "tiktok") {
+    if (!discoverClientId) {
+      push("Select client for imported accounts", "info");
+      return;
+    }
+    try {
+      setSyncLoading(true);
+      const payload: Record<string, unknown> = { client_id: discoverClientId, upsert_existing: true };
+      if (providerName) payload.provider = providerName;
+      const res = await req<AdAccountDiscoverResponse>("/ad-accounts/discover", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const failCount = Object.keys(res.providers_failed || {}).length;
+      const summary = `Discover: +${res.created} new, ${res.updated} updated, ${res.skipped} skipped`;
+      push(failCount ? `${summary} (${failCount} provider errors)` : summary, failCount ? "info" : "success");
+      await loadData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Discover failed";
       push(msg, "error");
     } finally {
       setSyncLoading(false);
@@ -245,6 +284,21 @@ export default function SyncMonitorPage() {
                 <div className="panel-subtitle">Transparent auth/readiness for Google, Meta, TikTok.</div>
               </div>
               <div className="session-controls">
+                <select
+                  value={discoverClientId}
+                  onChange={(e) => setDiscoverClientId(e.target.value)}
+                  title="Target client for imported accounts"
+                >
+                  <option value="">Select client</option>
+                  {clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+                <button className="ghost-btn" onClick={() => void discoverAccounts()} disabled={syncLoading}>
+                  Discover Accounts
+                </button>
                 <button className="ghost-btn" onClick={() => connectProvider("google")}>Connect Google</button>
                 <button className="ghost-btn" onClick={() => connectProvider("facebook")}>Connect Facebook</button>
                 <button className="primary-btn" onClick={() => void runSync()} disabled={syncLoading}>Sync All</button>
@@ -275,6 +329,20 @@ export default function SyncMonitorPage() {
                       disabled={syncLoading}
                     >
                       Sync {providerLabel(p.provider)}
+                    </button>
+                    <button
+                      className="ghost-btn"
+                      onClick={() => {
+                        const platform = asSyncPlatform(p.provider);
+                        if (!platform) {
+                          push("Provider is not supported for account discovery", "info");
+                          return;
+                        }
+                        void discoverAccounts(platform);
+                      }}
+                      disabled={syncLoading}
+                    >
+                      Discover {providerLabel(p.provider)}
                     </button>
                   </div>
                 </article>

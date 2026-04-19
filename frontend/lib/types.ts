@@ -114,6 +114,18 @@ export type AdAccountSyncJob = {
   created_at: string;
 };
 
+export type AdAccountDiscoverResponse = {
+  requested_provider: string;
+  client_id: string;
+  discovered: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  providers_attempted: string[];
+  providers_failed: Record<string, string>;
+  items: AdAccount[];
+};
+
 export type IntegrationProvider = {
   provider: string;
   status: "healthy" | "warning" | "error" | "disconnected";

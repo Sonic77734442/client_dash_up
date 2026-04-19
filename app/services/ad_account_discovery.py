@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Protocol
+from uuid import UUID
+
+from fastapi import HTTPException
+
+from app.schemas import AdAccountCreate, AdAccountDiscoverResponse, AdAccountOut, AdAccountPatch
+from app.services.ad_accounts import AdAccountStore
+from app.services.providers import google_ads, meta, tiktok
+
+
+class AccountDiscoverer(Protocol):
+    def __call__(self) -> List[Dict[str, object]]: ...
+
+
+@dataclass
+class DiscoveryResult:
+    requested_provider: str
+    client_id: UUID
+    discovered: int
+    created: int
+    updated: int
+    skipped: int
+    providers_attempted: List[str]
+    providers_failed: Dict[str, str]
+    items: List[AdAccountOut]
+
+
+def _normalize_provider(value: Optional[str]) -> str:
+    raw = (value or "all").strip().lower()
+    if raw in {"", "all"}:
+        return "all"
+    if raw == "facebook":
+        return "meta"
+    return raw
+
+
+def _fallback_ids_from_env(env_name: str) -> List[str]:
+    raw = os.getenv(env_name, "")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def _fallback_meta_accounts() -> List[Dict[str, object]]:
+    return [
+        {"external_account_id": account_id, "name": f"Meta {account_id}", "currency": "USD"}
+        for account_id in _fallback_ids_from_env("META_ACCOUNT_IDS")
+    ]
+
+
+def _fallback_google_accounts() -> List[Dict[str, object]]:
+    return [
+        {"external_account_id": customer_id, "name": f"Google {customer_id}", "currency": "USD"}
+        for customer_id in _fallback_ids_from_env("GOOGLE_CUSTOMER_IDS")
+    ]
+
+
+def _fallback_tiktok_accounts() -> List[Dict[str, object]]:
+    return [
+        {"external_account_id": advertiser_id, "name": f"TikTok {advertiser_id}", "currency": "USD"}
+        for advertiser_id in _fallback_ids_from_env("TIKTOK_ADVERTISER_IDS")
+    ]
+
+
+class AdAccountDiscoveryService:
+    def __init__(
+        self,
+        account_store: AdAccountStore,
+        *,
+        discoverers: Optional[Dict[str, AccountDiscoverer]] = None,
+    ):
+        self.account_store = account_store
+        self.discoverers: Dict[str, AccountDiscoverer] = discoverers or {
+            "meta": self._discover_meta_accounts,
+            "google": self._discover_google_accounts,
+            "tiktok": self._discover_tiktok_accounts,
+        }
+
+    @staticmethod
+    def _discover_meta_accounts() -> List[Dict[str, object]]:
+        try:
+            rows = meta.list_accounts()
+            if rows:
+                return rows
+        except Exception:
+            pass
+        return _fallback_meta_accounts()
+
+    @staticmethod
+    def _discover_google_accounts() -> List[Dict[str, object]]:
+        try:
+            rows = google_ads.list_accounts()
+            if rows:
+                return rows
+        except Exception:
+            pass
+        return _fallback_google_accounts()
+
+    @staticmethod
+    def _discover_tiktok_accounts() -> List[Dict[str, object]]:
+        try:
+            rows = tiktok.list_accounts()
+            if rows:
+                return rows
+        except Exception:
+            pass
+        return _fallback_tiktok_accounts()
+
+    @staticmethod
+    def _safe_provider_error(exc: Exception) -> str:
+        if isinstance(exc, HTTPException):
+            detail = exc.detail
+            if isinstance(detail, dict):
+                return str(detail.get("message") or detail.get("code") or "Provider discovery failed")
+            return str(detail)
+        return str(exc) or "Provider discovery failed"
+
+    def discover(
+        self,
+        *,
+        provider: Optional[str],
+        client_id: UUID,
+        upsert_existing: bool = True,
+    ) -> DiscoveryResult:
+        provider_filter = _normalize_provider(provider)
+        if provider_filter == "all":
+            providers = [p for p in ("meta", "google", "tiktok") if p in self.discoverers]
+        else:
+            if provider_filter not in self.discoverers:
+                raise HTTPException(status_code=400, detail="Unsupported provider for discovery")
+            providers = [provider_filter]
+
+        existing = {
+            ((a.platform or "").lower().strip(), str(a.external_account_id or "").strip()): a
+            for a in self.account_store.list(status="all")
+        }
+        now_iso = datetime.utcnow().isoformat()
+
+        created = 0
+        updated = 0
+        skipped = 0
+        discovered = 0
+        items: List[AdAccountOut] = []
+        providers_failed: Dict[str, str] = {}
+
+        for p in providers:
+            discoverer = self.discoverers.get(p)
+            if not discoverer:
+                providers_failed[p] = "Provider discovery not configured"
+                continue
+            try:
+                rows = discoverer() or []
+            except Exception as exc:
+                providers_failed[p] = self._safe_provider_error(exc)
+                continue
+
+            for row in rows:
+                external_account_id = str(row.get("external_account_id") or "").strip()
+                if not external_account_id:
+                    skipped += 1
+                    continue
+                discovered += 1
+                name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
+                currency = str(row.get("currency") or "USD").strip().upper() or "USD"
+                key = (p, external_account_id)
+                existing_account = existing.get(key)
+                discovery_meta = {
+                    "discovered_at": now_iso,
+                    "discovery_provider": p,
+                    "discovery_source": str(row.get("source") or "provider_api_or_env_fallback"),
+                }
+                if existing_account:
+                    merged_meta = dict(existing_account.metadata or {})
+                    merged_meta.update(discovery_meta)
+                    if not upsert_existing:
+                        skipped += 1
+                        items.append(existing_account)
+                        continue
+                    patch = AdAccountPatch(
+                        name=name if name and name != existing_account.name else None,
+                        currency=currency if currency and currency != existing_account.currency else None,
+                        status="active" if existing_account.status != "active" else None,
+                        metadata=merged_meta,
+                    )
+                    patched = self.account_store.patch(existing_account.id, patch)
+                    existing[key] = patched
+                    items.append(patched)
+                    updated += 1
+                    continue
+
+                created_row = self.account_store.create(
+                    AdAccountCreate(
+                        client_id=client_id,
+                        platform=p,
+                        external_account_id=external_account_id,
+                        name=name,
+                        currency=currency,
+                        status="active",
+                        metadata=discovery_meta,
+                    )
+                )
+                existing[key] = created_row
+                items.append(created_row)
+                created += 1
+
+        return DiscoveryResult(
+            requested_provider=provider_filter,
+            client_id=client_id,
+            discovered=discovered,
+            created=created,
+            updated=updated,
+            skipped=skipped,
+            providers_attempted=providers,
+            providers_failed=providers_failed,
+            items=items,
+        )
+
+    @staticmethod
+    def to_response(result: DiscoveryResult) -> AdAccountDiscoverResponse:
+        return AdAccountDiscoverResponse(
+            requested_provider=result.requested_provider,
+            client_id=result.client_id,
+            discovered=result.discovered,
+            created=result.created,
+            updated=result.updated,
+            skipped=result.skipped,
+            providers_attempted=result.providers_attempted,
+            providers_failed=result.providers_failed,
+            items=result.items,
+        )

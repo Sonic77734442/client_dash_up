@@ -19,6 +19,68 @@ def access_token() -> str:
     return token
 
 
+def _fallback_accounts() -> List[Dict[str, object]]:
+    raw = os.getenv("TIKTOK_ADVERTISER_IDS", "")
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    return [
+        {
+            "external_account_id": normalize_advertiser_id(advertiser_id),
+            "name": f"TikTok {normalize_advertiser_id(advertiser_id)}",
+            "currency": "USD",
+            "source": "env",
+        }
+        for advertiser_id in ids
+        if normalize_advertiser_id(advertiser_id)
+    ]
+
+
+def list_accounts() -> List[Dict[str, object]]:
+    url = "https://business-api.tiktok.com/open_api/v1.3/oauth2/advertiser/get/"
+    headers = {"Access-Token": access_token()}
+    try:
+        resp = httpx.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            fallback = _fallback_accounts()
+            if fallback:
+                return fallback
+            raise HTTPException(status_code=502, detail=f"TikTok API error: {resp.text}")
+        payload = resp.json()
+        if payload.get("code") not in (0, None):
+            fallback = _fallback_accounts()
+            if fallback:
+                return fallback
+            raise HTTPException(status_code=502, detail=f"TikTok API error: {payload}")
+        data = payload.get("data") or {}
+        rows = data.get("list") or data.get("advertisers") or []
+        out: List[Dict[str, object]] = []
+        for row in rows:
+            advertiser_id = normalize_advertiser_id(
+                row.get("advertiser_id") or row.get("id") or row.get("advertiserId")
+            )
+            if not advertiser_id:
+                continue
+            out.append(
+                {
+                    "external_account_id": advertiser_id,
+                    "name": str(
+                        row.get("advertiser_name")
+                        or row.get("name")
+                        or row.get("advertiserName")
+                        or f"TikTok {advertiser_id}"
+                    ),
+                    "currency": str(row.get("currency") or "USD"),
+                    "source": "api",
+                }
+            )
+        if out:
+            return out
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    return _fallback_accounts()
+
+
 def fetch_report(
     advertiser_id: str,
     date_from: str,

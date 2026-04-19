@@ -38,6 +38,62 @@ def ads_client() -> GoogleAdsClient:
     return GoogleAdsClient.load_from_dict(config)
 
 
+def _fallback_accounts() -> List[Dict[str, object]]:
+    raw = os.getenv("GOOGLE_CUSTOMER_IDS", "")
+    ids = [x.strip() for x in raw.split(",") if x.strip()]
+    return [
+        {
+            "external_account_id": normalize_customer_id(customer_id),
+            "name": f"Google {normalize_customer_id(customer_id)}",
+            "currency": "USD",
+            "source": "env",
+        }
+        for customer_id in ids
+        if normalize_customer_id(customer_id)
+    ]
+
+
+def list_accounts() -> List[Dict[str, object]]:
+    try:
+        client = ads_client()
+        customer_service = client.get_service("CustomerService")
+        ga_service = client.get_service("GoogleAdsService")
+        response = customer_service.list_accessible_customers()
+        out: List[Dict[str, object]] = []
+        for resource_name in list(response.resource_names or []):
+            customer_id = normalize_customer_id(str(resource_name).split("/")[-1])
+            if not customer_id:
+                continue
+            name = f"Google {customer_id}"
+            currency = "USD"
+            try:
+                rows = ga_service.search(
+                    customer_id=customer_id,
+                    query="SELECT customer.descriptive_name, customer.currency_code FROM customer LIMIT 1",
+                )
+                for row in rows:
+                    if row.customer.descriptive_name:
+                        name = str(row.customer.descriptive_name)
+                    if row.customer.currency_code:
+                        currency = str(row.customer.currency_code)
+                    break
+            except Exception:
+                pass
+            out.append(
+                {
+                    "external_account_id": customer_id,
+                    "name": name,
+                    "currency": currency,
+                    "source": "api",
+                }
+            )
+        if out:
+            return out
+    except Exception:
+        pass
+    return _fallback_accounts()
+
+
 def fetch_insights(customer_id: str, date_from: str, date_to: str) -> Tuple[List[Dict[str, object]], Optional[str]]:
     client = ads_client()
     ga_service = client.get_service("GoogleAdsService")

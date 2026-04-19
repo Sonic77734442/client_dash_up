@@ -214,6 +214,33 @@ class AdAccountSyncRunRequest(BaseModel):
     force: bool = False
 
 
+class AdAccountDiscoverRequest(BaseModel):
+    provider: Optional[str] = Field(
+        default=None,
+        description="Optional provider filter: meta|google|tiktok|all (facebook maps to meta).",
+    )
+    client_id: Optional[UUID] = Field(
+        default=None,
+        description="Target internal client for imported ad accounts. Required when multiple clients are in scope.",
+    )
+    upsert_existing: bool = Field(
+        default=True,
+        description="When true, updates existing accounts' name/currency/metadata and re-activates archived rows.",
+    )
+
+
+class AdAccountDiscoverResponse(BaseModel):
+    requested_provider: str
+    client_id: UUID
+    discovered: int
+    created: int
+    updated: int
+    skipped: int
+    providers_attempted: List[str]
+    providers_failed: Dict[str, str] = Field(default_factory=dict)
+    items: List[AdAccountOut]
+
+
 class AdAccountSyncJobOut(BaseModel):
     id: UUID
     ad_account_id: UUID
