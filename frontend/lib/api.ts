@@ -38,6 +38,12 @@ function storeCsrfToken(token: string): void {
   localStorage.setItem(CSRF_STORAGE_KEY, value);
 }
 
+function clearStoredCsrfToken(): void {
+  csrfMemoryToken = "";
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(CSRF_STORAGE_KEY);
+}
+
 async function resolveCsrfToken(baseUrl: string): Promise<string> {
   const fromCookie = readCookie(CSRF_COOKIE_NAME);
   if (fromCookie) {
@@ -71,30 +77,43 @@ export async function fetchJson<T>(
   init?: RequestInit
 ): Promise<T> {
   const method = (init?.method || "GET").toUpperCase();
-  const headers = new Headers(init?.headers || {});
-  if (!headers.has("Content-Type") && method !== "GET") {
-    headers.set("Content-Type", "application/json");
-  }
-  if (["POST", "PATCH", "PUT", "DELETE"].includes(method) && !headers.has(CSRF_HEADER_NAME)) {
-    const csrf = await resolveCsrfToken(baseUrl);
-    if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
-  }
   const resolvedToken =
     (token || "").trim() ||
     (typeof window !== "undefined" ? (localStorage.getItem("ops_session_token") || "").trim() : "");
-  if (resolvedToken) headers.set("Authorization", `Bearer ${resolvedToken}`);
 
-  const res = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers,
-    credentials: "include",
-  });
+  async function requestOnce(forceRefreshCsrf: boolean): Promise<{ res: Response; body: unknown }> {
+    const headers = new Headers(init?.headers || {});
+    if (!headers.has("Content-Type") && method !== "GET") {
+      headers.set("Content-Type", "application/json");
+    }
+    if (["POST", "PATCH", "PUT", "DELETE"].includes(method) && !headers.has(CSRF_HEADER_NAME)) {
+      if (forceRefreshCsrf) clearStoredCsrfToken();
+      const csrf = await resolveCsrfToken(baseUrl);
+      if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
+    }
+    if (resolvedToken) headers.set("Authorization", `Bearer ${resolvedToken}`);
 
-  let body: unknown = {};
-  try {
-    body = await res.json();
-  } catch {
-    body = {};
+    const res = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers,
+      credentials: "include",
+    });
+
+    let body: unknown = {};
+    try {
+      body = await res.json();
+    } catch {
+      body = {};
+    }
+    return { res, body };
+  }
+
+  let { res, body } = await requestOnce(false);
+  if (!res.ok && res.status === 403) {
+    const envelope = body as ApiErrorEnvelope;
+    if ((envelope?.error?.code || "").trim() === "csrf_failed") {
+      ({ res, body } = await requestOnce(true));
+    }
   }
 
   if (!res.ok) {
