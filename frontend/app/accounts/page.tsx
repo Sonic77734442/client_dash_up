@@ -39,6 +39,19 @@ function accountSyncStatus(a: AdAccount): "synced" | "unmapped" | "error" {
   return "synced";
 }
 
+function sanitizedMetadataForActivation(source?: Record<string, unknown> | null) {
+  const next: Record<string, unknown> = { ...(source || {}) };
+  delete next.sync_status;
+  delete next.sync_error;
+  delete next.sync_error_code;
+  delete next.sync_error_category;
+  delete next.sync_retryable;
+  delete next.sync_next_retry_at;
+  delete next.sync_attempt;
+  delete next.last_sync_job_id;
+  return next;
+}
+
 export default function AccountsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -166,7 +179,15 @@ export default function AccountsPage() {
       setMapLoading(true);
       setMapError("");
       await Promise.all(
-        targetIds.map((id) => req<AdAccount>(`/ad-accounts/${id}`, { method: "PATCH", body: JSON.stringify({ client_id: mappingForm.client_id }) }))
+        targetIds.map((id) => {
+          const account = accounts.find((a) => a.id === id);
+          const payload: Record<string, unknown> = {
+            client_id: mappingForm.client_id,
+            status: "active",
+          };
+          if (account) payload.metadata = sanitizedMetadataForActivation(account.metadata || {});
+          return req<AdAccount>(`/ad-accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        })
       );
       push(`Mapped ${targetIds.length} account(s)`, "success");
       setMapOpen(false);
