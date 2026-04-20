@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -201,6 +202,13 @@ class AdAccountSyncService:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _to_money_2(value: object) -> float:
+        try:
+            return float(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        except Exception:
+            return 0.0
+
     def _ingest_provider_rows(
         self,
         *,
@@ -219,8 +227,8 @@ class AdAccountSyncService:
                     platform=platform,
                     impressions=self._to_int(row.get("impressions")),
                     clicks=self._to_int(row.get("clicks")),
-                    spend=self._to_float(row.get("spend")),
-                    conversions=self._to_float(row.get("conversions")) if row.get("conversions") is not None else None,
+                    spend=self._to_money_2(row.get("spend")),
+                    conversions=self._to_money_2(row.get("conversions")) if row.get("conversions") is not None else None,
                 )
                 for row in rows
             ]

@@ -217,3 +217,31 @@ def test_sync_auto_date_range_uses_last_sync_or_default_lookback():
     assert by_external["meta-existing"] == ("2026-04-10", "2026-04-20")
     # 30-day inclusive window when account has never been synced.
     assert by_external["meta-fresh"] == ("2026-03-22", "2026-04-20")
+
+
+def test_sync_rounds_money_fields_before_ingest():
+    reset_state()
+    c = mk_client("Money Precision")
+    acc = mk_account(c["id"], "google", "g-precise")
+
+    service = app.state.ad_account_sync_service
+    service.provider_fetchers = {
+        "google": lambda external, date_from, date_to: [
+            {"date": date_from, "impressions": 100, "clicks": 10, "spend": 158.629157, "conversions": 1.9876}
+        ],
+    }
+
+    run = client.post(
+        "/ad-accounts/sync/run",
+        json={"account_ids": [acc["id"]], "date_from": "2026-04-01", "date_to": "2026-04-01", "force": True},
+    )
+    assert run.status_code == 200
+    assert run.json()["success"] == 1
+    assert run.json()["failed"] == 0
+
+    stats = client.get("/ad-stats?date_from=2026-04-01&date_to=2026-04-01&platform=google")
+    assert stats.status_code == 200
+    assert stats.json()["count"] == 1
+    row = stats.json()["items"][0]
+    assert row["spend"] == "158.63"
+    assert row["conversions"] == "1.99"
