@@ -2,6 +2,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.ad_account_sync import AdAccountSyncService
 
 
 client = TestClient(app)
@@ -168,3 +169,14 @@ def test_sync_retry_backoff_skips_until_force():
     latest = jobs.json()["items"][0]
     prev = jobs.json()["items"][1]
     assert latest["attempt"] == prev["attempt"] + 1
+
+
+def test_sync_error_classification_for_google_manager_metrics_error():
+    exc = RuntimeError(
+        "errors { error_code { query_error: REQUESTED_METRICS_FOR_MANAGER } "
+        "message: 'Metrics cannot be requested for a manager account.' }"
+    )
+    code, category, retryable = AdAccountSyncService._classify_error(exc)
+    assert code == "invalid_request"
+    assert category == "validation"
+    assert retryable is False

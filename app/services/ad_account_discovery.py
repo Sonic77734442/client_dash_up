@@ -111,7 +111,10 @@ class AdAccountDiscoveryService:
             if rows:
                 return rows
         except Exception:
-            pass
+            # If tenant-scoped credentials are provided, surface provider errors to caller
+            # instead of silently falling back to env IDs (which can mask MCC discovery issues).
+            if credentials:
+                raise
         return _fallback_google_accounts()
 
     @staticmethod

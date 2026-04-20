@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Protocol
@@ -192,11 +193,26 @@ class AdAccountSyncService:
                 return ("provider_unavailable", "provider", True)
             if status in {400, 404, 422}:
                 return ("invalid_request", "validation", False)
+        if "requested_metrics_for_manager" in raw or "metrics cannot be requested for a manager account" in raw:
+            return ("invalid_request", "validation", False)
         if "unauthorized" in raw or "forbidden" in raw or "scope" in raw or "permission" in raw or "token" in raw:
             return ("auth_failed", "auth", False)
-        if "rate" in raw or "quota" in raw or "throttl" in raw:
+        if "user_permission_denied" in raw or "customer_not_enabled" in raw:
+            return ("auth_failed", "auth", False)
+        if any(
+            needle in raw
+            for needle in (
+                "rate limit",
+                "rate-limited",
+                "rate_limited",
+                "quota",
+                "throttl",
+                "too many requests",
+                "resource exhausted",
+            )
+        ):
             return ("rate_limited", "rate_limit", True)
-        if "timeout" in raw or "temporar" in raw or "unavailable" in raw or "connection" in raw or "gateway" in raw:
+        if re.search(r"\b(timeout|temporar(?:y|ily)?|unavailable|connection|gateway)\b", raw):
             return ("provider_unavailable", "provider", True)
         if "invalid" in raw or "bad request" in raw or "missing" in raw:
             return ("invalid_request", "validation", False)

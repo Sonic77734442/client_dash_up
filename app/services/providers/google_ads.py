@@ -67,6 +67,8 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     strict_mode = config_override is not None
+    cfg = config_override or {}
+    login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "")
     try:
         client = ads_client(config_override)
         customer_service = client.get_service("CustomerService")
@@ -96,21 +98,28 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
 
         # 1) Add root accessible accounts.
         for customer_id in root_ids:
+            if login_customer_id and customer_id == login_customer_id:
+                # Do not include configured MCC manager account as leaf sync target.
+                continue
             name = f"Google {customer_id}"
             currency = "USD"
+            is_manager = False
             try:
                 rows = ga_service.search(
                     customer_id=customer_id,
-                    query="SELECT customer.descriptive_name, customer.currency_code FROM customer LIMIT 1",
+                    query="SELECT customer.descriptive_name, customer.currency_code, customer.manager FROM customer LIMIT 1",
                 )
                 for row in rows:
                     if row.customer.descriptive_name:
                         name = str(row.customer.descriptive_name)
                     if row.customer.currency_code:
                         currency = str(row.customer.currency_code)
+                    is_manager = bool(getattr(row.customer, "manager", False))
                     break
             except Exception:
                 pass
+            if is_manager:
+                continue
             add_row(customer_id, name, currency, "api_root")
 
         # 2) Traverse MCC hierarchy and include leaf/client accounts.
@@ -120,7 +129,8 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
               customer_client.descriptive_name,
               customer_client.currency_code,
               customer_client.manager,
-              customer_client.level
+              customer_client.level,
+              customer_client.status
             FROM customer_client
             WHERE customer_client.level <= 10
         """
@@ -135,6 +145,10 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
                     continue
                 if bool(row.customer_client.manager):
                     # Keep only non-manager clients in final list for registry.
+                    continue
+                status_name = str(getattr(row.customer_client, "status", "") or "").upper()
+                if "ENABLED" not in status_name:
+                    # Skip non-active client accounts to reduce predictable sync failures.
                     continue
                 add_row(
                     child_id,
