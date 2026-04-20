@@ -7,13 +7,7 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import {
-  ExternalAccountConfig,
-  ExternalInsightsSummary,
-  GoogleInsightsData,
-  MetaInsightsData,
-  TikTokInsightsData,
-} from "../../lib/types";
+import { AdAccount, AdStat } from "../../lib/types";
 
 function fmtNum(v?: number | string | null, digits = 0) {
   const n = Number(v || 0);
@@ -45,28 +39,105 @@ function lastDays(days: number) {
   return { from: fmt(from), to: fmt(to) };
 }
 
+type TrafficSummary = {
+  spend: number;
+  impressions: number;
+  clicks: number;
+  conversions: number;
+  ctr: number;
+  cpc: number;
+  cpm: number;
+  currency: string;
+};
+
+function summarize(rows: AdStat[]): TrafficSummary {
+  const spend = rows.reduce((sum, row) => sum + Number(row.spend || 0), 0);
+  const impressions = rows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
+  const clicks = rows.reduce((sum, row) => sum + Number(row.clicks || 0), 0);
+  const conversions = rows.reduce((sum, row) => sum + Number(row.conversions || 0), 0);
+  return {
+    spend,
+    impressions,
+    clicks,
+    conversions,
+    ctr: impressions ? clicks / impressions : 0,
+    cpc: clicks ? spend / clicks : 0,
+    cpm: impressions ? (spend / impressions) * 1000 : 0,
+    currency: "USD",
+  };
+}
+
+function groupByAccount(rows: AdStat[], accountMap: Map<string, AdAccount>) {
+  const buckets = new Map<string, { spend: number; impressions: number; clicks: number; conversions: number }>();
+  for (const row of rows) {
+    const accountId = String(row.ad_account_id || "").trim();
+    if (!accountId) continue;
+    const bucket = buckets.get(accountId) || { spend: 0, impressions: 0, clicks: 0, conversions: 0 };
+    bucket.spend += Number(row.spend || 0);
+    bucket.impressions += Number(row.impressions || 0);
+    bucket.clicks += Number(row.clicks || 0);
+    bucket.conversions += Number(row.conversions || 0);
+    buckets.set(accountId, bucket);
+  }
+  return [...buckets.entries()]
+    .map(([accountId, v]) => ({
+      account_id: accountId,
+      account_name: accountMap.get(accountId)?.name || accountId,
+      spend: v.spend,
+      impressions: v.impressions,
+      clicks: v.clicks,
+      conversions: v.conversions,
+      ctr: v.impressions ? v.clicks / v.impressions : 0,
+      cpc: v.clicks ? v.spend / v.clicks : 0,
+      cpm: v.impressions ? (v.spend / v.impressions) * 1000 : 0,
+    }))
+    .sort((a, b) => b.spend - a.spend);
+}
+
+function groupDaily(rows: AdStat[]) {
+  const buckets = new Map<string, { spend: number; impressions: number; clicks: number; conversions: number }>();
+  for (const row of rows) {
+    const d = String(row.date || "").trim();
+    if (!d) continue;
+    const bucket = buckets.get(d) || { spend: 0, impressions: 0, clicks: 0, conversions: 0 };
+    bucket.spend += Number(row.spend || 0);
+    bucket.impressions += Number(row.impressions || 0);
+    bucket.clicks += Number(row.clicks || 0);
+    bucket.conversions += Number(row.conversions || 0);
+    buckets.set(d, bucket);
+  }
+  return [...buckets.entries()]
+    .map(([date, v]) => ({
+      date,
+      spend: v.spend,
+      impressions: v.impressions,
+      clicks: v.clicks,
+      conversions: v.conversions,
+      ctr: v.impressions ? v.clicks / v.impressions : 0,
+      cpc: v.clicks ? v.spend / v.clicks : 0,
+      cpm: v.impressions ? (v.spend / v.impressions) * 1000 : 0,
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
 function TableBlock({ title, rows }: { title: string; rows: Record<string, unknown>[] }) {
   const columns = useMemo(() => {
     if (!rows.length) return [] as string[];
     const preferred = [
-      "campaign_name",
-      "adgroup_name",
-      "ad_name",
-      "campaign_id",
-      "adgroup_id",
-      "ad_id",
+      "date",
+      "account_name",
+      "account_id",
       "spend",
       "impressions",
       "clicks",
+      "conversions",
       "ctr",
       "cpc",
       "cpm",
-      "conversions",
-      "reach",
     ];
     const present = new Set<string>();
     for (const r of rows) Object.keys(r).forEach((k) => present.add(k));
-    return preferred.filter((k) => present.has(k)).slice(0, 10);
+    return preferred.filter((k) => present.has(k));
   }, [rows]);
 
   return (
@@ -81,7 +152,7 @@ function TableBlock({ title, rows }: { title: string; rows: Record<string, unkno
             <tr>{columns.map((c) => <th key={c}>{c}</th>)}</tr>
           </thead>
           <tbody>
-            {rows.slice(0, 100).map((r, idx) => (
+            {rows.slice(0, 200).map((r, idx) => (
               <tr key={`${title}-${idx}`}>
                 {columns.map((c) => {
                   const raw = r[c];
@@ -105,16 +176,17 @@ function TableBlock({ title, rows }: { title: string; rows: Record<string, unkno
   );
 }
 
-function Metrics({ summary }: { summary?: ExternalInsightsSummary }) {
-  const currency = summary?.currency || "USD";
+function Metrics({ summary }: { summary: TrafficSummary }) {
+  const currency = summary.currency || "USD";
   return (
     <section className="kpi-grid" style={{ marginTop: 8 }}>
-      <article className="kpi-card"><div className="kpi-title">Spend</div><div className="kpi-value">{fmtMoney(summary?.spend, currency)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">Impressions</div><div className="kpi-value">{fmtNum(summary?.impressions)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">Clicks</div><div className="kpi-value">{fmtNum(summary?.clicks)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">CTR</div><div className="kpi-value">{toPct(summary?.ctr)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">CPC</div><div className="kpi-value">{fmtMoney(summary?.cpc, currency)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">CPM</div><div className="kpi-value">{fmtMoney(summary?.cpm, currency)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">Spend</div><div className="kpi-value">{fmtMoney(summary.spend, currency)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">Impressions</div><div className="kpi-value">{fmtNum(summary.impressions)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">Clicks</div><div className="kpi-value">{fmtNum(summary.clicks)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">Conversions</div><div className="kpi-value">{fmtNum(summary.conversions, 2)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">CTR</div><div className="kpi-value">{toPct(summary.ctr)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">CPC</div><div className="kpi-value">{fmtMoney(summary.cpc, currency)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">CPM</div><div className="kpi-value">{fmtMoney(summary.cpm, currency)}</div></article>
     </section>
   );
 }
@@ -128,15 +200,13 @@ export default function TrafficPage() {
   const [warning, setWarning] = useState("");
   const [dateFrom, setDateFrom] = useState(lastDays(30).from);
   const [dateTo, setDateTo] = useState(lastDays(30).to);
-
-  const [accounts, setAccounts] = useState<ExternalAccountConfig[]>([]);
+  const [accounts, setAccounts] = useState<AdAccount[]>([]);
+  const [metaRows, setMetaRows] = useState<AdStat[]>([]);
+  const [googleRows, setGoogleRows] = useState<AdStat[]>([]);
+  const [tiktokRows, setTiktokRows] = useState<AdStat[]>([]);
   const [metaAccount, setMetaAccount] = useState("");
   const [googleAccount, setGoogleAccount] = useState("");
   const [tiktokAccount, setTiktokAccount] = useState("");
-
-  const [meta, setMeta] = useState<MetaInsightsData | null>(null);
-  const [google, setGoogle] = useState<GoogleInsightsData | null>(null);
-  const [tiktok, setTiktok] = useState<TikTokInsightsData | null>(null);
 
   const req = useCallback(
     <T,>(path: string) => fetchJson<T>(session.apiBase, path, session.token),
@@ -146,28 +216,27 @@ export default function TrafficPage() {
   const metaAccounts = useMemo(() => accounts.filter((x) => x.platform === "meta"), [accounts]);
   const googleAccounts = useMemo(() => accounts.filter((x) => x.platform === "google"), [accounts]);
   const tiktokAccounts = useMemo(() => accounts.filter((x) => x.platform === "tiktok"), [accounts]);
+  const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
 
   const loadAccounts = useCallback(async () => {
-    const data = await req<{ items: ExternalAccountConfig[] }>("/accounts");
+    const data = await req<{ items: AdAccount[] }>("/ad-accounts?status=active");
     setAccounts(data.items || []);
   }, [req]);
 
-  const loadInsights = useCallback(async () => {
-    const q = (id?: string) => {
-      const p = new URLSearchParams({ date_from: dateFrom, date_to: dateTo });
-      if (id) p.set("account_id", id);
-      return `?${p.toString()}`;
+  const loadStats = useCallback(async () => {
+    const q = (platform: "meta" | "google" | "tiktok", accountId?: string) => {
+      const p = new URLSearchParams({ date_from: dateFrom, date_to: dateTo, platform });
+      if (accountId) p.set("account_id", accountId);
+      return `/ad-stats?${p.toString()}`;
     };
-
     const [m, g, t] = await Promise.all([
-      req<MetaInsightsData>(`/meta/insights${q(metaAccount || undefined)}`),
-      req<GoogleInsightsData>(`/google/insights${q(googleAccount || undefined)}`),
-      req<TikTokInsightsData>(`/tiktok/insights${q(tiktokAccount || undefined)}`),
+      req<{ items: AdStat[] }>(q("meta", metaAccount || undefined)),
+      req<{ items: AdStat[] }>(q("google", googleAccount || undefined)),
+      req<{ items: AdStat[] }>(q("tiktok", tiktokAccount || undefined)),
     ]);
-
-    setMeta(m);
-    setGoogle(g);
-    setTiktok(t);
+    setMetaRows(m.items || []);
+    setGoogleRows(g.items || []);
+    setTiktokRows(t.items || []);
   }, [dateFrom, dateTo, metaAccount, googleAccount, tiktokAccount, req]);
 
   useEffect(() => {
@@ -177,8 +246,20 @@ export default function TrafficPage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadInsights().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load traffic data"));
-  }, [ready, loadInsights]);
+    void loadStats().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load traffic data"));
+  }, [ready, loadStats]);
+
+  const metaSummary = useMemo(() => summarize(metaRows), [metaRows]);
+  const googleSummary = useMemo(() => summarize(googleRows), [googleRows]);
+  const tiktokSummary = useMemo(() => summarize(tiktokRows), [tiktokRows]);
+
+  const metaByAccount = useMemo(() => groupByAccount(metaRows, accountMap), [metaRows, accountMap]);
+  const googleByAccount = useMemo(() => groupByAccount(googleRows, accountMap), [googleRows, accountMap]);
+  const tiktokByAccount = useMemo(() => groupByAccount(tiktokRows, accountMap), [tiktokRows, accountMap]);
+
+  const metaDaily = useMemo(() => groupDaily(metaRows), [metaRows]);
+  const googleDaily = useMemo(() => groupDaily(googleRows), [googleRows]);
+  const tiktokDaily = useMemo(() => groupDaily(tiktokRows), [tiktokRows]);
 
   return (
     <>
@@ -190,7 +271,7 @@ export default function TrafficPage() {
             <div className="topbar-left">
               <AppTopTabs active="traffic" />
               <div className="topbar-title">Traffic by Platform</div>
-              <div className="panel-subtitle">Separate Meta / Google / TikTok blocks with account-level pull and campaign drilldown.</div>
+              <div className="panel-subtitle">Unified stats from synced ad accounts.</div>
             </div>
             {tokenLoginEnabled ? (
               <div className="session-controls">
@@ -213,7 +294,7 @@ export default function TrafficPage() {
                     persist(next);
                     setSession(next);
                     try {
-                      await Promise.all([loadAccounts(), loadInsights()]);
+                      await Promise.all([loadAccounts(), loadStats()]);
                       push("Session saved", "success");
                     } catch (err) {
                       setWarning(err instanceof Error ? err.message : "Load failed");
@@ -239,7 +320,7 @@ export default function TrafficPage() {
                   To
                   <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
                 </label>
-                <button className="primary-btn" onClick={() => void loadInsights()}>Apply</button>
+                <button className="primary-btn" onClick={() => void loadStats()}>Apply</button>
               </div>
             </div>
           </section>
@@ -254,15 +335,16 @@ export default function TrafficPage() {
                   Account
                   <select value={metaAccount} onChange={(e) => setMetaAccount(e.target.value)}>
                     <option value="">All Meta accounts</option>
-                    {metaAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_id}</option>)}
+                    {metaAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_account_id}</option>)}
                   </select>
                 </label>
-                <button className="ghost-btn" onClick={() => void loadInsights()}>Reload</button>
+                <button className="ghost-btn" onClick={() => void loadStats()}>Reload</button>
               </div>
             </div>
-            <div className="panel-subtitle">{meta?.status || "--"}</div>
-            <Metrics summary={meta?.summary} />
-            <TableBlock title="Campaigns" rows={meta?.campaigns || []} />
+            <div className="panel-subtitle">{metaRows.length} synced rows</div>
+            <Metrics summary={metaSummary} />
+            <TableBlock title="By Account" rows={metaByAccount} />
+            <TableBlock title="Daily" rows={metaDaily} />
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
@@ -273,15 +355,16 @@ export default function TrafficPage() {
                   Account
                   <select value={googleAccount} onChange={(e) => setGoogleAccount(e.target.value)}>
                     <option value="">All Google accounts</option>
-                    {googleAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_id}</option>)}
+                    {googleAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_account_id}</option>)}
                   </select>
                 </label>
-                <button className="ghost-btn" onClick={() => void loadInsights()}>Reload</button>
+                <button className="ghost-btn" onClick={() => void loadStats()}>Reload</button>
               </div>
             </div>
-            <div className="panel-subtitle">{google?.status || "--"}</div>
-            <Metrics summary={google?.summary} />
-            <TableBlock title="Campaigns" rows={google?.campaigns || []} />
+            <div className="panel-subtitle">{googleRows.length} synced rows</div>
+            <Metrics summary={googleSummary} />
+            <TableBlock title="By Account" rows={googleByAccount} />
+            <TableBlock title="Daily" rows={googleDaily} />
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
@@ -292,17 +375,16 @@ export default function TrafficPage() {
                   Account
                   <select value={tiktokAccount} onChange={(e) => setTiktokAccount(e.target.value)}>
                     <option value="">All TikTok accounts</option>
-                    {tiktokAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_id}</option>)}
+                    {tiktokAccounts.map((a) => <option key={a.id} value={a.id}>{a.name || a.external_account_id}</option>)}
                   </select>
                 </label>
-                <button className="ghost-btn" onClick={() => void loadInsights()}>Reload</button>
+                <button className="ghost-btn" onClick={() => void loadStats()}>Reload</button>
               </div>
             </div>
-            <div className="panel-subtitle">{tiktok?.status || "--"}</div>
-            <Metrics summary={tiktok?.summary} />
-            <TableBlock title="Campaigns" rows={tiktok?.campaigns || []} />
-            <TableBlock title="Ad Groups" rows={tiktok?.adgroups || []} />
-            <TableBlock title="Ads" rows={tiktok?.ads || []} />
+            <div className="panel-subtitle">{tiktokRows.length} synced rows</div>
+            <Metrics summary={tiktokSummary} />
+            <TableBlock title="By Account" rows={tiktokByAccount} />
+            <TableBlock title="Daily" rows={tiktokDaily} />
           </section>
         </main>
       </div>

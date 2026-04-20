@@ -57,7 +57,16 @@ export type Overview = {
   };
 };
 
-export type AdStat = { date: string; platform: string; spend: number };
+export type AdStat = {
+  id?: string;
+  ad_account_id?: string;
+  date: string;
+  platform: string;
+  impressions?: number;
+  clicks?: number;
+  spend: number;
+  conversions?: number | null;
+};
 export type Budget = {
   id?: string;
   client_id: string;
