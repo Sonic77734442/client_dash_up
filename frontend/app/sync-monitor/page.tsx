@@ -77,6 +77,14 @@ function safeErrorMessage(raw?: string | null) {
   return "Sync failed. Check provider diagnostics and retry.";
 }
 
+function defaultSyncRangeLastDays(days: number) {
+  const to = new Date();
+  const from = new Date(to);
+  from.setDate(from.getDate() - (days - 1));
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  return { date_from: fmt(from), date_to: fmt(to) };
+}
+
 export default function SyncMonitorPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -192,7 +200,7 @@ export default function SyncMonitorPage() {
     }
     try {
       setSyncLoading(true);
-      const payload: Record<string, unknown> = { force: true };
+      const payload: Record<string, unknown> = { force: true, ...defaultSyncRangeLastDays(30) };
       if (discoverClientId) payload.client_id = discoverClientId;
       if (opts?.platform) payload.platform = opts.platform;
       if (opts?.accountId) payload.account_ids = [opts.accountId];
