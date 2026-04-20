@@ -10,10 +10,11 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from app.db import init_sqlite, sqlite_conn
-from app.schemas import AdAccountPatch, AdAccountSyncJobOut
+from app.schemas import AdAccountPatch, AdAccountSyncJobOut, AdStatWrite, AdStatsIngestRequest
 from app.services.ad_accounts import AdAccountStore
 from app.services.date_utils import meta_safe_date_from
 from app.services.providers import google_ads, meta, tiktok
+from app.services.ad_stats import AdStatsStore
 
 
 class AdAccountSyncJobStore(Protocol):
@@ -158,18 +159,72 @@ class AdAccountSyncService:
         self,
         account_store: AdAccountStore,
         job_store: AdAccountSyncJobStore,
+        ad_stats_store: AdStatsStore,
         *,
         provider_fetchers: Optional[Dict[str, Callable[..., List[Dict[str, object]]]]] = None,
         credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
     ):
         self.account_store = account_store
         self.job_store = job_store
+        self.ad_stats_store = ad_stats_store
         self.credential_resolver = credential_resolver
         self.provider_fetchers = provider_fetchers or {
             "meta": self._fetch_meta_daily,
             "google": self._fetch_google_daily,
             "tiktok": self._fetch_tiktok_daily,
         }
+
+    @staticmethod
+    def _row_date_or_default(row: Dict[str, object], fallback: str) -> str:
+        value = (
+            row.get("date")
+            or row.get("date_start")
+            or row.get("day")
+            or row.get("stat_time_day")
+            or fallback
+        )
+        return str(value).strip() or fallback
+
+    @staticmethod
+    def _to_int(value: object) -> int:
+        try:
+            return int(float(str(value or 0)))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _to_float(value: object) -> float:
+        try:
+            return float(str(value or 0))
+        except Exception:
+            return 0.0
+
+    def _ingest_provider_rows(
+        self,
+        *,
+        account_id: UUID,
+        platform: str,
+        rows: List[Dict[str, object]],
+        default_date: str,
+    ) -> int:
+        if not rows:
+            return 0
+        payload = AdStatsIngestRequest(
+            rows=[
+                AdStatWrite(
+                    ad_account_id=account_id,
+                    date=self._row_date_or_default(row, default_date),
+                    platform=platform,
+                    impressions=self._to_int(row.get("impressions")),
+                    clicks=self._to_int(row.get("clicks")),
+                    spend=self._to_float(row.get("spend")),
+                    conversions=self._to_float(row.get("conversions")) if row.get("conversions") is not None else None,
+                )
+                for row in rows
+            ]
+        )
+        result = self.ad_stats_store.ingest(payload)
+        return int(result.get("total") or 0)
 
     @staticmethod
     def _to_error_message(exc: Exception) -> str:
@@ -322,7 +377,12 @@ class AdAccountSyncService:
                         # Backward-compatible path for tests/custom fetchers with legacy signature.
                         rows = fetcher(account.external_account_id, from_str, to_str)
                     status = "success"
-                    records = len(rows)
+                    records = self._ingest_provider_rows(
+                        account_id=account.id,
+                        platform=provider,
+                        rows=rows,
+                        default_date=from_str,
+                    )
                     error_message = None
                     error_code = None
                     error_category = None

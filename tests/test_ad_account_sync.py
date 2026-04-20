@@ -86,6 +86,11 @@ def test_sync_run_updates_account_sync_fields_and_job_log():
     assert failed_job["attempt"] == 1
     assert failed_job["next_retry_at"] is not None
 
+    stats = client.get("/ad-stats?date_from=2026-04-01&date_to=2026-04-02")
+    assert stats.status_code == 200
+    assert stats.json()["count"] == 1
+    assert stats.json()["items"][0]["ad_account_id"] == ok_acc["id"]
+
 
 def test_sync_jobs_list_filters_by_account_id():
     reset_state()

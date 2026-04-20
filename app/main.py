@@ -158,6 +158,7 @@ client_store: ClientStore = SqliteClientStore(settings.budgets_db_path)
 ad_account_store: AdAccountStore = SqliteAdAccountStore(settings.budgets_db_path, client_store)
 integration_credential_store: IntegrationCredentialStore = SqliteIntegrationCredentialStore(settings.budgets_db_path)
 ad_account_sync_job_store = SqliteAdAccountSyncJobStore(settings.budgets_db_path)
+ad_stats_store: AdStatsStore = SqliteAdStatsStore(settings.budgets_db_path, ad_account_store)
 
 
 def _resolve_provider_credentials(
@@ -172,13 +173,13 @@ def _resolve_provider_credentials(
 ad_account_sync_service = AdAccountSyncService(
     account_store=ad_account_store,
     job_store=ad_account_sync_job_store,
+    ad_stats_store=ad_stats_store,
     credential_resolver=_resolve_provider_credentials,
 )
 ad_account_discovery_service = AdAccountDiscoveryService(
     account_store=ad_account_store,
     credential_resolver=_resolve_provider_credentials,
 )
-ad_stats_store: AdStatsStore = SqliteAdStatsStore(settings.budgets_db_path, ad_account_store)
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
 platform_admin_store: PlatformAdminStore = SqlitePlatformAdminStore(settings.budgets_db_path, auth_store)
@@ -427,16 +428,17 @@ def use_inmemory_stores():
         resolved = integration_creds.resolve_for_client(provider=provider, client_id=client_id, user_id=user_id)
         return dict(resolved.credentials) if resolved else None
     sync_jobs = InMemoryAdAccountSyncJobStore()
+    s = InMemoryAdStatsStore(a)
     sync_service = AdAccountSyncService(
         account_store=a,
         job_store=sync_jobs,
+        ad_stats_store=s,
         credential_resolver=_resolve_provider_credentials_inmemory,
     )
     discovery_service = AdAccountDiscoveryService(
         account_store=a,
         credential_resolver=_resolve_provider_credentials_inmemory,
     )
-    s = InMemoryAdStatsStore(a)
     b = InMemoryBudgetStore()
     auth = InMemoryAuthStore()
     platform_admin = InMemoryPlatformAdminStore(auth)
