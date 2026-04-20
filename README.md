@@ -176,7 +176,7 @@ Backend for digital analytics with normalized spend, manual budgets, and unified
 
 ## Setup
 Prerequisites:
-- Python `3.11+` (recommended for release parity)
+- Python `3.12+` (recommended for release parity)
 - Node.js `20+`
 
 1. `python3 -m venv .venv`

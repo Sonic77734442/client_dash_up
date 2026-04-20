@@ -1,7 +1,7 @@
 # Release Baseline Runbook
 
 ## Runtime baseline
-- Python: `3.11+` required for release pipelines.
+- Python: `3.12+` required for release pipelines.
 - Node.js: `20+` for frontend build.
 
 ## CI quality gate
