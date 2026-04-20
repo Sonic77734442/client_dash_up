@@ -155,6 +155,8 @@ class SyncRunResult:
 
 
 class AdAccountSyncService:
+    AUTO_INITIAL_LOOKBACK_DAYS = 30
+
     def __init__(
         self,
         account_store: AdAccountStore,
@@ -280,6 +282,41 @@ class AdAccountSyncService:
         return now + timedelta(minutes=delay_minutes)
 
     @staticmethod
+    def _parse_last_sync_date(raw: object) -> Optional[date]:
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw.date()
+        value = str(raw).strip()
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).date()
+        except Exception:
+            return None
+
+    def _resolve_date_range_for_account(
+        self,
+        *,
+        account,
+        explicit_from: Optional[date],
+        explicit_to: date,
+    ) -> tuple[str, str]:
+        if explicit_from:
+            from_date = explicit_from
+        else:
+            last_sync = self._parse_last_sync_date(getattr(account, "last_sync_at", None))
+            if not last_sync:
+                last_sync = self._parse_last_sync_date((account.metadata or {}).get("last_sync_at"))
+            if last_sync:
+                from_date = last_sync
+            else:
+                from_date = explicit_to - timedelta(days=self.AUTO_INITIAL_LOOKBACK_DAYS - 1)
+        if from_date > explicit_to:
+            from_date = explicit_to
+        return from_date.isoformat(), explicit_to.isoformat()
+
+    @staticmethod
     def _fetch_meta_daily(
         external_id: str,
         date_from: str,
@@ -322,8 +359,7 @@ class AdAccountSyncService:
         force: bool = False,
     ) -> SyncRunResult:
         started_at = datetime.utcnow()
-        from_str = (date_from or started_at.date()).isoformat()
-        to_str = (date_to or started_at.date()).isoformat()
+        sync_to = date_to or started_at.date()
 
         accounts = self.account_store.list(status="all")
         if account_ids is not None:
@@ -342,6 +378,11 @@ class AdAccountSyncService:
         for account in accounts:
             s_at = datetime.utcnow()
             provider = str(account.platform or "").lower().strip()
+            from_str, to_str = self._resolve_date_range_for_account(
+                account=account,
+                explicit_from=date_from,
+                explicit_to=sync_to,
+            )
             fetcher = self.provider_fetchers.get(provider)
             prev = latest.get(account.id)
             if (

@@ -1851,7 +1851,9 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
     summary="Run ad-account sync",
     description=(
         "Runs provider sync for selected ad accounts and records sync jobs. "
-        "Sync status/last_sync/error for account registry is derived from these jobs."
+        "Sync status/last_sync/error for account registry is derived from these jobs. "
+        "If date_from/date_to are omitted, sync runs incrementally from each account's last_sync_at; "
+        "for never-synced accounts it backfills the last 30 days."
     ),
 )
 def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext = Depends(auth_context)):

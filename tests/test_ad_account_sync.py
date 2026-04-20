@@ -185,3 +185,35 @@ def test_sync_error_classification_for_google_manager_metrics_error():
     assert code == "invalid_request"
     assert category == "validation"
     assert retryable is False
+
+
+def test_sync_auto_date_range_uses_last_sync_or_default_lookback():
+    reset_state()
+    c = mk_client("Auto Range")
+    fresh = mk_account(c["id"], "meta", "meta-fresh")
+    existing = mk_account(c["id"], "meta", "meta-existing")
+    patched = client.patch(
+        f"/ad-accounts/{existing['id']}",
+        json={"metadata": {"last_sync_at": "2026-04-10T12:00:00"}},
+    )
+    assert patched.status_code == 200
+
+    seen = []
+
+    def fake_fetcher(external_id, date_from, date_to, creds=None):
+        seen.append((external_id, date_from, date_to))
+        return []
+
+    service = app.state.ad_account_sync_service
+    service.provider_fetchers = {"meta": fake_fetcher}
+
+    run = client.post(
+        "/ad-accounts/sync/run",
+        json={"account_ids": [fresh["id"], existing["id"]], "date_to": "2026-04-20", "force": True},
+    )
+    assert run.status_code == 200
+
+    by_external = {external_id: (date_from, date_to) for (external_id, date_from, date_to) in seen}
+    assert by_external["meta-existing"] == ("2026-04-10", "2026-04-20")
+    # 30-day inclusive window when account has never been synced.
+    assert by_external["meta-fresh"] == ("2026-03-22", "2026-04-20")
