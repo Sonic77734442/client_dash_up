@@ -19,6 +19,50 @@ function readCookie(name: string): string {
 
 const CSRF_COOKIE_NAME = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
 const CSRF_HEADER_NAME = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
+const CSRF_STORAGE_KEY = "ops_csrf_token";
+
+let csrfMemoryToken = "";
+
+function readStoredCsrfToken(): string {
+  if (typeof window === "undefined") return "";
+  if (csrfMemoryToken) return csrfMemoryToken;
+  const stored = (localStorage.getItem(CSRF_STORAGE_KEY) || "").trim();
+  if (stored) csrfMemoryToken = stored;
+  return stored;
+}
+
+function storeCsrfToken(token: string): void {
+  const value = (token || "").trim();
+  if (!value || typeof window === "undefined") return;
+  csrfMemoryToken = value;
+  localStorage.setItem(CSRF_STORAGE_KEY, value);
+}
+
+async function resolveCsrfToken(baseUrl: string): Promise<string> {
+  const fromCookie = readCookie(CSRF_COOKIE_NAME);
+  if (fromCookie) {
+    storeCsrfToken(fromCookie);
+    return fromCookie;
+  }
+  const fromStorage = readStoredCsrfToken();
+  if (fromStorage) return fromStorage;
+
+  // Cross-domain SPA cannot read API-domain cookies; ask API for CSRF token explicitly.
+  const res = await fetch(`${baseUrl}/auth/csrf`, {
+    method: "GET",
+    credentials: "include",
+  });
+  if (!res.ok) return "";
+  let body: unknown = {};
+  try {
+    body = await res.json();
+  } catch {
+    return "";
+  }
+  const token = String((body as { csrf_token?: unknown })?.csrf_token || "").trim();
+  if (token) storeCsrfToken(token);
+  return token;
+}
 
 export async function fetchJson<T>(
   baseUrl: string,
@@ -32,7 +76,7 @@ export async function fetchJson<T>(
     headers.set("Content-Type", "application/json");
   }
   if (["POST", "PATCH", "PUT", "DELETE"].includes(method) && !headers.has(CSRF_HEADER_NAME)) {
-    const csrf = readCookie(CSRF_COOKIE_NAME);
+    const csrf = await resolveCsrfToken(baseUrl);
     if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
   }
   const resolvedToken =

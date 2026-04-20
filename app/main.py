@@ -1143,6 +1143,29 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     return AuthMeResponse(user=user, session=session)
 
 
+@app.get(
+    "/auth/csrf",
+    summary="Get CSRF token for cookie-auth requests",
+    description=(
+        "Returns CSRF token for cross-domain SPA deployments where frontend cannot read API-domain cookies. "
+        "Requires authenticated session."
+    ),
+)
+def auth_csrf(request: Request, session: SessionContextResponse = Depends(current_session_context)):
+    if not session.valid:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    csrf_token = request.cookies.get(settings.csrf_cookie_name) or _new_csrf_token()
+    response = JSONResponse(
+        content={
+            "csrf_token": csrf_token,
+            "header_name": settings.csrf_header_name,
+            "cookie_name": settings.csrf_cookie_name,
+        }
+    )
+    _set_csrf_cookie(response, csrf_token)
+    return response
+
+
 @app.post(
     "/auth/logout",
     summary="Logout current session",

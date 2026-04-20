@@ -70,6 +70,39 @@ def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt():
     assert out.status_code == 200
 
 
+def test_cookie_session_can_fetch_csrf_token_via_endpoint():
+    reset_state()
+    app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
+
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "facebook",
+            "client_id": "fb-client",
+            "client_secret": "fb-secret",
+            "redirect_uri": "http://127.0.0.1:8000/auth/facebook/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+
+    csrf = client.get("/auth/csrf")
+    assert csrf.status_code == 200
+    body = csrf.json()
+    assert body["csrf_token"]
+    assert body["header_name"] == "X-CSRF-Token"
+    assert body["cookie_name"] == "ops_csrf"
+
+    ok = client.post("/auth/session/refresh", headers={"X-CSRF-Token": body["csrf_token"]})
+    assert ok.status_code == 200
+
+
 def test_rate_limit_triggers_on_auth_sensitive_routes():
     reset_state()
     status_codes = []
