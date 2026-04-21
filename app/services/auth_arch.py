@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
@@ -57,10 +59,37 @@ class AuthStore(Protocol):
     def revoke_session(self, token: str) -> Dict[str, object]: ...
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut: ...
     def list_provider_configs(self) -> List[AuthProviderConfigOut]: ...
+    def set_password(self, user_id: UUID, password: str) -> None: ...
+    def authenticate_password(self, email: str, password: str) -> Optional[UserOut]: ...
 
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _password_hash(password: str, *, iterations: int = 390000) -> str:
+    salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return (
+        "pbkdf2_sha256$"
+        f"{iterations}$"
+        f"{base64.urlsafe_b64encode(salt).decode('ascii')}$"
+        f"{base64.urlsafe_b64encode(derived).decode('ascii')}"
+    )
+
+
+def _password_verify(password: str, encoded: str) -> bool:
+    try:
+        algo, iter_s, salt_b64, hash_b64 = encoded.split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        iterations = int(iter_s)
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(hash_b64.encode("ascii"))
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(actual, expected)
 
 
 class SqliteAuthStore:
@@ -150,6 +179,34 @@ class SqliteAuthStore:
         with sqlite_conn(self.db_path) as conn:
             rows = conn.execute("SELECT * FROM users ORDER BY updated_at DESC").fetchall()
         return [self._to_user(r) for r in rows]
+
+    def set_password(self, user_id: UUID, password: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with sqlite_conn(self.db_path) as conn:
+            row = conn.execute("SELECT id FROM users WHERE id=?", (str(user_id),)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+            conn.execute(
+                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+                (_password_hash(password), now, str(user_id)),
+            )
+            conn.commit()
+
+    def authenticate_password(self, email: str, password: str) -> Optional[UserOut]:
+        norm_email = (email or "").strip().lower()
+        if not norm_email:
+            return None
+        with sqlite_conn(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (norm_email,)).fetchone()
+        if not row:
+            return None
+        password_hash = row["password_hash"] if "password_hash" in row.keys() else None
+        if not password_hash or not _password_verify(password, password_hash):
+            return None
+        user = self._to_user(row)
+        if user.status != "active":
+            return None
+        return user
 
     def find_identity(self, provider: str, provider_user_id: str) -> Optional[AuthIdentityOut]:
         with sqlite_conn(self.db_path) as conn:
@@ -417,6 +474,7 @@ class SqliteAuthStore:
 class InMemoryAuthStore:
     def __init__(self):
         self.users: Dict[UUID, UserOut] = {}
+        self.password_hashes: Dict[UUID, str] = {}
         self.identities: Dict[str, AuthIdentityOut] = {}
         self.access: Dict[str, UserClientAccessOut] = {}
         self.sessions: Dict[str, Dict[str, object]] = {}
@@ -441,6 +499,25 @@ class InMemoryAuthStore:
 
     def list_users(self) -> List[UserOut]:
         return sorted(self.users.values(), key=lambda x: x.updated_at, reverse=True)
+
+    def set_password(self, user_id: UUID, password: str) -> None:
+        user = self.users.get(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        self.password_hashes[user_id] = _password_hash(password)
+        self.users[user_id] = user.model_copy(update={"updated_at": datetime.utcnow()})
+
+    def authenticate_password(self, email: str, password: str) -> Optional[UserOut]:
+        norm_email = (email or "").strip().lower()
+        if not norm_email:
+            return None
+        user = next((u for u in self.users.values() if (u.email or "").lower() == norm_email), None)
+        if not user or user.status != "active":
+            return None
+        encoded = self.password_hashes.get(user.id)
+        if not encoded or not _password_verify(password, encoded):
+            return None
+        return user
 
     def find_identity(self, provider: str, provider_user_id: str) -> Optional[AuthIdentityOut]:
         return self.identities.get(f"{provider}:{provider_user_id}")

@@ -538,7 +538,13 @@ class SqlitePlatformAdminStore:
 
     def accept_invite(self, payload: AgencyInviteAcceptRequest, *, session_ttl_minutes: int) -> AgencyInviteAcceptResponse:
         now = datetime.utcnow()
+        password = (payload.password or "").strip()
         token_hash = _token_hash(payload.token.strip())
+        if len(password) < 8:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
+            )
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM agency_invites WHERE token_hash=?",
@@ -575,6 +581,7 @@ class SqlitePlatformAdminStore:
                         status="active",
                     )
                 )
+            self.auth_store.set_password(user.id, password)
 
             existing_member = conn.execute(
                 "SELECT * FROM agency_members WHERE agency_id=? AND user_id=?",
@@ -885,6 +892,12 @@ class InMemoryPlatformAdminStore:
 
     def accept_invite(self, payload: AgencyInviteAcceptRequest, *, session_ttl_minutes: int) -> AgencyInviteAcceptResponse:
         now = datetime.utcnow()
+        password = (payload.password or "").strip()
+        if len(password) < 8:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
+            )
         invite_id = self.invite_token_hash_to_id.get(_token_hash(payload.token.strip()))
         if not invite_id or invite_id not in self.invites:
             raise HTTPException(status_code=404, detail={"code": "invite_not_found", "message": "Invite token is invalid"})
@@ -914,6 +927,7 @@ class InMemoryPlatformAdminStore:
                     status="active",
                 )
             )
+        self.auth_store.set_password(user.id, password)
 
         member = self.upsert_member(
             invite.agency_id,

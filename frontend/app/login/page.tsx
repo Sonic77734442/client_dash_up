@@ -15,7 +15,10 @@ export default function LoginPage() {
 
   const [apiBase, setApiBase] = useState(defaultApiBase);
   const [token, setToken] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [inviteName, setInviteName] = useState("");
+  const [invitePassword, setInvitePassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -61,6 +64,10 @@ export default function LoginPage() {
       setError("Invite token is missing");
       return;
     }
+    if (invitePassword.trim().length < 8) {
+      setError("Password must be at least 8 characters");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -68,7 +75,7 @@ export default function LoginPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ token: inviteToken, name: inviteName.trim() || undefined }),
+        body: JSON.stringify({ token: inviteToken, name: inviteName.trim() || undefined, password: invitePassword }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -81,6 +88,38 @@ export default function LoginPage() {
       router.replace("/");
     } catch {
       setError("Invite accept failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function signInWithPassword() {
+    const base = apiBase.trim().replace(/\/$/, "");
+    const em = email.trim().toLowerCase();
+    if (!base || !em || password.length < 8) {
+      setError("Email and password (min 8 chars) are required");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${base}/auth/password/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email: em, password }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError((body && body.error && body.error.message) || "Email/password login failed");
+        return;
+      }
+      localStorage.setItem(LS_API_BASE, base);
+      localStorage.removeItem(LS_SESSION_TOKEN);
+      window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+      router.replace("/");
+    } catch {
+      setError("Email/password login failed");
     } finally {
       setLoading(false);
     }
@@ -116,6 +155,19 @@ export default function LoginPage() {
           </>
         ) : null}
 
+        <div className="login-divider">Email and password</div>
+        <label>
+          Email
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
+        </label>
+        <label>
+          Password
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" />
+        </label>
+        <button className="primary-btn" onClick={() => void signInWithPassword()} disabled={loading}>
+          {loading ? "Signing in..." : "Sign In with Password"}
+        </button>
+
         <div className={`warning ${error ? "" : "hidden"}`}>{error}</div>
 
         {inviteToken ? (
@@ -124,6 +176,15 @@ export default function LoginPage() {
             <label>
               Your name (optional)
               <input value={inviteName} onChange={(e) => setInviteName(e.target.value)} placeholder="John Doe" />
+            </label>
+            <label>
+              Set password
+              <input
+                type="password"
+                value={invitePassword}
+                onChange={(e) => setInvitePassword(e.target.value)}
+                placeholder="At least 8 characters"
+              />
             </label>
             <button className="primary-btn" onClick={() => void acceptInvite()} disabled={loading}>
               {loading ? "Accepting..." : "Accept Invite"}

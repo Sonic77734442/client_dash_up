@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT NULL UNIQUE,
   name TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('admin','agency','client')),
+  password_hash TEXT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -321,6 +322,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_client_id ON audit_logs(tenant_
 
 
 def _migrate_sqlite(conn: sqlite3.Connection) -> None:
+    user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if user_cols and "password_hash" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NULL")
+
     cols = {row[1] for row in conn.execute("PRAGMA table_info(budgets)").fetchall()}
     if cols and "scope" not in cols:
         conn.execute("ALTER TABLE budgets ADD COLUMN scope TEXT NOT NULL DEFAULT 'client'")

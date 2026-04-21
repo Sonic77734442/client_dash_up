@@ -67,6 +67,7 @@ from app.schemas import (
     SessionIssueRequest,
     SessionIssueResponse,
     AuthMeResponse,
+    AuthPasswordLoginRequest,
     SessionContextResponse,
     SessionValidateRequest,
     SessionValidationResponse,
@@ -492,6 +493,7 @@ async def auth_security_middleware(request: Request, call_next):
     if settings.csrf_enforce_cookie_auth and method in {"POST", "PATCH", "PUT", "DELETE"}:
         csrf_exempt = {
             "/auth/invites/accept",
+            "/auth/password/login",
             "/auth/logout",
             "/auth/internal/sessions/issue",
             "/auth/internal/sessions/validate",
@@ -1266,6 +1268,45 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     if not user:
         raise HTTPException(status_code=401, detail="Session user not found")
     return AuthMeResponse(user=user, session=session)
+
+
+@app.post(
+    "/auth/password/login",
+    response_model=AuthMeResponse,
+    summary="Password login",
+    description="Authenticates user by email/password and issues backend session cookie.",
+)
+def auth_password_login(payload: AuthPasswordLoginRequest):
+    user = _auth_store().authenticate_password(payload.email, payload.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "invalid_credentials", "message": "Invalid email or password"},
+        )
+    issued = _auth_store().issue_session(
+        SessionIssueRequest(
+            user_id=user.id,
+            ttl_minutes=settings.oauth_session_ttl_minutes,
+            metadata={"auth_method": "password"},
+        )
+    )
+    session_ctx = _auth_facade().get_session_context(issued.token)
+    if not session_ctx.valid:
+        raise HTTPException(status_code=500, detail="Session context failed")
+    body = AuthMeResponse(user=user, session=session_ctx)
+    response = JSONResponse(content=body.model_dump(mode="json"))
+    max_age = max(60, int((issued.expires_at - datetime.utcnow()).total_seconds()))
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=issued.token,
+        httponly=True,
+        samesite=_cookie_samesite_value(),
+        secure=settings.auth_cookie_secure,
+        max_age=max_age,
+        path="/",
+    )
+    _set_csrf_cookie(response, _new_csrf_token())
+    return response
 
 
 @app.get(

@@ -64,8 +64,6 @@ export default function PlatformAgenciesPage() {
 
   const [assignClientId, setAssignClientId] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
-  const [inviteRole, setInviteRole] = useState<"owner" | "manager" | "member">("member");
-  const [inviteDays, setInviteDays] = useState(7);
   const [lastInviteUrl, setLastInviteUrl] = useState("");
 
   const selectedAgency = useMemo(
@@ -249,8 +247,8 @@ export default function PlatformAgenciesPage() {
         method: "POST",
         body: JSON.stringify({
           email: inviteEmail.trim().toLowerCase(),
-          member_role: inviteRole,
-          expires_in_days: inviteDays,
+          member_role: "member",
+          expires_in_days: 7,
         }),
       });
       setLastInviteUrl(issued.accept_url);
@@ -329,7 +327,7 @@ export default function PlatformAgenciesPage() {
     try {
       const issued = await req<AgencyInviteIssueResponse>(`/platform/agencies/${selectedAgency.id}/invites/${inviteId}/resend`, {
         method: "POST",
-        body: JSON.stringify({ expires_in_days: inviteDays }),
+        body: JSON.stringify({ expires_in_days: 7 }),
       });
       setLastInviteUrl(issued.accept_url);
       await loadAgencyDetails(selectedAgency.id);
@@ -568,20 +566,6 @@ export default function PlatformAgenciesPage() {
                     value={inviteEmail}
                     onChange={(e) => setInviteEmail(e.target.value)}
                     placeholder="member@agency.com"
-                  />
-                  <select value={inviteRole} onChange={(e) => setInviteRole(e.target.value as "owner" | "manager" | "member")}>
-                    <option value="owner">owner</option>
-                    <option value="manager">manager</option>
-                    <option value="member">member</option>
-                  </select>
-                  <input
-                    type="number"
-                    min={1}
-                    max={30}
-                    value={inviteDays}
-                    onChange={(e) => setInviteDays(Math.max(1, Math.min(30, Number(e.target.value) || 7)))}
-                    placeholder="days"
-                    style={{ width: 90 }}
                   />
                 </div>
                 <div className="alert-actions" style={{ marginTop: 8 }}>

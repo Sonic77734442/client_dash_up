@@ -592,6 +592,7 @@ class AgencyInviteIssueResponse(BaseModel):
 class AgencyInviteAcceptRequest(BaseModel):
     token: str
     name: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
 
 
 class AgencyInviteAcceptResponse(BaseModel):
@@ -613,6 +614,11 @@ class SessionValidationResponse(BaseModel):
 
 class SessionValidateRequest(BaseModel):
     token: str
+
+
+class AuthPasswordLoginRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8, max_length=128)
 
 
 class AuthProviderConfigCreate(BaseModel):
