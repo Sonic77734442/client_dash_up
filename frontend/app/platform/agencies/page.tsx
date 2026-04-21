@@ -33,6 +33,12 @@ function fmtDate(v?: string | null) {
   return d.toLocaleString();
 }
 
+function agencyRoleLabel(v: "owner" | "manager" | "member") {
+  if (v === "owner") return "agency_admin";
+  if (v === "manager") return "agency_manager";
+  return "agency_member";
+}
+
 export default function PlatformAgenciesPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -488,9 +494,9 @@ export default function PlatformAgenciesPage() {
                     ))}
                   </select>
                   <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as "owner" | "manager" | "member")}>
-                    <option value="owner">owner</option>
-                    <option value="manager">manager</option>
-                    <option value="member">member</option>
+                    <option value="owner">agency_admin</option>
+                    <option value="manager">agency_manager</option>
+                    <option value="member">agency_member</option>
                   </select>
                   <select value={memberStatus} onChange={(e) => setMemberStatus(e.target.value as "active" | "inactive")}>
                     <option value="active">active</option>
@@ -508,7 +514,7 @@ export default function PlatformAgenciesPage() {
                     return (
                       <div key={m.id} className="activity-item">
                         <div><strong>{user?.name || m.user_id.slice(0, 8)}</strong></div>
-                        <div className="muted">{m.role} · {m.status} · {fmtDate(m.updated_at)}</div>
+                        <div className="muted">{agencyRoleLabel(m.role)} | {m.status} | {fmtDate(m.updated_at)}</div>
                         <div className="alert-actions" style={{ marginTop: 6 }}>
                           <button
                             className="mini-btn"
@@ -587,7 +593,7 @@ export default function PlatformAgenciesPage() {
                     <div key={inv.id} className="activity-item">
                       <div><strong>{inv.email}</strong></div>
                       <div className="muted">
-                        {inv.member_role} · {inv.status} · exp {fmtDate(inv.expires_at)}
+                        {agencyRoleLabel(inv.member_role)} | {inv.status} | exp {fmtDate(inv.expires_at)}
                       </div>
                       <div className="alert-actions" style={{ marginTop: 6 }}>
                         <button

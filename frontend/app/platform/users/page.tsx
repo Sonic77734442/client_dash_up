@@ -112,8 +112,10 @@ export default function PlatformUsersPage() {
               <AppTopTabs active="platform_admin" />
               <div className="topbar-title">Platform Users</div>
             </div>
-            {tokenLoginEnabled ? (
-              <div className="session-controls">
+            <div className="session-controls">
+              <a className="ghost-btn" href="/platform/agencies">Go To Agencies</a>
+              {tokenLoginEnabled ? (
+                <>
                 <input value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base" />
                 <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
                 <button
@@ -128,8 +130,9 @@ export default function PlatformUsersPage() {
                 >
                   Save
                 </button>
-              </div>
-            ) : null}
+                </>
+              ) : null}
+            </div>
           </header>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
@@ -140,7 +143,6 @@ export default function PlatformUsersPage() {
                 <h3 style={{ margin: 0 }}>Create User</h3>
                 <div className="panel-subtitle">Create platform user with global role.</div>
               </div>
-              <a className="ghost-btn" href="/platform/agencies">Go To Agencies</a>
             </div>
             <div className="session-controls" style={{ marginTop: 10 }}>
               <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)} placeholder="email@company.com (optional)" />
@@ -210,4 +212,3 @@ export default function PlatformUsersPage() {
     </>
   );
 }
-
