@@ -76,11 +76,7 @@ export default function LoginPage() {
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
-      if (body?.session?.token) {
-        localStorage.setItem(LS_SESSION_TOKEN, body.session.token);
-      } else {
-        localStorage.removeItem(LS_SESSION_TOKEN);
-      }
+      localStorage.removeItem(LS_SESSION_TOKEN);
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {

@@ -38,6 +38,8 @@ class Settings:
     auth_rate_limit_admin_invite_max_requests: int
     request_log_enabled: bool
     metrics_enabled: bool
+    observability_public: bool
+    enable_test_endpoints: bool
     operational_insights_rules: Dict[str, Any]
 
 
@@ -80,11 +82,13 @@ def _bool_from_env(name: str, default: bool) -> bool:
 def get_settings() -> Settings:
     origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
     origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
+    app_env = os.getenv("APP_ENV", "development")
+    is_prod = app_env.lower() in {"prod", "production"}
     settings = Settings(
-        app_env=os.getenv("APP_ENV", "development"),
+        app_env=app_env,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
-        allowed_origins=origins or ["*"],
+        allowed_origins=[o for o in origins if o != "*"] or ["http://localhost:3000", "http://127.0.0.1:3000"],
         account_config_path=os.getenv("ACCOUNT_CONFIG_PATH", "./accounts.json"),
         budgets_db_path=os.getenv("BUDGETS_DB_PATH", "./storage/budgets.db"),
         frontend_base_url=os.getenv("FRONTEND_BASE_URL", "http://localhost:3000"),
@@ -107,6 +111,8 @@ def get_settings() -> Settings:
         ),
         request_log_enabled=_bool_from_env("REQUEST_LOG_ENABLED", True),
         metrics_enabled=_bool_from_env("METRICS_ENABLED", True),
+        observability_public=_bool_from_env("OBSERVABILITY_PUBLIC", not is_prod),
+        enable_test_endpoints=_bool_from_env("ENABLE_TEST_ENDPOINTS", False),
         operational_insights_rules=_operational_insights_rules_from_env(),
     )
     if settings.auth_cookie_samesite == "none" and not settings.auth_cookie_secure:

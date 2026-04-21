@@ -3,7 +3,6 @@ from __future__ import annotations
 import secrets
 import threading
 import time
-import re
 import os
 from datetime import date, datetime
 from typing import List, Optional
@@ -59,6 +58,7 @@ from app.schemas import (
     AuthIdentityOut,
     AuthProviderConfigCreate,
     AuthProviderConfigOut,
+    AuthProviderConfigPublicOut,
     AuditLogOut,
     ExternalIdentityResolveRequest,
     ExternalIdentityResolveResponse,
@@ -77,6 +77,7 @@ from app.schemas import (
     IntegrationsOverviewResponse,
     IntegrationCredentialCreate,
     IntegrationCredentialOut,
+    IntegrationCredentialPublicOut,
     IntegrationCredentialPatch,
     OverviewResponse,
     TikTokInsightsResponse,
@@ -148,8 +149,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # Allow Vercel preview/production domains without enumerating each one.
-    allow_origin_regex=r"^https://.*\.vercel\.app$",
 )
 
 
@@ -239,15 +238,10 @@ class RuntimeMetrics:
 
 app.state.runtime_metrics = RuntimeMetrics()
 
-_VERCEL_ORIGIN_RE = re.compile(r"^https://.*\.vercel\.app$")
-
-
 def _origin_allowed(origin: str) -> bool:
     if not origin:
         return False
-    if origin in settings.allowed_origins:
-        return True
-    return bool(_VERCEL_ORIGIN_RE.match(origin))
+    return origin in settings.allowed_origins
 
 
 def _attach_cors_headers(request: Request, response: Response) -> Response:
@@ -260,6 +254,70 @@ def _attach_cors_headers(request: Request, response: Response) -> Response:
     response.headers["Access-Control-Allow-Methods"] = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
     response.headers["Vary"] = "Origin"
     return response
+
+
+def _attach_security_headers(response: Response) -> Response:
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+    if settings.app_env.lower() in {"prod", "production"}:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+def _mask_secret_value(value: object) -> object:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "********"
+    return f"{'*' * (len(text) - 4)}{text[-4:]}"
+
+
+def _is_sensitive_credential_key(key: str) -> bool:
+    lowered = (key or "").lower()
+    tokens = ("token", "secret", "password", "api_key", "key", "refresh")
+    return any(t in lowered for t in tokens)
+
+
+def _to_public_provider_config(cfg: AuthProviderConfigOut) -> AuthProviderConfigPublicOut:
+    return AuthProviderConfigPublicOut(
+        id=cfg.id,
+        provider=cfg.provider,
+        client_id=cfg.client_id,
+        redirect_uri=cfg.redirect_uri,
+        enabled=cfg.enabled,
+        client_secret_configured=bool(str(cfg.client_secret or "").strip()),
+        created_at=cfg.created_at,
+        updated_at=cfg.updated_at,
+    )
+
+
+def _to_public_integration_credential(row: IntegrationCredentialOut) -> IntegrationCredentialPublicOut:
+    preview: dict = {}
+    keys = sorted(row.credentials.keys())
+    for k in keys:
+        v = row.credentials.get(k)
+        if _is_sensitive_credential_key(k):
+            preview[k] = _mask_secret_value(v)
+        else:
+            preview[k] = v
+    return IntegrationCredentialPublicOut(
+        id=row.id,
+        provider=row.provider,
+        scope_type=row.scope_type,
+        scope_id=row.scope_id,
+        status=row.status,
+        created_by=row.created_by,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        credential_keys=keys,
+        credentials_preview=preview,
+    )
 
 
 def _status_code_to_error_code(status_code: int) -> str:
@@ -336,6 +394,7 @@ async def auth_security_middleware(request: Request, call_next):
 
     def finalize(resp: Response) -> Response:
         resp = _attach_cors_headers(request, resp)
+        resp = _attach_security_headers(resp)
         resp.headers["X-Request-Id"] = request_id
         route = request.scope.get("route")
         route_path = getattr(route, "path", path) if route else path
@@ -389,11 +448,8 @@ async def auth_security_middleware(request: Request, call_next):
 
     if settings.csrf_enforce_cookie_auth and method in {"POST", "PATCH", "PUT", "DELETE"}:
         csrf_exempt = {
-            "/_testing/use-inmemory-stores",
             "/auth/invites/accept",
             "/auth/logout",
-            "/ad-accounts/discover",
-            "/ad-accounts/sync/run",
             "/auth/internal/sessions/issue",
             "/auth/internal/sessions/validate",
             "/auth/internal/sessions/revoke",
@@ -418,8 +474,10 @@ async def auth_security_middleware(request: Request, call_next):
     return finalize(response)
 
 
-@app.post("/_testing/use-inmemory-stores")
+@app.post("/_testing/use-inmemory-stores", include_in_schema=False)
 def use_inmemory_stores():
+    if not settings.enable_test_endpoints:
+        raise HTTPException(status_code=404, detail="Not found")
     # Helper for tests to avoid file I/O and cross-test state leakage.
     c = InMemoryClientStore()
     a = InMemoryAdAccountStore(c)
@@ -875,7 +933,17 @@ def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optio
 
 
 @app.get("/health")
-def health() -> dict:
+def health(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> dict:
+    if settings.observability_public:
+        accounts = load_accounts(settings)
+        by_platform = {
+            "meta": len([a for a in accounts if a.platform == "meta"]),
+            "google": len([a for a in accounts if a.platform == "google"]),
+            "tiktok": len([a for a in accounts if a.platform == "tiktok"]),
+        }
+        return {"status": "ok", "accounts": by_platform, "env": settings.app_env}
+    if not ctx or ctx.role != "admin":
+        return {"status": "ok"}
     accounts = load_accounts(settings)
     by_platform = {
         "meta": len([a for a in accounts if a.platform == "meta"]),
@@ -891,7 +959,7 @@ def healthz() -> dict:
 
 
 @app.get("/readyz")
-def readyz() -> dict:
+def readyz(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> dict:
     checks = {
         "client_store": bool(getattr(app.state, "client_store", None)),
         "ad_account_store": bool(getattr(app.state, "ad_account_store", None)),
@@ -910,15 +978,24 @@ def readyz() -> dict:
     checks["sqlite"] = db_ok
 
     if not all(checks.values()):
-        payload = {"status": "not_ready", "checks": checks}
-        if db_error:
-            payload["db_error"] = db_error
-        return JSONResponse(status_code=503, content=payload)
-    return {"status": "ready", "checks": checks}
+        if settings.observability_public:
+            payload = {"status": "not_ready", "checks": checks}
+            if db_error:
+                payload["db_error"] = db_error
+            return JSONResponse(status_code=503, content=payload)
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    if settings.observability_public:
+        return {"status": "ready", "checks": checks}
+    if ctx and ctx.role == "admin":
+        return {"status": "ready", "checks": checks}
+    return {"status": "ready"}
 
 
 @app.get("/metrics")
-def metrics():
+def metrics(ctx: Optional[RequestContext] = Depends(optional_auth_context)):
+    if not settings.observability_public:
+        if not ctx or ctx.role != "admin":
+            raise HTTPException(status_code=404, detail="Not found")
     snap = _runtime_metrics().snapshot()
     lines: list[str] = []
     lines.append("# HELP http_requests_total Total HTTP requests")
@@ -1337,9 +1414,7 @@ def auth_oauth_callback(
 
     base = settings.frontend_base_url.rstrip("/")
     next_encoded = quote(consumed.next_path or "/", safe="/?=&")
-    token_encoded = quote(resolved.session.token, safe="")
-    # Some redirect chains can drop URL fragments. Keep token in query as fallback for login completion.
-    redirect_url = f"{base}/login/success?next={next_encoded}&token={token_encoded}#token={token_encoded}"
+    redirect_url = f"{base}/login/success?next={next_encoded}"
     response = RedirectResponse(url=redirect_url, status_code=302)
     max_age = (
         max(60, int((resolved.session.expires_at - datetime.utcnow()).total_seconds()))
@@ -1361,25 +1436,26 @@ def auth_oauth_callback(
     return response
 
 
-@app.post("/auth/provider-configs", response_model=AuthProviderConfigOut, summary="Upsert auth provider config")
+@app.post("/auth/provider-configs", response_model=AuthProviderConfigPublicOut, summary="Upsert auth provider config")
 def auth_upsert_provider_config(
     payload: AuthProviderConfigCreate,
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    return _auth_store().upsert_provider_config(payload)
+    return _to_public_provider_config(_auth_store().upsert_provider_config(payload))
 
 
 @app.get("/auth/provider-configs", summary="List auth provider configs")
 def auth_list_provider_configs(ctx: Optional[RequestContext] = Depends(optional_auth_context)):
     _enforce_internal_admin(ctx)
     rows = _auth_store().list_provider_configs()
-    return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+    safe_rows = [_to_public_provider_config(x) for x in rows]
+    return {"items": [x.model_dump(mode="json") for x in safe_rows], "count": len(safe_rows)}
 
 
 @app.post(
     "/platform/integration-credentials",
-    response_model=IntegrationCredentialOut,
+    response_model=IntegrationCredentialPublicOut,
     summary="[INTERNAL/TEMP] Upsert tenant integration credential",
     description=(
         "Temporary internal/admin-only endpoint. Stores provider credentials at "
@@ -1392,7 +1468,8 @@ def create_integration_credential(
 ):
     ensure_admin(ctx)
     payload_with_actor = payload.model_copy(update={"created_by": payload.created_by or ctx.user_id})
-    return _integration_credential_store().upsert(payload_with_actor)
+    out = _integration_credential_store().upsert(payload_with_actor)
+    return _to_public_integration_credential(out)
 
 
 @app.get(
@@ -1414,12 +1491,13 @@ def list_integration_credentials(
         scope_type=scope_type,
         scope_id=scope_id,
     )
-    return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+    safe_rows = [_to_public_integration_credential(x) for x in rows]
+    return {"items": [x.model_dump(mode="json") for x in safe_rows], "count": len(safe_rows)}
 
 
 @app.patch(
     "/platform/integration-credentials/{credential_id}",
-    response_model=IntegrationCredentialOut,
+    response_model=IntegrationCredentialPublicOut,
     summary="[INTERNAL/TEMP] Patch tenant integration credential",
     description="Temporary internal/admin-only endpoint for provider credential registry.",
 )
@@ -1430,12 +1508,13 @@ def patch_integration_credential(
 ):
     ensure_admin(ctx)
     payload_with_actor = payload.model_copy(update={"created_by": payload.created_by or ctx.user_id})
-    return _integration_credential_store().patch(credential_id, payload_with_actor)
+    out = _integration_credential_store().patch(credential_id, payload_with_actor)
+    return _to_public_integration_credential(out)
 
 
 @app.delete(
     "/platform/integration-credentials/{credential_id}",
-    response_model=IntegrationCredentialOut,
+    response_model=IntegrationCredentialPublicOut,
     summary="[INTERNAL/TEMP] Archive tenant integration credential",
     description="Temporary internal/admin-only endpoint for provider credential registry.",
 )
@@ -1444,7 +1523,8 @@ def archive_integration_credential(
     ctx: RequestContext = Depends(auth_context),
 ):
     ensure_admin(ctx)
-    return _integration_credential_store().archive(credential_id)
+    out = _integration_credential_store().archive(credential_id)
+    return _to_public_integration_credential(out)
 
 
 @app.post(

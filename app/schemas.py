@@ -608,6 +608,17 @@ class AuthProviderConfigOut(BaseModel):
     updated_at: datetime
 
 
+class AuthProviderConfigPublicOut(BaseModel):
+    id: UUID
+    provider: str
+    client_id: str
+    redirect_uri: str
+    enabled: bool
+    client_secret_configured: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class IntegrationCredentialBase(BaseModel):
     provider: str
     scope_type: Literal["global", "agency", "client"] = "global"
@@ -647,6 +658,19 @@ class IntegrationCredentialOut(BaseModel):
     created_by: Optional[UUID] = None
     created_at: datetime
     updated_at: datetime
+
+
+class IntegrationCredentialPublicOut(BaseModel):
+    id: UUID
+    provider: str
+    scope_type: Literal["global", "agency", "client"]
+    scope_id: Optional[UUID] = None
+    status: Literal["active", "archived"]
+    created_by: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+    credential_keys: List[str] = Field(default_factory=list)
+    credentials_preview: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ExternalIdentityResolveRequest(BaseModel):
