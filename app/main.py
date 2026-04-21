@@ -135,7 +135,13 @@ from app.db import sqlite_conn
 
 
 settings = get_settings()
-app = FastAPI(title="Envidicy Digital Dashboard Backend", version="0.3.0")
+app = FastAPI(
+    title="Envidicy Digital Dashboard Backend",
+    version="0.3.0",
+    docs_url="/docs" if settings.api_docs_enabled else None,
+    redoc_url="/redoc" if settings.api_docs_enabled else None,
+    openapi_url="/openapi.json" if settings.api_docs_enabled else None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -780,27 +786,27 @@ def _get_session_token(
     *,
     required: bool = True,
 ) -> Optional[str]:
+    value = (authorization or "").strip()
+    if value:
+        if not value.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "unauthorized", "message": "Authorization must use Bearer token"},
+            )
+        token = value[7:].strip()
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "unauthorized", "message": "Missing Bearer token"},
+            )
+        return token
     if x_session_token:
         return x_session_token.strip()
     if cookie_token:
         return cookie_token.strip()
-    if not authorization:
-        if not required:
-            return None
-        raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Missing session token"})
-    value = authorization.strip()
-    if not value.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail={"code": "unauthorized", "message": "Authorization must use Bearer token"},
-        )
-    token = value[7:].strip()
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail={"code": "unauthorized", "message": "Missing Bearer token"},
-        )
-    return token
+    if not required:
+        return None
+    raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Missing session token"})
 
 
 def auth_context(
@@ -1038,7 +1044,10 @@ def list_external_accounts(ctx: RequestContext = Depends(auth_context)) -> dict:
     summary="Get auth/role access model",
     description="Architecture-level model for internal authorization. External provider auth is separate from authorization.",
 )
-def auth_access_model():
+def auth_access_model(ctx: Optional[RequestContext] = Depends(optional_auth_context)):
+    if not settings.observability_public:
+        if not ctx or ctx.role != "admin":
+            raise HTTPException(status_code=404, detail="Not found")
     return {
         "roles": ROLE_ACCESS_MODEL,
         "security_assumptions": [
