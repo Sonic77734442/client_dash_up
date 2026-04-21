@@ -78,7 +78,7 @@ export function AppSidebar({
         <Link className={itemClass("sync_monitor", active)} href="/sync-monitor">Sync Monitor</Link>
         <Link className={itemClass("budgets", active)} href="/budgets">Budgets</Link>
         <Link className={itemClass("clients", active)} href="/clients">Clients</Link>
-        {showPlatformAdmin ? <Link className={itemClass("platform_admin", active)} href="/platform/agencies">Platform Admin</Link> : null}
+        {showPlatformAdmin ? <Link className={itemClass("platform_admin", active)} href="/platform/users">Platform Admin</Link> : null}
       </nav>
       <div className="sidebar-footer">
         <a className="menu-item" href="#">Documentation</a>

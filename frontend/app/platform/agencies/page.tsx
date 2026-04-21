@@ -354,6 +354,7 @@ export default function PlatformAgenciesPage() {
               <div className="panel-subtitle">Provision agencies, attach members, and grant tenant access.</div>
             </div>
             <div className="session-controls">
+              <a className="ghost-btn" href="/platform/users">Users</a>
               {tokenLoginEnabled ? (
                 <>
                   <input

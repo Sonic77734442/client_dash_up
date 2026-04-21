@@ -23,6 +23,7 @@ from app.schemas import (
     UserClientAccessCreate,
     UserClientAccessOut,
     UserCreate,
+    UserPatch,
     UserOut,
 )
 
@@ -48,6 +49,7 @@ class AuthStore(Protocol):
     def get_user(self, user_id: UUID) -> Optional[UserOut]: ...
     def find_user_by_email(self, email: str) -> Optional[UserOut]: ...
     def list_users(self) -> List[UserOut]: ...
+    def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut: ...
     def find_identity(self, provider: str, provider_user_id: str) -> Optional[AuthIdentityOut]: ...
     def link_identity(self, payload: AuthIdentityLink) -> AuthIdentityOut: ...
     def list_identities(self, user_id: Optional[UUID] = None) -> List[AuthIdentityOut]: ...
@@ -179,6 +181,30 @@ class SqliteAuthStore:
         with sqlite_conn(self.db_path) as conn:
             rows = conn.execute("SELECT * FROM users ORDER BY updated_at DESC").fetchall()
         return [self._to_user(r) for r in rows]
+
+    def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
+        patch = payload.model_dump(exclude_unset=True)
+        with sqlite_conn(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+            if not patch:
+                return self._to_user(row)
+            now = datetime.utcnow().isoformat()
+            email = patch.get("email", row["email"])
+            name = patch.get("name", row["name"])
+            role = patch.get("role", row["role"])
+            status = patch.get("status", row["status"])
+            try:
+                conn.execute(
+                    "UPDATE users SET email=?, name=?, role=?, status=?, updated_at=? WHERE id=?",
+                    (email, name, role, status, now, str(user_id)),
+                )
+                conn.commit()
+            except Exception as exc:
+                raise HTTPException(status_code=409, detail=f"User conflict: {exc}")
+            updated = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
+        return self._to_user(updated)
 
     def set_password(self, user_id: UUID, password: str) -> None:
         now = datetime.utcnow().isoformat()
@@ -499,6 +525,21 @@ class InMemoryAuthStore:
 
     def list_users(self) -> List[UserOut]:
         return sorted(self.users.values(), key=lambda x: x.updated_at, reverse=True)
+
+    def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
+        existing = self.users.get(user_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="User not found")
+        patch = payload.model_dump(exclude_unset=True)
+        if "email" in patch and patch["email"]:
+            new_email = str(patch["email"]).lower()
+            for uid, u in self.users.items():
+                if uid != user_id and (u.email or "").lower() == new_email:
+                    raise HTTPException(status_code=409, detail="User conflict: duplicate email")
+            patch["email"] = new_email
+        updated = existing.model_copy(update={**patch, "updated_at": datetime.utcnow()})
+        self.users[user_id] = updated
+        return updated
 
     def set_password(self, user_id: UUID, password: str) -> None:
         user = self.users.get(user_id)

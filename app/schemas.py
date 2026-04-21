@@ -445,6 +445,13 @@ class UserCreate(BaseModel):
     status: Literal["active", "inactive"] = "active"
 
 
+class UserPatch(BaseModel):
+    email: Optional[str] = None
+    name: Optional[str] = None
+    role: Optional[Literal["admin", "agency", "client"]] = None
+    status: Optional[Literal["active", "inactive"]] = None
+
+
 class UserOut(BaseModel):
     id: UUID
     email: Optional[str] = None

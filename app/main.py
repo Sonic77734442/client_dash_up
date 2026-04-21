@@ -74,6 +74,7 @@ from app.schemas import (
     UserClientAccessCreate,
     UserClientAccessOut,
     UserCreate,
+    UserPatch,
     UserOut,
     GoogleInsightsResponse,
     MetaInsightsResponse,
@@ -1120,6 +1121,21 @@ def auth_list_users(ctx: Optional[RequestContext] = Depends(optional_auth_contex
     _enforce_internal_admin(ctx)
     rows = _auth_store().list_users()
     return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+
+
+@app.patch(
+    "/auth/internal/users/{user_id}",
+    response_model=UserOut,
+    summary="[INTERNAL/TEMP] Patch internal user",
+    description="Temporary internal/admin-only endpoint for internal user role/status updates.",
+)
+def auth_patch_user(
+    user_id: UUID,
+    payload: UserPatch,
+    ctx: Optional[RequestContext] = Depends(optional_auth_context),
+):
+    _enforce_internal_admin(ctx)
+    return _auth_store().patch_user(user_id, payload)
 
 
 @app.post(

@@ -30,7 +30,7 @@ export function AppTopTabs({ active }: { active: TabKey }) {
       <Link className={cls(active === "sync_monitor")} href="/sync-monitor">Sync Monitor</Link>
       <Link className={cls(active === "budgets")} href="/budgets">Budgets</Link>
       <Link className={cls(active === "clients")} href="/clients">Clients</Link>
-      {showPlatformAdmin ? <Link className={cls(active === "platform_admin")} href="/platform/agencies">Platform Admin</Link> : null}
+      {showPlatformAdmin ? <Link className={cls(active === "platform_admin")} href="/platform/users">Platform Admin</Link> : null}
     </div>
   );
 }
