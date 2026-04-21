@@ -22,6 +22,8 @@ from app.schemas import (
     AdAccountOut,
     AdAccountPatch,
     AdAccountSyncJobOut,
+    AdAccountSyncDiagnosticOut,
+    AdAccountSyncDiagnosticsResponse,
     AdAccountSyncRunRequest,
     AdAccountSyncRunResponse,
     AdStatOut,
@@ -336,6 +338,41 @@ def _status_code_to_error_code(status_code: int) -> str:
         422: "validation_error",
     }
     return mapping.get(status_code, "application_error")
+
+
+def _safe_sync_error_message(raw: Optional[str]) -> str:
+    msg = str(raw or "").strip().lower()
+    if not msg:
+        return "No provider error details available."
+    if "expired" in msg or "unauthorized" in msg or "invalid token" in msg:
+        return "Authentication expired or invalid. Reconnect provider."
+    if "scope" in msg or "permission" in msg or "forbidden" in msg or "access" in msg:
+        return "Insufficient permissions for required API scopes."
+    if "rate" in msg or "throttl" in msg or "quota" in msg:
+        return "Provider is rate-limiting requests. Retry later."
+    if "not set" in msg or "credentials" in msg or "credential" in msg:
+        return "Provider credentials are missing or incomplete."
+    if "customer_not_enabled" in msg or ("customer" in msg and "not enabled" in msg):
+        return "Account is not enabled in provider and cannot be synced."
+    if "user_permission_denied" in msg or "login-customer-id" in msg:
+        return "Account is outside current manager hierarchy. Check MCC/login customer scope."
+    return "Sync failed. Check provider diagnostics and retry."
+
+
+def _sync_action_hint(*, state: str, error_code: Optional[str], retryable: bool) -> str:
+    if state == "healthy":
+        return "No action needed."
+    if state == "never_synced":
+        return "Run initial sync for this account."
+    if state == "retry_scheduled":
+        return "Retry is already scheduled automatically. You can force sync if needed."
+    if error_code == "auth_failed":
+        return "Reconnect provider credentials or fix account permissions."
+    if error_code == "invalid_request":
+        return "Check account mapping and provider account configuration."
+    if retryable:
+        return "Retry later or run force sync after provider recovers."
+    return "Inspect account/provider diagnostics and retry sync."
 
 
 def _error_envelope(status_code: int, detail) -> dict:
@@ -2032,6 +2069,100 @@ def list_ad_account_sync_jobs(
         rows = [r for r in rows if r.ad_account_id in allowed]
 
     return {"items": [r.model_dump(mode="json") for r in rows], "count": len(rows)}
+
+
+@app.get(
+    "/ad-accounts/sync/diagnostics",
+    response_model=AdAccountSyncDiagnosticsResponse,
+    summary="Get per-account sync diagnostics",
+    description="Returns actionable sync diagnostics per account: state, safe error reason, retry status and next action hint.",
+)
+def ad_account_sync_diagnostics(
+    client_id: Optional[UUID] = None,
+    provider: Optional[str] = None,
+    status: str = Query(default="active", pattern="^(active|inactive|archived|all)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    ctx: RequestContext = Depends(auth_context),
+):
+    if client_id:
+        ensure_client_access(ctx, client_id)
+    rows = _ad_account_store().list(client_id=client_id, status=status)
+    if provider:
+        p = provider.strip().lower()
+        rows = [x for x in rows if (x.platform or "").lower().strip() == p]
+    if not ctx.global_access:
+        rows = [x for x in rows if x.client_id in ctx.accessible_client_ids]
+    rows = rows[:limit]
+
+    latest = _ad_account_sync_service().latest_by_account_ids([x.id for x in rows])
+    client_names = {c.id: c.name for c in _client_store().list(status="all")}
+    now = datetime.utcnow()
+    items: List[AdAccountSyncDiagnosticOut] = []
+
+    for account in rows:
+        job = latest.get(account.id)
+        if not job:
+            state = "never_synced"
+            message = "No sync jobs yet for this account."
+            action = _sync_action_hint(state=state, error_code=None, retryable=False)
+            items.append(
+                AdAccountSyncDiagnosticOut(
+                    ad_account_id=account.id,
+                    client_id=account.client_id,
+                    client_name=client_names.get(account.client_id),
+                    platform=account.platform,
+                    account_name=account.name,
+                    account_status=account.status,
+                    sync_state=state,
+                    diagnostic_message=message,
+                    action_hint=action,
+                    last_sync_at=account.last_sync_at,
+                )
+            )
+            continue
+
+        if job.status == "success":
+            state = "healthy"
+            message = "Last sync completed successfully."
+        elif job.retryable and job.next_retry_at and job.next_retry_at > now:
+            state = "retry_scheduled"
+            message = "Sync failed, retry is already scheduled."
+        else:
+            state = "error"
+            message = _safe_sync_error_message(job.error_message)
+
+        action = _sync_action_hint(state=state, error_code=job.error_code, retryable=bool(job.retryable))
+        items.append(
+            AdAccountSyncDiagnosticOut(
+                ad_account_id=account.id,
+                client_id=account.client_id,
+                client_name=client_names.get(account.client_id),
+                platform=account.platform,
+                account_name=account.name,
+                account_status=account.status,
+                sync_state=state,
+                diagnostic_message=message,
+                action_hint=action,
+                last_sync_at=account.last_sync_at or job.finished_at or job.started_at,
+                last_job_id=job.id,
+                last_job_status=job.status,
+                records_synced=job.records_synced,
+                error_code=job.error_code,
+                error_category=job.error_category,
+                retryable=bool(job.retryable),
+                attempt=int(job.attempt or 1),
+                next_retry_at=job.next_retry_at,
+            )
+        )
+
+    summary = {
+        "total_accounts": len(items),
+        "healthy": len([x for x in items if x.sync_state == "healthy"]),
+        "error": len([x for x in items if x.sync_state == "error"]),
+        "retry_scheduled": len([x for x in items if x.sync_state == "retry_scheduled"]),
+        "never_synced": len([x for x in items if x.sync_state == "never_synced"]),
+    }
+    return AdAccountSyncDiagnosticsResponse(summary=summary, items=items)
 
 
 @app.get(

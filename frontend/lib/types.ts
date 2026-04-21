@@ -123,6 +123,50 @@ export type AdAccountSyncJob = {
   created_at: string;
 };
 
+export type AdAccountSyncRunResponse = {
+  requested: number;
+  processed: number;
+  skipped: number;
+  success: number;
+  failed: number;
+  retry_scheduled: number;
+  started_at: string;
+  finished_at: string;
+  jobs: AdAccountSyncJob[];
+};
+
+export type AdAccountSyncDiagnostic = {
+  ad_account_id: string;
+  client_id: string;
+  client_name?: string | null;
+  platform: string;
+  account_name: string;
+  account_status: "active" | "inactive" | "archived";
+  sync_state: "healthy" | "error" | "retry_scheduled" | "never_synced";
+  diagnostic_message: string;
+  action_hint: string;
+  last_sync_at?: string | null;
+  last_job_id?: string | null;
+  last_job_status?: "success" | "error" | null;
+  records_synced: number;
+  error_code?: string | null;
+  error_category?: string | null;
+  retryable: boolean;
+  attempt: number;
+  next_retry_at?: string | null;
+};
+
+export type AdAccountSyncDiagnosticsResponse = {
+  summary: {
+    total_accounts: number;
+    healthy: number;
+    error: number;
+    retry_scheduled: number;
+    never_synced: number;
+  };
+  items: AdAccountSyncDiagnostic[];
+};
+
 export type AdAccountDiscoverResponse = {
   requested_provider: string;
   client_id: string;

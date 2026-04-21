@@ -10,7 +10,10 @@ import { fetchJson } from "../../lib/api";
 import {
   AdAccount,
   AdAccountDiscoverResponse,
+  AdAccountSyncDiagnostic,
+  AdAccountSyncDiagnosticsResponse,
   AdAccountSyncJob,
+  AdAccountSyncRunResponse,
   AuthMeResponse,
   ClientOut,
   IntegrationsOverview,
@@ -26,6 +29,12 @@ function fmtDate(v?: string | null) {
 
 function statusClass(status: string) {
   return status === "success" ? "good" : "bad";
+}
+
+function syncStateClass(state: AdAccountSyncDiagnostic["sync_state"]) {
+  if (state === "healthy") return "good";
+  if (state === "retry_scheduled" || state === "never_synced") return "warn";
+  return "bad";
 }
 
 function providerLabel(v: string) {
@@ -96,6 +105,8 @@ export default function SyncMonitorPage() {
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [clients, setClients] = useState<ClientOut[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationsOverview | null>(null);
+  const [diagnostics, setDiagnostics] = useState<AdAccountSyncDiagnosticsResponse | null>(null);
+  const [lastRun, setLastRun] = useState<AdAccountSyncRunResponse | null>(null);
 
   const [provider, setProvider] = useState("all");
   const [status, setStatus] = useState<"all" | "success" | "error">("all");
@@ -111,11 +122,14 @@ export default function SyncMonitorPage() {
   );
 
   const loadData = useCallback(async () => {
-    const [jobRows, accRows, clientRows, integrationsRows] = await Promise.all([
+    const diagParams = new URLSearchParams({ status: "active", limit: "500" });
+    if (discoverClientId) diagParams.set("client_id", discoverClientId);
+    const [jobRows, accRows, clientRows, integrationsRows, diagnosticsRows] = await Promise.all([
       req<{ items: AdAccountSyncJob[] }>(`/ad-accounts/sync/jobs?status=all&limit=500`),
       req<{ items: AdAccount[] }>("/ad-accounts?status=all"),
       req<{ items: ClientOut[] }>("/clients?status=all"),
       req<IntegrationsOverview>("/integrations/overview"),
+      req<AdAccountSyncDiagnosticsResponse>(`/ad-accounts/sync/diagnostics?${diagParams.toString()}`),
     ]);
     const me = await req<AuthMeResponse>("/auth/me");
     setCurrentRole(me?.user?.role || "unknown");
@@ -123,7 +137,8 @@ export default function SyncMonitorPage() {
     setAccounts(accRows.items || []);
     setClients(clientRows.items || []);
     setIntegrations(integrationsRows);
-  }, [req]);
+    setDiagnostics(diagnosticsRows);
+  }, [req, discoverClientId]);
 
   useEffect(() => {
     if (!ready) return;
@@ -138,6 +153,10 @@ export default function SyncMonitorPage() {
 
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
+  const diagnosticsByAccount = useMemo(
+    () => new Map((diagnostics?.items || []).map((d) => [d.ad_account_id, d])),
+    [diagnostics]
+  );
 
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -154,6 +173,24 @@ export default function SyncMonitorPage() {
       .sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime());
   }, [jobs, provider, status, search, accountMap, clientMap]);
 
+  const diagnosticRows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (diagnostics?.items || [])
+      .filter((d) => {
+        if (provider === "all") return true;
+        const selectedPlatform = asSyncPlatform(provider) || provider;
+        const rowPlatform = asSyncPlatform(d.platform) || d.platform;
+        return rowPlatform === selectedPlatform;
+      })
+      .filter((d) => {
+        if (!q) return true;
+        const clientName = d.client_name || clientMap.get(d.client_id) || "";
+        const hay = `${d.platform} ${d.account_name} ${clientName} ${d.sync_state} ${d.diagnostic_message}`.toLowerCase();
+        return hay.includes(q);
+      })
+      .sort((a, b) => new Date(b.last_sync_at || 0).getTime() - new Date(a.last_sync_at || 0).getTime());
+  }, [diagnostics, provider, search, clientMap]);
+
   useEffect(() => {
     if (!rows.length) {
       setSelectedId("");
@@ -165,6 +202,10 @@ export default function SyncMonitorPage() {
   }, [rows, selectedId]);
 
   const selected = useMemo(() => rows.find((r) => r.id === selectedId) || null, [rows, selectedId]);
+  const selectedDiagnostic = useMemo(
+    () => (selected?.ad_account_id ? diagnosticsByAccount.get(selected.ad_account_id) || null : null),
+    [selected?.ad_account_id, diagnosticsByAccount]
+  );
   const providerMap = useMemo(() => {
     const map = new Map<string, IntegrationProvider>();
     for (const p of integrations?.providers || []) {
@@ -204,12 +245,16 @@ export default function SyncMonitorPage() {
       if (discoverClientId) payload.client_id = discoverClientId;
       if (opts?.platform) payload.platform = opts.platform;
       if (opts?.accountId) payload.account_ids = [opts.accountId];
-      await req("/ad-accounts/sync/run", {
+      const runRes = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      setLastRun(runRes);
       const scope = opts?.accountId ? "account" : opts?.platform || "all providers";
-      push(`Sync queued (${scope})`, "success");
+      push(
+        `Sync done (${scope}): processed ${runRes.processed}, success ${runRes.success}, failed ${runRes.failed}, skipped ${runRes.skipped}`,
+        runRes.failed > 0 ? "info" : "success"
+      );
       await loadData();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Sync failed";
@@ -395,6 +440,72 @@ export default function SyncMonitorPage() {
             </div>
           </section>
 
+          <section className="panel" style={{ marginTop: 12 }}>
+            <div className="panel-head">
+              <div>
+                <h3 style={{ margin: 0 }}>Account Sync Diagnostics</h3>
+                <div className="panel-subtitle">Per-account health with safe error reasons and next action hints.</div>
+              </div>
+              <button className="ghost-btn" onClick={() => void loadData()}>Refresh Diagnostics</button>
+            </div>
+            <div className="kpi-grid" style={{ marginTop: 10 }}>
+              <article className="kpi-card">
+                <div className="kpi-title">Total Accounts</div>
+                <div className="kpi-value">{diagnostics?.summary.total_accounts || 0}</div>
+              </article>
+              <article className="kpi-card good">
+                <div className="kpi-title">Healthy</div>
+                <div className="kpi-value">{diagnostics?.summary.healthy || 0}</div>
+              </article>
+              <article className="kpi-card bad">
+                <div className="kpi-title">Errors</div>
+                <div className="kpi-value">{diagnostics?.summary.error || 0}</div>
+              </article>
+              <article className="kpi-card warn">
+                <div className="kpi-title">Retry Scheduled</div>
+                <div className="kpi-value">{diagnostics?.summary.retry_scheduled || 0}</div>
+              </article>
+            </div>
+            {lastRun ? (
+              <div className="muted-note" style={{ marginTop: 10 }}>
+                Last run: processed {lastRun.processed}, success {lastRun.success}, failed {lastRun.failed}, skipped {lastRun.skipped}, retry scheduled {lastRun.retry_scheduled}.
+              </div>
+            ) : null}
+            <div className="budgets-table-wrap" style={{ marginTop: 10 }}>
+              <table className="budgets-table">
+                <thead>
+                  <tr>
+                    <th>Provider</th>
+                    <th>Account</th>
+                    <th>Client</th>
+                    <th>Sync State</th>
+                    <th>Reason</th>
+                    <th>Action</th>
+                    <th>Last Sync</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {diagnosticRows.slice(0, 100).map((d) => (
+                    <tr key={d.ad_account_id}>
+                      <td>{providerLabel(d.platform)}</td>
+                      <td>{d.account_name}</td>
+                      <td>{d.client_name || clientMap.get(d.client_id) || "--"}</td>
+                      <td><span className={`badge ${syncStateClass(d.sync_state)}`}>{d.sync_state}</span></td>
+                      <td>{d.diagnostic_message}</td>
+                      <td>{d.action_hint}</td>
+                      <td>{fmtDate(d.last_sync_at)}</td>
+                    </tr>
+                  ))}
+                  {!diagnosticRows.length ? (
+                    <tr>
+                      <td colSpan={7} className="muted-note">No diagnostics rows.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           <section className="accounts-grid" style={{ marginTop: 12 }}>
             <article className="panel accounts-main">
               <div className="chip-row" style={{ marginTop: 0 }}>
@@ -458,7 +569,7 @@ export default function SyncMonitorPage() {
                   <div className="budgets-detail-head">
                     <div>
                       <div className="kpi-title">Detail Panel</div>
-                      <h3 style={{ margin: 0 }}>{selected.provider} • {selected.status.toUpperCase()}</h3>
+                      <h3 style={{ margin: 0 }}>{selected.provider} | {selected.status.toUpperCase()}</h3>
                     </div>
                   </div>
 
@@ -486,28 +597,21 @@ export default function SyncMonitorPage() {
                         </div>
                       </div>
                     ) : null}
-                    {selected.error_message ? (
+                    {selectedDiagnostic && selectedDiagnostic.sync_state !== "healthy" ? (
+                      <div className="alert-card high" style={{ marginTop: 10 }}>
+                        <div className="alert-priority high">{selectedDiagnostic.sync_state.toUpperCase()}</div>
+                        <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>{selectedDiagnostic.diagnostic_message}</div>
+                        <div className="muted-note" style={{ marginTop: 8 }}>{selectedDiagnostic.action_hint}</div>
+                        <div className="muted-note" style={{ marginTop: 8 }}>
+                          code: {selectedDiagnostic.error_code || "n/a"} | category: {selectedDiagnostic.error_category || "n/a"}
+                        </div>
+                      </div>
+                    ) : selected.error_message ? (
                       <div className="alert-card high" style={{ marginTop: 10 }}>
                         <div className="alert-priority high">ERROR</div>
                         <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>{safeErrorMessage(selected.error_message)}</div>
                         <div className="muted-note" style={{ marginTop: 8 }}>
-                          code: {selected.error_code || "n/a"} · category: {selected.error_category || "n/a"}
-                        </div>
-                        <div
-                          style={{
-                            marginTop: 8,
-                            padding: 8,
-                            border: "1px solid #f0c9c9",
-                            borderRadius: 6,
-                            background: "#fff7f7",
-                            color: "#8b2525",
-                            fontSize: 12,
-                            lineHeight: 1.4,
-                            whiteSpace: "pre-wrap",
-                            wordBreak: "break-word",
-                          }}
-                        >
-                          {selected.error_message}
+                          code: {selected.error_code || "n/a"} | category: {selected.error_category || "n/a"}
                         </div>
                       </div>
                     ) : null}

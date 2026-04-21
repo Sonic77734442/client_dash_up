@@ -273,6 +273,32 @@ class AdAccountSyncRunResponse(BaseModel):
     jobs: List[AdAccountSyncJobOut]
 
 
+class AdAccountSyncDiagnosticOut(BaseModel):
+    ad_account_id: UUID
+    client_id: UUID
+    client_name: Optional[str] = None
+    platform: str
+    account_name: str
+    account_status: Literal["active", "inactive", "archived"]
+    sync_state: Literal["healthy", "error", "retry_scheduled", "never_synced"]
+    diagnostic_message: str
+    action_hint: str
+    last_sync_at: Optional[datetime] = None
+    last_job_id: Optional[UUID] = None
+    last_job_status: Optional[Literal["success", "error"]] = None
+    records_synced: int = 0
+    error_code: Optional[str] = None
+    error_category: Optional[str] = None
+    retryable: bool = False
+    attempt: int = 0
+    next_retry_at: Optional[datetime] = None
+
+
+class AdAccountSyncDiagnosticsResponse(BaseModel):
+    summary: Dict[str, int]
+    items: List[AdAccountSyncDiagnosticOut]
+
+
 class IntegrationProviderOut(BaseModel):
     provider: str
     status: Literal["healthy", "warning", "error", "disconnected"]
