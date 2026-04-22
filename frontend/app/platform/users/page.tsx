@@ -26,6 +26,11 @@ function fmtDate(v?: string) {
   return d.toLocaleString();
 }
 
+function roleLabel(role: "admin" | "agency" | "client") {
+  if (role === "client") return "solo_client";
+  return role;
+}
+
 export default function PlatformUsersPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -148,7 +153,7 @@ export default function PlatformUsersPage() {
               <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)} placeholder="email@company.com (optional)" />
               <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Full name" />
               <select value={createRole} onChange={(e) => setCreateRole(e.target.value as "admin" | "agency" | "client")}>
-                <option value="client">client</option>
+                <option value="client">solo_client</option>
                 <option value="agency">agency</option>
                 <option value="admin">admin</option>
               </select>
@@ -183,9 +188,9 @@ export default function PlatformUsersPage() {
                       <td>{u.email || "--"}</td>
                       <td>
                         <select value={u.role} onChange={(e) => void patchUser(u.id, { role: e.target.value as UserItem["role"] })}>
-                          <option value="admin">admin</option>
-                          <option value="agency">agency</option>
-                          <option value="client">client</option>
+                          <option value="admin">{roleLabel("admin")}</option>
+                          <option value="agency">{roleLabel("agency")}</option>
+                          <option value="client">{roleLabel("client")}</option>
                         </select>
                       </td>
                       <td>

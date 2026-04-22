@@ -8,13 +8,11 @@ import { useSession } from "../../../hooks/useSession";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson } from "../../../lib/api";
 import {
-  AgencyClientAccessOut,
   AgencyInviteIssueResponse,
   AgencyInviteOut,
   AgencyMemberOut,
   AgencyOut,
   AuthMeResponse,
-  ClientOut,
   SessionContext,
 } from "../../../lib/types";
 
@@ -52,11 +50,9 @@ export default function PlatformAgenciesPage() {
   const [selectedAgencyId, setSelectedAgencyId] = useState<string | null>(null);
 
   const [members, setMembers] = useState<AgencyMemberOut[]>([]);
-  const [clientAccess, setClientAccess] = useState<AgencyClientAccessOut[]>([]);
   const [invites, setInvites] = useState<AgencyInviteOut[]>([]);
 
   const [users, setUsers] = useState<UserItem[]>([]);
-  const [clients, setClients] = useState<ClientOut[]>([]);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
@@ -68,7 +64,6 @@ export default function PlatformAgenciesPage() {
   const [memberRole, setMemberRole] = useState<"owner" | "manager" | "member">("member");
   const [memberStatus, setMemberStatus] = useState<"active" | "inactive">("active");
 
-  const [assignClientId, setAssignClientId] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [lastInviteUrl, setLastInviteUrl] = useState("");
 
@@ -83,12 +78,8 @@ export default function PlatformAgenciesPage() {
   );
 
   const loadRefData = useCallback(async () => {
-    const [usersRes, clientsRes] = await Promise.all([
-      req<{ items: UserItem[] }>("/auth/internal/users"),
-      req<{ items: ClientOut[] }>("/clients?status=all"),
-    ]);
+    const usersRes = await req<{ items: UserItem[] }>("/auth/internal/users");
     setUsers((usersRes.items || []).filter((u) => u.role === "agency" || u.role === "admin"));
-    setClients(clientsRes.items || []);
   }, [req]);
 
   const loadAgencies = useCallback(async () => {
@@ -104,13 +95,11 @@ export default function PlatformAgenciesPage() {
 
   const loadAgencyDetails = useCallback(
     async (agencyId: string) => {
-      const [m, c, i] = await Promise.all([
+      const [m, i] = await Promise.all([
         req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`),
-        req<AgencyClientAccessOut[]>(`/platform/agencies/${agencyId}/clients`),
         req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`),
       ]);
       setMembers(m || []);
-      setClientAccess(c || []);
       setInvites(i || []);
     },
     [req]
@@ -133,7 +122,6 @@ export default function PlatformAgenciesPage() {
   useEffect(() => {
     if (!selectedAgencyId) {
       setMembers([]);
-      setClientAccess([]);
       setInvites([]);
       return;
     }
@@ -146,9 +134,8 @@ export default function PlatformAgenciesPage() {
     const active = agencies.filter((x) => x.status === "active").length;
     const suspended = agencies.filter((x) => x.status === "suspended").length;
     const totalMembers = members.length;
-    const totalClientBindings = clientAccess.length;
-    return { total: agencies.length, active, suspended, totalMembers, totalClientBindings };
-  }, [agencies, clientAccess.length, members.length]);
+    return { total: agencies.length, active, suspended, totalMembers };
+  }, [agencies, members.length]);
 
   const usersById = useMemo(() => {
     const map = new Map<string, UserItem>();
@@ -156,20 +143,13 @@ export default function PlatformAgenciesPage() {
     return map;
   }, [users]);
 
-  const clientsById = useMemo(() => {
-    const map = new Map<string, ClientOut>();
-    for (const c of clients) map.set(c.id, c);
-    return map;
-  }, [clients]);
-
   const selectedStats = useMemo(() => {
     const activeMembers = members.filter((m) => m.status === "active").length;
     return {
       totalMembers: members.length,
       activeMembers,
-      clientBindings: clientAccess.length,
     };
-  }, [members, clientAccess]);
+  }, [members]);
 
   async function createAgency() {
     if (!createName.trim()) {
@@ -229,20 +209,6 @@ export default function PlatformAgenciesPage() {
     }
   }
 
-  async function assignClient() {
-    if (!selectedAgency || !assignClientId) return;
-    try {
-      await req<AgencyClientAccessOut>(`/platform/agencies/${selectedAgency.id}/clients`, {
-        method: "POST",
-        body: JSON.stringify({ client_id: assignClientId }),
-      });
-      await loadAgencyDetails(selectedAgency.id);
-      push("Client access assigned", "success");
-    } catch (err) {
-      push(err instanceof Error ? err.message : "Assign client failed", "error");
-    }
-  }
-
   async function issueInvite() {
     if (!selectedAgency || !inviteEmail.trim()) {
       push("Invite email is required", "error");
@@ -299,19 +265,6 @@ export default function PlatformAgenciesPage() {
       push("Member removed", "success");
     } catch (err) {
       push(err instanceof Error ? err.message : "Remove failed", "error");
-    }
-  }
-
-  async function revokeClientBinding(accessId: string) {
-    if (!selectedAgency) return;
-    try {
-      await req<{ status: string }>(`/platform/agencies/${selectedAgency.id}/clients/${accessId}`, {
-        method: "DELETE",
-      });
-      await loadAgencyDetails(selectedAgency.id);
-      push("Client access revoked", "success");
-    } catch (err) {
-      push(err instanceof Error ? err.message : "Revoke failed", "error");
     }
   }
 
@@ -403,8 +356,8 @@ export default function PlatformAgenciesPage() {
 
           <section className="agency-flow" style={{ marginTop: 12 }}>
             <div className="agency-flow-step">1. Select agency</div>
-            <div className="agency-flow-step">2. Add member</div>
-            <div className="agency-flow-step">3. Grant client access</div>
+            <div className="agency-flow-step">2. Invite agency user</div>
+            <div className="agency-flow-step">3. Add member and role</div>
           </section>
 
           <section className="agency-stats" style={{ marginTop: 12 }}>
@@ -421,8 +374,8 @@ export default function PlatformAgenciesPage() {
               <div className="agency-stat-value">{kpis.suspended}</div>
             </article>
             <article className="agency-stat-card">
-              <div className="agency-stat-label">Client Bindings</div>
-              <div className="agency-stat-value">{kpis.totalClientBindings}</div>
+              <div className="agency-stat-label">Members</div>
+              <div className="agency-stat-value">{kpis.totalMembers}</div>
             </article>
           </section>
 
@@ -477,14 +430,10 @@ export default function PlatformAgenciesPage() {
                   <div className="kpi-title">Active Members</div>
                   <div className="kpi-value">{selectedStats.activeMembers}</div>
                 </article>
-                <article className="kpi-card">
-                  <div className="kpi-title">Client Access</div>
-                  <div className="kpi-value">{selectedStats.clientBindings}</div>
-                </article>
               </section>
 
               <div className="panel drawer-section">
-                <h3>Step 2: Add Member</h3>
+                <h3>Step 3: Add Member</h3>
                 <div className="panel-subtitle">User from `agency/admin` roles, plus access role inside agency.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)}>
@@ -535,37 +484,7 @@ export default function PlatformAgenciesPage() {
               </div>
 
               <div className="panel drawer-section">
-                <h3>Step 3: Grant Client Access</h3>
-                <div className="panel-subtitle">Assign tenant(s) to this agency. Applied to active members automatically.</div>
-                <div className="session-controls" style={{ marginTop: 8 }}>
-                  <select value={assignClientId} onChange={(e) => setAssignClientId(e.target.value)}>
-                    <option value="">Select client</option>
-                    {clients.filter((c) => c.status !== "archived").map((c) => (
-                      <option key={c.id} value={c.id}>{c.name}</option>
-                    ))}
-                  </select>
-                  <button className="primary-btn" disabled={!selectedAgency || !assignClientId || adminOnly === true} onClick={() => void assignClient()}>
-                    Grant Access
-                  </button>
-                </div>
-                <div className="drawer-list">
-                  {clientAccess.map((ac) => (
-                    <div key={ac.id} className="activity-item">
-                      <div><strong>{clientsById.get(ac.client_id)?.name || ac.client_id.slice(0, 8)}</strong></div>
-                      <div className="muted">Granted: {fmtDate(ac.updated_at)}</div>
-                      <div className="alert-actions" style={{ marginTop: 6 }}>
-                        <button className="mini-btn" disabled={adminOnly === true} onClick={() => void revokeClientBinding(ac.id)}>
-                          Revoke
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                  {clientAccess.length === 0 ? <div className="muted">No client bindings yet.</div> : null}
-                </div>
-              </div>
-
-              <div className="panel drawer-section">
-                <h3>Step 4: Invite Agency User</h3>
+                <h3>Step 2: Invite Agency User</h3>
                 <div className="panel-subtitle">Issue one-time invite link. User accepts invite on login page.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <input
