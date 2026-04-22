@@ -610,6 +610,41 @@ class AgencyInviteAcceptResponse(BaseModel):
     session: SessionIssueResponse
 
 
+class ClientInviteCreate(BaseModel):
+    email: str
+    expires_in_days: int = Field(7, ge=1, le=30)
+
+
+class ClientInviteResendRequest(BaseModel):
+    expires_in_days: int = Field(7, ge=1, le=30)
+
+
+class ClientInviteOut(BaseModel):
+    id: UUID
+    client_id: UUID
+    email: str
+    status: Literal["pending", "accepted", "revoked", "expired"]
+    expires_at: datetime
+    invited_by: Optional[UUID] = None
+    accepted_user_id: Optional[UUID] = None
+    accepted_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ClientInviteIssueResponse(BaseModel):
+    invite: ClientInviteOut
+    invite_token: str
+    accept_url: str
+
+
+class ClientInviteAcceptResponse(BaseModel):
+    invite: ClientInviteOut
+    client: ClientOut
+    user: UserOut
+    session: SessionIssueResponse
+
+
 class SessionValidationResponse(BaseModel):
     valid: bool
     reason: Optional[str] = None

@@ -172,6 +172,23 @@ CREATE TABLE IF NOT EXISTS agency_invites (
   FOREIGN KEY (accepted_user_id) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS client_invites (
+  id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','revoked','expired')),
+  expires_at TEXT NOT NULL,
+  invited_by TEXT NULL,
+  accepted_user_id TEXT NULL,
+  accepted_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (client_id) REFERENCES clients(id),
+  FOREIGN KEY (invited_by) REFERENCES users(id),
+  FOREIGN KEY (accepted_user_id) REFERENCES users(id)
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -234,6 +251,9 @@ CREATE INDEX IF NOT EXISTS idx_agency_client_access_client_id ON agency_client_a
 CREATE INDEX IF NOT EXISTS idx_agency_invites_agency_id ON agency_invites(agency_id);
 CREATE INDEX IF NOT EXISTS idx_agency_invites_email ON agency_invites(email);
 CREATE INDEX IF NOT EXISTS idx_agency_invites_status ON agency_invites(status);
+CREATE INDEX IF NOT EXISTS idx_client_invites_client_id ON client_invites(client_id);
+CREATE INDEX IF NOT EXISTS idx_client_invites_email ON client_invites(email);
+CREATE INDEX IF NOT EXISTS idx_client_invites_status ON client_invites(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_oauth_states_provider ON oauth_states(provider, created_at);
 

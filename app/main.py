@@ -4,8 +4,8 @@ import secrets
 import threading
 import time
 import os
-from datetime import date, datetime
-from typing import List, Optional
+from datetime import date, datetime, timedelta
+from typing import List, Optional, Union
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -54,6 +54,11 @@ from app.schemas import (
     BudgetTransferRequest,
     BudgetTransferResponse,
     ClientCreate,
+    ClientInviteAcceptResponse,
+    ClientInviteCreate,
+    ClientInviteIssueResponse,
+    ClientInviteOut,
+    ClientInviteResendRequest,
     ClientOut,
     ClientPatch,
     AuthIdentityLink,
@@ -818,6 +823,210 @@ def _ensure_solo_client_for_user(user: UserOut) -> None:
             client_id=created.id,
             role="client",
         )
+    )
+
+
+def _invite_token_hash(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _derive_name_from_email(email: str) -> str:
+    local = (email or "").split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ").strip()
+    return local.title() or "Client User"
+
+
+def _to_client_invite_out(row) -> ClientInviteOut:
+    return ClientInviteOut(
+        id=UUID(row["id"]),
+        client_id=UUID(row["client_id"]),
+        email=row["email"],
+        status=row["status"],
+        expires_at=datetime.fromisoformat(row["expires_at"]),
+        invited_by=UUID(row["invited_by"]) if row["invited_by"] else None,
+        accepted_user_id=UUID(row["accepted_user_id"]) if row["accepted_user_id"] else None,
+        accepted_at=datetime.fromisoformat(row["accepted_at"]) if row["accepted_at"] else None,
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _issue_client_invite(
+    *,
+    client_id: UUID,
+    email: str,
+    expires_in_days: int,
+    invited_by: Optional[UUID],
+) -> ClientInviteIssueResponse:
+    now = datetime.utcnow()
+    expires_at = now + timedelta(days=max(1, int(expires_in_days)))
+    invite_id = str(uuid4())
+    token = secrets.token_urlsafe(32)
+    token_hash = _invite_token_hash(token)
+    norm_email = email.strip().lower()
+    if not norm_email:
+        raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email is required"})
+
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        row_client = conn.execute("SELECT id FROM clients WHERE id=?", (str(client_id),)).fetchone()
+        if not row_client:
+            raise HTTPException(status_code=404, detail="Client not found")
+        conn.execute(
+            """
+            UPDATE client_invites
+            SET status='revoked', updated_at=?
+            WHERE client_id=? AND lower(email)=lower(?) AND status='pending'
+            """,
+            (now.isoformat(), str(client_id), norm_email),
+        )
+        conn.execute(
+            """
+            INSERT INTO client_invites
+            (id, client_id, email, token_hash, status, expires_at, invited_by, accepted_user_id, accepted_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, ?, ?)
+            """,
+            (
+                invite_id,
+                str(client_id),
+                norm_email,
+                token_hash,
+                expires_at.isoformat(),
+                str(invited_by) if invited_by else None,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM client_invites WHERE id=?", (invite_id,)).fetchone()
+
+    base = settings.frontend_base_url.rstrip("/")
+    accept_url = f"{base}/login?invite_token={token}"
+    return ClientInviteIssueResponse(invite=_to_client_invite_out(row), invite_token=token, accept_url=accept_url)
+
+
+def _list_client_invites(*, client_id: UUID, status: str = "all") -> List[ClientInviteOut]:
+    now_iso = datetime.utcnow().isoformat()
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        conn.execute(
+            """
+            UPDATE client_invites
+            SET status='expired', updated_at=?
+            WHERE client_id=? AND status='pending' AND expires_at < ?
+            """,
+            (now_iso, str(client_id), now_iso),
+        )
+        conn.commit()
+        where = "WHERE client_id=?"
+        params: List[object] = [str(client_id)]
+        if status != "all":
+            where += " AND status=?"
+            params.append(status)
+        rows = conn.execute(
+            f"SELECT * FROM client_invites {where} ORDER BY updated_at DESC",
+            tuple(params),
+        ).fetchall()
+    return [_to_client_invite_out(r) for r in rows]
+
+
+def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOut:
+    now_iso = datetime.utcnow().isoformat()
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM client_invites WHERE id=? AND client_id=?",
+            (str(invite_id), str(client_id)),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Client invite not found")
+        if row["status"] in {"accepted", "expired", "revoked"}:
+            return _to_client_invite_out(row)
+        conn.execute(
+            "UPDATE client_invites SET status='revoked', updated_at=? WHERE id=?",
+            (now_iso, str(invite_id)),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM client_invites WHERE id=?", (str(invite_id),)).fetchone()
+    return _to_client_invite_out(updated)
+
+
+def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcceptResponse:
+    if payload.password is None or len(payload.password.strip()) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
+        )
+    now = datetime.utcnow()
+    token_hash = _invite_token_hash(payload.token.strip())
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM client_invites WHERE token_hash=?",
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail={"code": "invalid_invite", "message": "Invalid invite token"})
+        status = row["status"]
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if status == "accepted":
+            raise HTTPException(status_code=400, detail={"code": "invite_used", "message": "Invite already accepted"})
+        if status == "revoked":
+            raise HTTPException(status_code=400, detail={"code": "invite_revoked", "message": "Invite was revoked"})
+        if expires_at <= now:
+            conn.execute("UPDATE client_invites SET status='expired', updated_at=? WHERE id=?", (now.isoformat(), row["id"]))
+            conn.commit()
+            raise HTTPException(status_code=400, detail={"code": "invite_expired", "message": "Invite expired"})
+        client_row = conn.execute("SELECT * FROM clients WHERE id=?", (row["client_id"],)).fetchone()
+        if not client_row:
+            raise HTTPException(status_code=404, detail={"code": "client_not_found", "message": "Client not found"})
+
+    email = str(row["email"]).strip().lower()
+    existing_user = _auth_store().find_user_by_email(email)
+    if existing_user:
+        user = existing_user
+        if user.status != "active":
+            user = _auth_store().patch_user(user.id, UserPatch(status="active"))
+        if payload.name and payload.name.strip():
+            user = _auth_store().patch_user(user.id, UserPatch(name=payload.name.strip()))
+    else:
+        user = _auth_store().create_user(
+            UserCreate(
+                email=email,
+                name=(payload.name or "").strip() or _derive_name_from_email(email),
+                role="client",
+                status="active",
+            )
+        )
+
+    _ensure_solo_client_for_user(user)
+    _auth_store().assign_client_access(
+        UserClientAccessCreate(
+            user_id=user.id,
+            client_id=UUID(row["client_id"]),
+            role="client",
+        )
+    )
+    _auth_store().set_password(user.id, payload.password.strip())
+    session = _auth_store().issue_session(SessionIssueRequest(user_id=user.id, ttl_minutes=settings.oauth_session_ttl_minutes))
+
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        conn.execute(
+            """
+            UPDATE client_invites
+            SET status='accepted', accepted_user_id=?, accepted_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (str(user.id), now.isoformat(), now.isoformat(), row["id"]),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM client_invites WHERE id=?", (row["id"],)).fetchone()
+
+    client = _client_store().get(UUID(row["client_id"]))
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return ClientInviteAcceptResponse(
+        invite=_to_client_invite_out(updated),
+        client=client,
+        user=user,
+        session=session,
     )
 
 
@@ -1899,15 +2108,22 @@ def platform_revoke_agency_client(
 
 @app.post(
     "/auth/invites/accept",
-    response_model=AgencyInviteAcceptResponse,
+    response_model=Union[AgencyInviteAcceptResponse, ClientInviteAcceptResponse],
     summary="Accept agency invite",
     description=(
-        "Public onboarding endpoint: validates invite token, creates/links agency user, "
-        "adds agency membership, materializes tenant access, and issues backend session."
+        "Public onboarding endpoint: validates invite token and accepts agency/client invite, "
+        "materializes tenant access, and issues backend session."
     ),
 )
 def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
-    accepted = _platform_admin_store().accept_invite(payload, session_ttl_minutes=settings.oauth_session_ttl_minutes)
+    try:
+        accepted = _platform_admin_store().accept_invite(payload, session_ttl_minutes=settings.oauth_session_ttl_minutes)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        code = str(detail.get("code") or "").strip().lower() if isinstance(detail, dict) else ""
+        if exc.status_code != 400 or code not in {"invalid_invite", "invite_expired", "invite_revoked", "invite_used"}:
+            raise
+        accepted = _accept_client_invite(payload)
     response = JSONResponse(content=accepted.model_dump(mode="json"))
     max_age = max(60, int((accepted.session.expires_at - datetime.utcnow()).total_seconds()))
     response.set_cookie(
@@ -1981,6 +2197,94 @@ def archive_client(client_id: UUID, ctx: RequestContext = Depends(auth_context))
     ensure_client_access(ctx, client_id)
     row = _client_store().archive(client_id)
     return {"status": "archived", "client": row.model_dump(mode="json")}
+
+
+@app.post(
+    "/clients/{client_id}/invites",
+    response_model=ClientInviteIssueResponse,
+    summary="Issue client invite",
+)
+def issue_client_invite(client_id: UUID, payload: ClientInviteCreate, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can issue client invites"},
+        )
+    ensure_client_access(ctx, client_id)
+    return _issue_client_invite(
+        client_id=client_id,
+        email=payload.email,
+        expires_in_days=payload.expires_in_days,
+        invited_by=ctx.user_id,
+    )
+
+
+@app.get(
+    "/clients/{client_id}/invites",
+    response_model=List[ClientInviteOut],
+    summary="List client invites",
+)
+def list_client_invites(
+    client_id: UUID,
+    status: str = Query(default="all", pattern="^(pending|accepted|revoked|expired|all)$"),
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can list client invites"},
+        )
+    ensure_client_access(ctx, client_id)
+    return _list_client_invites(client_id=client_id, status=status)
+
+
+@app.post(
+    "/clients/{client_id}/invites/{invite_id}/resend",
+    response_model=ClientInviteIssueResponse,
+    summary="Resend client invite",
+)
+def resend_client_invite(
+    client_id: UUID,
+    invite_id: UUID,
+    payload: ClientInviteResendRequest,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can resend client invites"},
+        )
+    ensure_client_access(ctx, client_id)
+    invites = _list_client_invites(client_id=client_id, status="all")
+    target = next((x for x in invites if x.id == invite_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Client invite not found")
+    _revoke_client_invite(client_id=client_id, invite_id=invite_id)
+    return _issue_client_invite(
+        client_id=client_id,
+        email=target.email,
+        expires_in_days=payload.expires_in_days,
+        invited_by=ctx.user_id,
+    )
+
+
+@app.post(
+    "/clients/{client_id}/invites/{invite_id}/revoke",
+    response_model=ClientInviteOut,
+    summary="Revoke client invite",
+)
+def revoke_client_invite(
+    client_id: UUID,
+    invite_id: UUID,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can revoke client invites"},
+        )
+    ensure_client_access(ctx, client_id)
+    return _revoke_client_invite(client_id=client_id, invite_id=invite_id)
 
 
 @app.post(

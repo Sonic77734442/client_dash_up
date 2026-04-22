@@ -19,6 +19,24 @@ type ClientForm = {
   default_currency: string;
   timezone: string;
   notes: string;
+  invite_email: string;
+  invite_expires_in_days: number;
+};
+
+type ClientInvite = {
+  id: string;
+  client_id: string;
+  email: string;
+  status: "pending" | "accepted" | "revoked" | "expired";
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type ClientInviteIssueResponse = {
+  invite: ClientInvite;
+  invite_token: string;
+  accept_url: string;
 };
 
 function emptyForm(): ClientForm {
@@ -29,6 +47,8 @@ function emptyForm(): ClientForm {
     default_currency: "USD",
     timezone: "UTC",
     notes: "",
+    invite_email: "",
+    invite_expires_in_days: 7,
   };
 }
 
@@ -158,6 +178,8 @@ export default function ClientsPage() {
       default_currency: row.default_currency || "USD",
       timezone: row.timezone || "UTC",
       notes: row.notes || "",
+      invite_email: "",
+      invite_expires_in_days: 7,
     });
     setModalError("");
     setModalOpen(true);
@@ -186,11 +208,28 @@ export default function ClientsPage() {
         });
         push("Client updated", "success");
       } else {
-        await req<ClientOut>("/clients", {
+        const created = await req<ClientOut>("/clients", {
           method: "POST",
           body: JSON.stringify(payload),
         });
-        push("Client created", "success");
+        const inviteEmail = form.invite_email.trim().toLowerCase();
+        if (inviteEmail) {
+          const issued = await req<ClientInviteIssueResponse>(`/clients/${created.id}/invites`, {
+            method: "POST",
+            body: JSON.stringify({
+              email: inviteEmail,
+              expires_in_days: Number(form.invite_expires_in_days) || 7,
+            }),
+          });
+          try {
+            await navigator.clipboard.writeText(issued.accept_url);
+            push("Client created, invite issued, link copied", "success");
+          } catch {
+            push("Client created, invite issued", "success");
+          }
+        } else {
+          push("Client created", "success");
+        }
       }
       setModalOpen(false);
       await loadClients();
@@ -223,6 +262,36 @@ export default function ClientsPage() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Restore failed";
       setWarning(msg);
+      push(msg, "error");
+    }
+  }
+
+  async function copyInviteLink(row: ClientOut) {
+    try {
+      const invitesRes = await req<ClientInvite[]>(`/clients/${row.id}/invites?status=all`);
+      const latest = (invitesRes || [])[0];
+      let issued: ClientInviteIssueResponse;
+      if (latest) {
+        issued = await req<ClientInviteIssueResponse>(`/clients/${row.id}/invites/${latest.id}/resend`, {
+          method: "POST",
+          body: JSON.stringify({ expires_in_days: 7 }),
+        });
+      } else {
+        const email = window.prompt("Client email for invite");
+        const normEmail = String(email || "").trim().toLowerCase();
+        if (!normEmail) {
+          push("Invite email is required", "info");
+          return;
+        }
+        issued = await req<ClientInviteIssueResponse>(`/clients/${row.id}/invites`, {
+          method: "POST",
+          body: JSON.stringify({ email: normEmail, expires_in_days: 7 }),
+        });
+      }
+      await navigator.clipboard.writeText(issued.accept_url);
+      push("Invite link copied", "success");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Invite action failed";
       push(msg, "error");
     }
   }
@@ -353,6 +422,7 @@ export default function ClientsPage() {
                       <td>
                         <div className="alert-actions" style={{ marginTop: 0 }}>
                           <Link className="mini-btn" href={`/client/${c.id}`}>Open Client</Link>
+                          <button className="mini-btn" onClick={() => void copyInviteLink(c)}>Copy Invite Link</button>
                           <button className="mini-btn" onClick={() => openEdit(c)}>Edit</button>
                           {c.status === "archived" ? (
                             <button className="mini-btn" onClick={() => void restoreClient(c)}>Restore</button>
@@ -440,6 +510,30 @@ export default function ClientsPage() {
             Notes
             <textarea value={form.notes} onChange={(e) => setForm((s) => ({ ...s, notes: e.target.value }))} rows={3} style={{ width: "100%" }} />
           </label>
+
+          {!editingId ? (
+            <div className="detail-grid" style={{ marginTop: 10 }}>
+              <label>
+                Client login email (optional)
+                <input
+                  type="email"
+                  value={form.invite_email}
+                  onChange={(e) => setForm((s) => ({ ...s, invite_email: e.target.value }))}
+                  placeholder="client@company.com"
+                />
+              </label>
+              <label>
+                Invite expires (days)
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={form.invite_expires_in_days}
+                  onChange={(e) => setForm((s) => ({ ...s, invite_expires_in_days: Number(e.target.value) || 7 }))}
+                />
+              </label>
+            </div>
+          ) : null}
 
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
             <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Cancel</button>
