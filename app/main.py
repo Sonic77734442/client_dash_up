@@ -1920,8 +1920,29 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
 
 @app.post("/clients", response_model=ClientOut, summary="Create client")
 def create_client(payload: ClientCreate, ctx: RequestContext = Depends(auth_context)):
-    ensure_admin(ctx)
-    return _client_store().create(payload)
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can create clients"},
+        )
+    agency_ids: List[UUID] = []
+    if ctx.role == "agency":
+        if not ctx.user_id:
+            raise HTTPException(status_code=401, detail="Session user not found")
+        agency_ids = _agency_scope_ids_for_user(ctx.user_id)
+        if not agency_ids:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "agency_unbound", "message": "Agency user has no active agency membership"},
+            )
+    created = _client_store().create(payload)
+    if ctx.role == "agency":
+        for agency_id in agency_ids:
+            _platform_admin_store().assign_client(
+                agency_id,
+                AgencyClientAccessCreate(client_id=created.id),
+            )
+    return created
 
 
 @app.get("/clients", summary="List clients")
