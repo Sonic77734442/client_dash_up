@@ -2,22 +2,11 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ToastHost } from "../../components/ToastHost";
-import { useSession } from "../../hooks/useSession";
-import { useToast } from "../../hooks/useToast";
-import { fetchJson, getQuery } from "../../lib/api";
-import { AdAccount, AuthMeResponse, Budget, OperationalAction, Overview, SessionContext } from "../../lib/types";
-
-function fmtMoney(v: number | null | undefined) {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(v || 0);
-}
-
-function fmtDate(v?: string | null) {
-  if (!v) return "--";
-  const d = new Date(v);
-  if (Number.isNaN(d.getTime())) return "--";
-  return d.toLocaleString();
-}
+import { ToastHost } from "../../../components/ToastHost";
+import { useSession } from "../../../hooks/useSession";
+import { useToast } from "../../../hooks/useToast";
+import { fetchJson, getQuery } from "../../../lib/api";
+import { AuthMeResponse, Budget, Overview, SessionContext } from "../../../lib/types";
 
 function dateRange(periodDays: number) {
   const to = new Date();
@@ -27,7 +16,11 @@ function dateRange(periodDays: number) {
   return { from: fmt(from), to: fmt(to) };
 }
 
-export default function ClientPortalPage() {
+function fmtMoney(v: number | null | undefined) {
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(v || 0);
+}
+
+export default function ClientPortalBillingPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
@@ -37,11 +30,8 @@ export default function ClientPortalPage() {
   const [warning, setWarning] = useState("");
   const [ctx, setCtx] = useState<SessionContext | null>(null);
   const [selectedClientId, setSelectedClientId] = useState("");
-
   const [overview, setOverview] = useState<Overview | null>(null);
-  const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [budgets, setBudgets] = useState<Budget[]>([]);
-  const [actions, setActions] = useState<OperationalAction[]>([]);
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -75,31 +65,26 @@ export default function ClientPortalPage() {
 
     const r = dateRange(periodDays);
     const q = getQuery({ client_id: cid, date_from: r.from, date_to: r.to });
-    const [ov, acc, bgs, acts] = await Promise.all([
+    const [ov, bgs] = await Promise.all([
       req<Overview>(`/insights/overview${q}`),
-      req<{ items: AdAccount[] }>(`/ad-accounts${getQuery({ client_id: cid, status: "active" })}`),
       req<{ items: Budget[] }>(`/budgets${getQuery({ client_id: cid, status: "active", date_from: r.from, date_to: r.to })}`),
-      req<OperationalAction[]>(`/insights/operational/actions${getQuery({ client_id: cid })}`),
     ]);
-
     setOverview(ov);
-    setAccounts(acc.items || []);
     setBudgets(bgs.items || []);
-    setActions(Array.isArray(acts) ? acts.slice(0, 10) : []);
     setWarning("");
   }, [ctx, loadContext, periodDays, req, selectedClientId]);
 
   useEffect(() => {
     if (!ready) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load portal"));
+    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load billing"));
   }, [ready, loadData]);
 
-  const kpis = useMemo(() => {
-    const spend = Number(overview?.spend_summary?.spend || 0);
+  const summary = useMemo(() => {
+    const spend = Number(overview?.budget_summary?.spend || 0);
     const budget = Number(overview?.budget_summary?.budget || 0);
+    const remaining = overview?.budget_summary?.remaining;
     const usage = overview?.budget_summary?.usage_percent;
-    const pace = String(overview?.budget_summary?.pace_status || "on_track");
-    return { spend, budget, usage, pace };
+    return { spend, budget, remaining, usage };
   }, [overview]);
 
   return (
@@ -109,9 +94,9 @@ export default function ClientPortalPage() {
           <div className="brand">Editorial Rigor</div>
           <div className="panel-subtitle">Client Portal</div>
           <nav className="menu">
-            <Link className="menu-item active" href="/portal">Overview</Link>
+            <Link className="menu-item" href="/portal">Overview</Link>
             <Link className="menu-item" href="/portal/reports">Reports</Link>
-            <Link className="menu-item" href="/portal/billing">Billing</Link>
+            <Link className="menu-item active" href="/portal/billing">Billing</Link>
           </nav>
           <div className="sidebar-footer">
             <Link className="menu-item" href="/portal/reports">Export Reports</Link>
@@ -123,8 +108,8 @@ export default function ClientPortalPage() {
         <main className="content">
           <header className="topbar">
             <div className="topbar-left">
-              <div className="topbar-title">Client Overview</div>
-              <div className="panel-subtitle">Read-only performance and budget tracking</div>
+              <div className="topbar-title">Billing & Budgets</div>
+              <div className="panel-subtitle">Client budget status and active budget records</div>
             </div>
             {tokenLoginEnabled ? (
               <div className="session-controls">
@@ -180,76 +165,35 @@ export default function ClientPortalPage() {
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
 
           <section className="kpi-grid" style={{ marginTop: 12 }}>
-            <article className="kpi-card good"><div className="kpi-title">Spend</div><div className="kpi-value">{fmtMoney(kpis.spend)}</div></article>
-            <article className="kpi-card"><div className="kpi-title">Budget</div><div className="kpi-value">{kpis.budget ? fmtMoney(kpis.budget) : "—"}</div></article>
-            <article className="kpi-card"><div className="kpi-title">Usage</div><div className="kpi-value">{kpis.usage == null ? "—" : `${kpis.usage.toFixed(1)}%`}</div></article>
-            <article className="kpi-card"><div className="kpi-title">Pace</div><div className="kpi-value" style={{ fontSize: 24 }}>{kpis.pace.toUpperCase()}</div></article>
-          </section>
-
-          <section className="mid-grid" style={{ marginTop: 12 }}>
-            <article className="panel">
-              <h3>My Accounts</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Platform</th>
-                    <th>Status</th>
-                    <th>Last Sync</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {accounts.map((a) => (
-                    <tr key={a.id}>
-                      <td>{a.name}</td>
-                      <td>{a.platform}</td>
-                      <td>{a.status}</td>
-                      <td>{fmtDate(a.last_sync_at || a.updated_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </article>
-
-            <article className="panel">
-              <h3>Budget Snapshot</h3>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Scope</th>
-                    <th>Amount</th>
-                    <th>Status</th>
-                    <th>Period</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {budgets.map((b) => (
-                    <tr key={b.id || `${b.client_id}-${b.account_id || "client"}`}>
-                      <td>{b.scope}</td>
-                      <td>{fmtMoney(Number(b.amount || 0))}</td>
-                      <td>{b.status || "active"}</td>
-                      <td>{b.start_date} → {b.end_date}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </article>
+            <article className="kpi-card good"><div className="kpi-title">Spend</div><div className="kpi-value">{fmtMoney(summary.spend)}</div></article>
+            <article className="kpi-card"><div className="kpi-title">Budget</div><div className="kpi-value">{summary.budget ? fmtMoney(summary.budget) : "-"}</div></article>
+            <article className="kpi-card"><div className="kpi-title">Remaining</div><div className="kpi-value">{summary.remaining == null ? "-" : fmtMoney(summary.remaining)}</div></article>
+            <article className="kpi-card"><div className="kpi-title">Usage</div><div className="kpi-value">{summary.usage == null ? "-" : `${summary.usage.toFixed(1)}%`}</div></article>
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
-            <h3>Recent Actions</h3>
-            <div className="insights-list">
-              {actions.length ? actions.map((a) => (
-                <article key={a.id} className="insight-card">
-                  <div className="insight-head">
-                    <div className="insight-title">{a.title}</div>
-                    <span className="badge">{a.status.toUpperCase()}</span>
-                  </div>
-                  <div className="insight-text">{a.title || `${a.action.toUpperCase()} • ${a.scope}`}</div>
-                  <div className="insight-meta">{fmtDate(a.created_at)}</div>
-                </article>
-              )) : <div className="muted-note">No recent actions.</div>}
-            </div>
+            <h3>Active Budgets</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Scope</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Period</th>
+                </tr>
+              </thead>
+              <tbody>
+                {budgets.map((b) => (
+                  <tr key={b.id || `${b.client_id}-${b.account_id || "client"}-${b.start_date || ""}`}>
+                    <td>{b.scope}</td>
+                    <td>{fmtMoney(Number(b.amount || 0))}</td>
+                    <td>{b.status || "active"}</td>
+                    <td>{b.start_date || "-"} to {b.end_date || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {!budgets.length ? <div className="muted-note">No active budget records for selected period.</div> : null}
           </section>
         </main>
       </div>
