@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -156,7 +157,7 @@ class SyncRunResult:
 
 
 class AdAccountSyncService:
-    AUTO_INITIAL_LOOKBACK_DAYS = 30
+    DEFAULT_INITIAL_LOOKBACK_DAYS = 90
 
     def __init__(
         self,
@@ -171,6 +172,13 @@ class AdAccountSyncService:
         self.job_store = job_store
         self.ad_stats_store = ad_stats_store
         self.credential_resolver = credential_resolver
+        try:
+            self.initial_lookback_days = max(
+                1,
+                int(str(os.getenv("AD_SYNC_INITIAL_LOOKBACK_DAYS", self.DEFAULT_INITIAL_LOOKBACK_DAYS))),
+            )
+        except Exception:
+            self.initial_lookback_days = self.DEFAULT_INITIAL_LOOKBACK_DAYS
         self.provider_fetchers = provider_fetchers or {
             "meta": self._fetch_meta_daily,
             "google": self._fetch_google_daily,
@@ -319,7 +327,7 @@ class AdAccountSyncService:
             if last_sync:
                 from_date = last_sync
             else:
-                from_date = explicit_to - timedelta(days=self.AUTO_INITIAL_LOOKBACK_DAYS - 1)
+                from_date = explicit_to - timedelta(days=self.initial_lookback_days - 1)
         if from_date > explicit_to:
             from_date = explicit_to
         return from_date.isoformat(), explicit_to.isoformat()

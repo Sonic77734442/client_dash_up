@@ -210,6 +210,7 @@ class AdAccountDiscoveryService:
                         items.append(existing_account)
                         continue
                     patch = AdAccountPatch(
+                        client_id=client_id if existing_account.client_id != client_id else None,
                         name=name if name and name != existing_account.name else None,
                         currency=currency if currency and currency != existing_account.currency else None,
                         status="active" if existing_account.status != "active" else None,
@@ -266,6 +267,7 @@ class AdAccountDiscoveryService:
                     patched = self.account_store.patch(
                         fallback_existing.id,
                         AdAccountPatch(
+                            client_id=client_id if fallback_existing.client_id != client_id else None,
                             name=name if name and name != fallback_existing.name else None,
                             currency=currency if currency and currency != fallback_existing.currency else None,
                             status="active" if fallback_existing.status != "active" else None,
