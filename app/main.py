@@ -787,6 +787,35 @@ def _auto_upsert_integration_credentials(
         )
 
 
+def _ensure_solo_client_for_user(user: UserOut) -> None:
+    if user.role != "client":
+        return
+    existing = _auth_store().list_client_access(user_id=user.id)
+    for grant in existing:
+        if grant.role != "client":
+            continue
+        row = _client_store().get(grant.client_id)
+        if row and row.status != "archived":
+            return
+
+    fallback_name = (user.name or "").strip() or ((user.email or "").split("@")[0].strip() if user.email else "")
+    client_name = fallback_name or f"solo-{str(user.id)[:8]}"
+    created = _client_store().create(
+        ClientCreate(
+            name=client_name,
+            status="active",
+            notes=f"Auto-created solo client for user {user.id}",
+        )
+    )
+    _auth_store().assign_client_access(
+        UserClientAccessCreate(
+            user_id=user.id,
+            client_id=created.id,
+            role="client",
+        )
+    )
+
+
 def _normalize_next_path(next_path: Optional[str]) -> str:
     value = (next_path or "/").strip()
     if not value.startswith("/"):
@@ -1109,7 +1138,9 @@ def auth_create_user(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    return _auth_store().create_user(payload)
+    user = _auth_store().create_user(payload)
+    _ensure_solo_client_for_user(user)
+    return user
 
 
 @app.get(
@@ -1135,7 +1166,9 @@ def auth_patch_user(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    return _auth_store().patch_user(user_id, payload)
+    user = _auth_store().patch_user(user_id, payload)
+    _ensure_solo_client_for_user(user)
+    return user
 
 
 @app.post(
