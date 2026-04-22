@@ -12,6 +12,7 @@ type SessionState = {
 };
 
 export function useSession(defaultApiBase: string) {
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const [session, setSession] = useState<SessionState>({
     apiBase: defaultApiBase,
     token: "",
@@ -20,10 +21,10 @@ export function useSession(defaultApiBase: string) {
 
   useEffect(() => {
     const apiBase = localStorage.getItem(LS_API_BASE) || defaultApiBase;
-    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
+    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
     setSession({ apiBase, token });
     setReady(true);
-  }, [defaultApiBase]);
+  }, [defaultApiBase, tokenLoginEnabled]);
 
   const persist = useCallback((next: SessionState) => {
     localStorage.setItem(LS_API_BASE, next.apiBase);

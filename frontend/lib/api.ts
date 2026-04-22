@@ -77,9 +77,7 @@ export async function fetchJson<T>(
   init?: RequestInit
 ): Promise<T> {
   const method = (init?.method || "GET").toUpperCase();
-  const resolvedToken =
-    (token || "").trim() ||
-    (typeof window !== "undefined" ? (localStorage.getItem("ops_session_token") || "").trim() : "");
+  const resolvedToken = (token || "").trim();
 
   async function requestOnce(forceRefreshCsrf: boolean): Promise<{ res: Response; body: unknown }> {
     const headers = new Headers(init?.headers || {});
