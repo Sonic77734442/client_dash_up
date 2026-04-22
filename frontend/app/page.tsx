@@ -15,6 +15,7 @@ import { fetchJson, getQuery } from "../lib/api";
 import {
   AdStat,
   AgencyOverview,
+  AuthMeResponse,
   Budget,
   Client,
   ClientOpsRow,
@@ -95,6 +96,8 @@ export default function HomePage() {
   const [budgets, setBudgets] = useState<Budget[]>([]);
 
   const [warning, setWarning] = useState("");
+  const [authResolved, setAuthResolved] = useState(false);
+  const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
 
   const [clientOpsSearch, setClientOpsSearch] = useState("");
   const [clientOpsChip, setClientOpsChip] = useState<"all" | "at_risk" | "overspending" | "no_budget" | "has_alerts">("all");
@@ -108,6 +111,14 @@ export default function HomePage() {
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
     [session.apiBase, session.token]
   );
+
+  const resolveAuth = useCallback(async () => {
+    const me = await req<AuthMeResponse>("/auth/me");
+    const role = (me?.user?.role || "unknown") as "admin" | "agency" | "client" | "unknown";
+    setCurrentRole(role);
+    setAuthResolved(true);
+    return role;
+  }, [req]);
 
   const loadClients = useCallback(async () => {
     const payload = await req<{ items: Client[] }>("/clients?status=active");
@@ -155,13 +166,24 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadClients();
-  }, [ready, loadClients]);
+    void resolveAuth()
+      .then((role) => {
+        if (role === "client") {
+          router.replace("/portal");
+          return;
+        }
+        void loadClients();
+      })
+      .catch((err) => {
+        setWarning(err instanceof Error ? err.message : "Failed to resolve session");
+        setAuthResolved(true);
+      });
+  }, [ready, resolveAuth, router, loadClients]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || !authResolved || currentRole === "client") return;
     void refresh();
-  }, [ready, periodDays, clientId, platform, refresh]);
+  }, [ready, authResolved, currentRole, periodDays, clientId, platform, refresh]);
 
   const groupedTimeline = useMemo(() => {
     if (!overview) return [] as TimelinePoint[];
