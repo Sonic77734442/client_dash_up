@@ -82,7 +82,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   }, [session.apiBase, session.token]);
 
   const loadData = useCallback(async () => {
-    const context = (await loadContext()) || ctx;
+    const context = await loadContext();
     if (!context?.valid) {
       setWarning("Invalid or expired session. Please sign in again.");
       return;
@@ -118,7 +118,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     setStats(daily.items || []);
     setInsights(ops.items || []);
     setWarning("");
-  }, [ctx, loadContext, periodDays, req, selectedClientId]);
+  }, [loadContext, periodDays, req, selectedClientId]);
 
   useEffect(() => {
     if (!ready) return;

@@ -55,7 +55,7 @@ export default function ClientPortalPage() {
   }, [session.apiBase, session.token]);
 
   const loadData = useCallback(async () => {
-    const context = (await loadContext()) || ctx;
+    const context = await loadContext();
     if (!context?.valid) {
       setWarning("Invalid or expired session. Please sign in again.");
       return;
@@ -87,7 +87,7 @@ export default function ClientPortalPage() {
     setBudgets(bgs.items || []);
     setActions(Array.isArray(acts) ? acts.slice(0, 10) : []);
     setWarning("");
-  }, [ctx, loadContext, periodDays, req, selectedClientId]);
+  }, [loadContext, periodDays, req, selectedClientId]);
 
   useEffect(() => {
     if (!ready) return;

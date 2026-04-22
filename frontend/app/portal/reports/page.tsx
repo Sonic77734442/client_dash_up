@@ -49,7 +49,7 @@ export default function ClientPortalReportsPage() {
   }, [session.apiBase, session.token]);
 
   const loadData = useCallback(async () => {
-    const context = (await loadContext()) || ctx;
+    const context = await loadContext();
     if (!context?.valid) {
       setWarning("Invalid or expired session. Please sign in again.");
       return;
@@ -76,7 +76,7 @@ export default function ClientPortalReportsPage() {
     setOverview(ov);
     setStats((daily.items || []).slice().sort((a, b) => String(b.date).localeCompare(String(a.date))));
     setWarning("");
-  }, [ctx, loadContext, periodDays, req, selectedClientId]);
+  }, [loadContext, periodDays, req, selectedClientId]);
 
   useEffect(() => {
     if (!ready) return;
