@@ -80,19 +80,35 @@ def _bool_from_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_origin(value: str) -> str:
+    return (value or "").strip().rstrip("/")
+
+
 def get_settings() -> Settings:
     origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
-    origins = [x.strip() for x in origins_raw.split(",") if x.strip()]
+    origins = [_normalize_origin(x) for x in origins_raw.split(",") if _normalize_origin(x)]
     app_env = os.getenv("APP_ENV", "development")
     is_prod = app_env.lower() in {"prod", "production"}
+    frontend_base_url = _normalize_origin(os.getenv("FRONTEND_BASE_URL", "http://localhost:3000"))
+
+    default_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://client-dash-up.vercel.app",
+    ]
+    if frontend_base_url:
+        default_origins.append(frontend_base_url)
+    computed_origins = sorted({o for o in (origins + default_origins) if o and o != "*"})
     settings = Settings(
         app_env=app_env,
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
-        allowed_origins=[o for o in origins if o != "*"] or ["http://localhost:3000", "http://127.0.0.1:3000"],
+        allowed_origins=computed_origins,
         account_config_path=os.getenv("ACCOUNT_CONFIG_PATH", "./accounts.json"),
         budgets_db_path=os.getenv("BUDGETS_DB_PATH", "./storage/budgets.db"),
-        frontend_base_url=os.getenv("FRONTEND_BASE_URL", "http://localhost:3000"),
+        frontend_base_url=frontend_base_url or "http://localhost:3000",
         auth_cookie_name=os.getenv("AUTH_COOKIE_NAME", "ops_session"),
         auth_cookie_secure=_bool_from_env("AUTH_COOKIE_SECURE", False),
         auth_cookie_samesite=os.getenv("AUTH_COOKIE_SAMESITE", "lax").strip().lower() or "lax",

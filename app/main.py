@@ -257,7 +257,8 @@ app.state.runtime_metrics = RuntimeMetrics()
 def _origin_allowed(origin: str) -> bool:
     if not origin:
         return False
-    return origin in settings.allowed_origins
+    norm = origin.strip().rstrip("/")
+    return norm in settings.allowed_origins
 
 
 def _attach_cors_headers(request: Request, response: Response) -> Response:
