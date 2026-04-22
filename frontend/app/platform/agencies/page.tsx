@@ -356,8 +356,8 @@ export default function PlatformAgenciesPage() {
 
           <section className="agency-flow" style={{ marginTop: 12 }}>
             <div className="agency-flow-step">1. Select agency</div>
-            <div className="agency-flow-step">2. Invite agency user</div>
-            <div className="agency-flow-step">3. Add member and role</div>
+            <div className="agency-flow-step">2. Add member and role</div>
+            <div className="agency-flow-step">3. Invite agency user</div>
           </section>
 
           <section className="agency-stats" style={{ marginTop: 12 }}>
@@ -433,7 +433,7 @@ export default function PlatformAgenciesPage() {
               </section>
 
               <div className="panel drawer-section">
-                <h3>Step 3: Add Member</h3>
+                <h3>Step 2: Add Member</h3>
                 <div className="panel-subtitle">User from `agency/admin` roles, plus access role inside agency.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)}>
@@ -484,7 +484,7 @@ export default function PlatformAgenciesPage() {
               </div>
 
               <div className="panel drawer-section">
-                <h3>Step 2: Invite Agency User</h3>
+                <h3>Step 3: Invite Agency User</h3>
                 <div className="panel-subtitle">Issue one-time invite link. User accepts invite on login page.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <input
