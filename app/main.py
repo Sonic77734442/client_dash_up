@@ -459,6 +459,10 @@ async def auth_security_middleware(request: Request, call_next):
             print(log_line)
         return resp
 
+    # Handle CORS preflight early to avoid auth/rate-limit/CSRF interference.
+    if method == "OPTIONS":
+        return finalize(Response(status_code=204))
+
     if settings.auth_rate_limit_enabled:
         limit = None
         bucket = None
