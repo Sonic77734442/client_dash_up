@@ -6,6 +6,42 @@ export type ApiErrorEnvelope = {
   };
 };
 
+function normalizeQueryPath(path: string): string {
+  const qIndex = path.indexOf("?");
+  if (qIndex < 0) return path;
+  const base = path.slice(0, qIndex + 1);
+  let query = path.slice(qIndex + 1);
+  if (!query) return path;
+
+  // Defensive fix for malformed concatenated query strings like
+  // client_id=...status=active...date_from=...
+  const knownKeys = [
+    "client_id",
+    "account_id",
+    "status",
+    "date_from",
+    "date_to",
+    "provider",
+    "platform",
+    "scope",
+    "limit",
+    "offset",
+    "search",
+  ];
+  for (const key of knownKeys) {
+    const needle = `${key}=`;
+    let cursor = query.indexOf(needle, 1);
+    while (cursor > -1) {
+      if (query[cursor - 1] !== "&") {
+        query = `${query.slice(0, cursor)}&${query.slice(cursor)}`;
+        cursor += 1;
+      }
+      cursor = query.indexOf(needle, cursor + needle.length);
+    }
+  }
+  return `${base}${query}`;
+}
+
 function readCookie(name: string): string {
   if (typeof document === "undefined") return "";
   const parts = document.cookie ? document.cookie.split(";") : [];
@@ -76,6 +112,7 @@ export async function fetchJson<T>(
   token?: string,
   init?: RequestInit
 ): Promise<T> {
+  const normalizedPath = normalizeQueryPath(path);
   const method = (init?.method || "GET").toUpperCase();
   const resolvedToken = (token || "").trim();
   const fallbackToken =
@@ -98,7 +135,7 @@ export async function fetchJson<T>(
       headers.set("Authorization", `Bearer ${fallbackToken}`);
     }
 
-    const res = await fetch(`${baseUrl}${path}`, {
+    const res = await fetch(`${baseUrl}${normalizedPath}`, {
       ...init,
       headers,
       credentials: "include",

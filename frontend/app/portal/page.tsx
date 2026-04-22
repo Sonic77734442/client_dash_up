@@ -91,7 +91,15 @@ export default function ClientPortalPage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load portal"));
+    void loadData().catch((err) => {
+      const msg = err instanceof Error ? err.message : "Failed to load portal";
+      if (/unauthorized|401/i.test(msg)) {
+        setWarning("Session expired. Redirecting to sign in...");
+        window.location.replace("/login");
+        return;
+      }
+      setWarning(msg);
+    });
   }, [ready, loadData]);
 
   const kpis = useMemo(() => {

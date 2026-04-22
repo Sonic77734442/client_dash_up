@@ -76,7 +76,15 @@ export default function ClientPortalBillingPage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load billing"));
+    void loadData().catch((err) => {
+      const msg = err instanceof Error ? err.message : "Failed to load billing";
+      if (/unauthorized|401/i.test(msg)) {
+        setWarning("Session expired. Redirecting to sign in...");
+        window.location.replace("/login");
+        return;
+      }
+      setWarning(msg);
+    });
   }, [ready, loadData]);
 
   const summary = useMemo(() => {
