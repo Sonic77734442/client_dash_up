@@ -32,7 +32,11 @@ def ads_client(config_override: Optional[Dict[str, Any]] = None) -> GoogleAdsCli
     client_id = str(cfg.get("client_id") or os.getenv("GOOGLE_ADS_CLIENT_ID") or "").strip()
     client_secret = str(cfg.get("client_secret") or os.getenv("GOOGLE_ADS_CLIENT_SECRET") or "").strip()
     refresh_token = str(cfg.get("refresh_token") or os.getenv("GOOGLE_ADS_REFRESH_TOKEN") or "").strip()
-    login_customer_id = str(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "").strip() or None
+    # For explicit per-tenant credentials, do not fall back to global env login_customer_id.
+    if config_override is not None:
+        login_customer_id = str(cfg.get("login_customer_id") or "").strip() or None
+    else:
+        login_customer_id = str(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "").strip() or None
 
     if not developer_token or not client_id or not client_secret or not refresh_token:
         raise HTTPException(status_code=500, detail="Google Ads API credentials are not set")
@@ -68,7 +72,10 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     strict_mode = config_override is not None
     cfg = config_override or {}
-    login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "")
+    if config_override is not None:
+        login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or "")
+    else:
+        login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "")
     try:
         client = ads_client(config_override)
         customer_service = client.get_service("CustomerService")
@@ -166,6 +173,47 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
         if strict_mode:
             raise HTTPException(status_code=502, detail=f"Google account discovery failed: {exc}")
     return _fallback_accounts()
+
+
+def detect_login_customer_id(config_override: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Pick a manager (MCC) customer id for tenant-scoped credentials when possible."""
+    if not config_override:
+        return None
+    try:
+        client = ads_client(config_override)
+        customer_service = client.get_service("CustomerService")
+        ga_service = client.get_service("GoogleAdsService")
+        response = customer_service.list_accessible_customers()
+        root_ids: List[str] = []
+        seen: set[str] = set()
+        for resource_name in list(response.resource_names or []):
+            cid = normalize_customer_id(str(resource_name).split("/")[-1])
+            if cid and cid not in seen:
+                seen.add(cid)
+                root_ids.append(cid)
+        if not root_ids:
+            return None
+
+        managers: List[str] = []
+        for customer_id in root_ids:
+            try:
+                rows = ga_service.search(
+                    customer_id=customer_id,
+                    query="SELECT customer.manager FROM customer LIMIT 1",
+                )
+                is_manager = False
+                for row in rows:
+                    is_manager = bool(getattr(row.customer, "manager", False))
+                    break
+                if is_manager:
+                    managers.append(customer_id)
+            except Exception:
+                continue
+        if managers:
+            return managers[0]
+        return root_ids[0]
+    except Exception:
+        return None
 
 
 def fetch_insights(

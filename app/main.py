@@ -118,6 +118,7 @@ from app.services.operational_actions import (
     SqliteOperationalActionStore,
 )
 from app.services.acl import RequestContext, ensure_account_access, ensure_admin, ensure_client_access
+from app.services.providers import google_ads
 from app.services.audit_log import AuditLogStore, InMemoryAuditLogStore, SqliteAuditLogStore
 from app.services.platform_admin import (
     InMemoryPlatformAdminStore,
@@ -728,11 +729,11 @@ def _integration_credentials_from_oauth(
             "refresh_token": refresh_token,
         }
         developer_token = str(os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")).strip()
-        login_customer_id = str(os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "")).strip()
         if developer_token:
             payload["developer_token"] = developer_token
-        if login_customer_id:
-            payload["login_customer_id"] = login_customer_id
+        # Detect tenant-specific login_customer_id from this OAuth credential set.
+        # This avoids pinning agency sync to a global default MCC.
+        payload["login_customer_id"] = google_ads.detect_login_customer_id(payload)
         return payload
     return None
 
