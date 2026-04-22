@@ -1222,6 +1222,15 @@ def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optio
     )
 
 
+def _infer_single_tenant_client(ctx: RequestContext) -> Optional[UUID]:
+    if ctx.global_access:
+        return None
+    candidates = [cid for cid in ctx.accessible_client_ids if _client_store().get(cid) is not None]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 @app.get("/health")
 def health(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> dict:
     if settings.observability_public:
@@ -2882,6 +2891,10 @@ def insights_overview(
         if not client_id:
             client_id = account.client_id
     if not ctx.global_access and not client_id:
+        inferred_client_id = _infer_single_tenant_client(ctx)
+        if inferred_client_id:
+            client_id = inferred_client_id
+    if not ctx.global_access and not client_id:
         raise HTTPException(
             status_code=403,
             detail={"code": "forbidden", "message": "Tenant scope required for non-admin context"},
@@ -2921,6 +2934,10 @@ def insights_operational(
             raise HTTPException(status_code=400, detail="account_id does not belong to client_id")
         if not client_id:
             client_id = account.client_id
+    if not ctx.global_access and not client_id:
+        inferred_client_id = _infer_single_tenant_client(ctx)
+        if inferred_client_id:
+            client_id = inferred_client_id
     if not ctx.global_access and not client_id:
         raise HTTPException(
             status_code=403,
@@ -2994,6 +3011,10 @@ def list_operational_actions(
         ensure_account_access(ctx, account.client_id, account_id=account.id)
         if not client_id:
             client_id = account.client_id
+    if not ctx.global_access and not client_id:
+        inferred_client_id = _infer_single_tenant_client(ctx)
+        if inferred_client_id:
+            client_id = inferred_client_id
     if not ctx.global_access and not client_id:
         raise HTTPException(
             status_code=403,

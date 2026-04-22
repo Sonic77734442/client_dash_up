@@ -180,7 +180,19 @@ export default function HomePage() {
       });
   }, [ready, resolveAuth, router, loadClients]);
 
+useEffect(() => {
+    if (clientId) return;
+    if (currentRole === "agency" && clients.length > 0) {
+      setClientId(clients[0].id);
+      return;
+    }
+    if (clients.length === 1) {
+      setClientId(clients[0].id);
+    }
+  }, [clients, clientId, currentRole]);
+
   useEffect(() => {
+    if (currentRole === "agency" && !clientId) return;
     if (!ready || !authResolved || currentRole === "client") return;
     void refresh();
   }, [ready, authResolved, currentRole, periodDays, clientId, platform, refresh]);
