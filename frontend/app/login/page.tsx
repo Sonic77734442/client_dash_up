@@ -83,7 +83,12 @@ export default function LoginPage() {
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
-      localStorage.removeItem(LS_SESSION_TOKEN);
+      const issuedToken = String((body as { session?: { token?: string } })?.session?.token || "").trim();
+      if (issuedToken) {
+        localStorage.setItem(LS_SESSION_TOKEN, issuedToken);
+      } else {
+        localStorage.removeItem(LS_SESSION_TOKEN);
+      }
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {

@@ -78,6 +78,8 @@ export async function fetchJson<T>(
 ): Promise<T> {
   const method = (init?.method || "GET").toUpperCase();
   const resolvedToken = (token || "").trim();
+  const fallbackToken =
+    typeof window !== "undefined" ? (localStorage.getItem("ops_session_token") || "").trim() : "";
 
   async function requestOnce(forceRefreshCsrf: boolean): Promise<{ res: Response; body: unknown }> {
     const headers = new Headers(init?.headers || {});
@@ -89,7 +91,12 @@ export async function fetchJson<T>(
       const csrf = await resolveCsrfToken(baseUrl);
       if (csrf) headers.set(CSRF_HEADER_NAME, csrf);
     }
-    if (resolvedToken) headers.set("Authorization", `Bearer ${resolvedToken}`);
+    if (resolvedToken) {
+      headers.set("Authorization", `Bearer ${resolvedToken}`);
+    } else if (forceRefreshCsrf && fallbackToken) {
+      // Fallback only after an auth failure retry path (cross-site cookie blocked scenarios).
+      headers.set("Authorization", `Bearer ${fallbackToken}`);
+    }
 
     const res = await fetch(`${baseUrl}${path}`, {
       ...init,
@@ -112,6 +119,9 @@ export async function fetchJson<T>(
     if ((envelope?.error?.code || "").trim() === "csrf_failed") {
       ({ res, body } = await requestOnce(true));
     }
+  }
+  if (!res.ok && res.status === 401 && !resolvedToken && fallbackToken) {
+    ({ res, body } = await requestOnce(true));
   }
 
   if (!res.ok) {
