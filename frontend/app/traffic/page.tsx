@@ -9,6 +9,15 @@ import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
 import { AdAccount, AdStat } from "../../lib/types";
 
+function normalizePlatform(value?: string | null) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (raw === "facebook" || raw === "fb" || raw.startsWith("meta")) return "meta";
+  if (raw.startsWith("google")) return "google";
+  if (raw === "tt" || raw.startsWith("tik")) return "tiktok";
+  return raw;
+}
+
 function fmtNum(v?: number | string | null, digits = 0) {
   const n = Number(v || 0);
   return new Intl.NumberFormat("en-US", {
@@ -213,9 +222,9 @@ export default function TrafficPage() {
     [session.apiBase, session.token]
   );
 
-  const metaAccounts = useMemo(() => accounts.filter((x) => x.platform === "meta"), [accounts]);
-  const googleAccounts = useMemo(() => accounts.filter((x) => x.platform === "google"), [accounts]);
-  const tiktokAccounts = useMemo(() => accounts.filter((x) => x.platform === "tiktok"), [accounts]);
+  const metaAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "meta"), [accounts]);
+  const googleAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "google"), [accounts]);
+  const tiktokAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "tiktok"), [accounts]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
 
   const loadAccounts = useCallback(async () => {
@@ -224,20 +233,22 @@ export default function TrafficPage() {
   }, [req]);
 
   const loadStats = useCallback(async () => {
-    const q = (platform: "meta" | "google" | "tiktok", accountId?: string) => {
-      const p = new URLSearchParams({ date_from: dateFrom, date_to: dateTo, platform });
-      if (accountId) p.set("account_id", accountId);
-      return `/ad-stats?${p.toString()}`;
-    };
-    const [m, g, t] = await Promise.all([
-      req<{ items: AdStat[] }>(q("meta", metaAccount || undefined)),
-      req<{ items: AdStat[] }>(q("google", googleAccount || undefined)),
-      req<{ items: AdStat[] }>(q("tiktok", tiktokAccount || undefined)),
-    ]);
-    setMetaRows(m.items || []);
-    setGoogleRows(g.items || []);
-    setTiktokRows(t.items || []);
-  }, [dateFrom, dateTo, metaAccount, googleAccount, tiktokAccount, req]);
+    const p = new URLSearchParams({ date_from: dateFrom, date_to: dateTo });
+    const all = await req<{ items: AdStat[] }>(`/ad-stats?${p.toString()}`);
+    const rows = all.items || [];
+    const byPlatform = (target: "meta" | "google" | "tiktok", selectedAccountId?: string) =>
+      rows.filter((row) => {
+        const rowAccountId = String(row.ad_account_id || "");
+        if (selectedAccountId && rowAccountId !== selectedAccountId) return false;
+        const mappedPlatform = normalizePlatform(accountMap.get(rowAccountId)?.platform);
+        const rowPlatform = normalizePlatform(row.platform);
+        const resolvedPlatform = mappedPlatform || rowPlatform;
+        return resolvedPlatform === target;
+      });
+    setMetaRows(byPlatform("meta", metaAccount || undefined));
+    setGoogleRows(byPlatform("google", googleAccount || undefined));
+    setTiktokRows(byPlatform("tiktok", tiktokAccount || undefined));
+  }, [dateFrom, dateTo, metaAccount, googleAccount, tiktokAccount, req, accountMap]);
 
   useEffect(() => {
     if (!ready) return;
