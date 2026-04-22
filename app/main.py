@@ -2121,7 +2121,10 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
         code = str(detail.get("code") or "").strip().lower() if isinstance(detail, dict) else ""
-        if exc.status_code != 400 or code not in {"invalid_invite", "invite_expired", "invite_revoked", "invite_used"}:
+        if not (
+            (exc.status_code == 404 and code in {"invite_not_found", "invalid_invite"})
+            or (exc.status_code == 400 and code in {"invalid_invite", "invite_expired", "invite_revoked", "invite_used"})
+        ):
             raise
         accepted = _accept_client_invite(payload)
     response = JSONResponse(content=accepted.model_dump(mode="json"))
