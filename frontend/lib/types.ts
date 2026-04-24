@@ -236,6 +236,26 @@ export type IntegrationConnection = {
   credentials_preview: Record<string, unknown>;
 };
 
+export type AlertOut = {
+  id: string;
+  code: string;
+  severity: "critical" | "high" | "medium" | "low";
+  status: "open" | "acked" | "resolved";
+  title: string;
+  message: string;
+  fingerprint: string;
+  provider?: string | null;
+  client_id?: string | null;
+  ad_account_id?: string | null;
+  context: Record<string, unknown>;
+  occurrences: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
+  resolved_at?: string | null;
+};
+
 export type SessionContext = {
   valid: boolean;
   reason?: string | null;

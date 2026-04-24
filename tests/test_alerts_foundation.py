@@ -129,3 +129,30 @@ def test_discovery_auth_alert_open_and_resolve():
     resolved = client.get("/alerts?status=resolved", headers={"Authorization": f"Bearer {admin_token}"})
     assert resolved.status_code == 200
     assert any(x["fingerprint"] == auth_failed["fingerprint"] for x in resolved.json())
+
+
+def test_alerts_endpoints_are_admin_only():
+    reset_state()
+    admin_token = bootstrap_admin_token()
+    c = mk_client(admin_token)
+
+    client_user = client.post(
+        "/auth/internal/users",
+        json={"email": "alerts.client@test.local", "name": "Client", "role": "client", "status": "active"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert client_user.status_code == 200
+    grant = client.post(
+        "/auth/internal/access",
+        json={"user_id": client_user.json()["id"], "client_id": c["id"], "role": "client"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert grant.status_code == 200
+    client_token = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": client_user.json()["id"], "ttl_minutes": 60},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()["token"]
+
+    listed = client.get("/alerts?status=all", headers={"Authorization": f"Bearer {client_token}"})
+    assert listed.status_code == 403

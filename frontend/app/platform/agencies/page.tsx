@@ -314,6 +314,7 @@ export default function PlatformAgenciesPage() {
             </div>
             <div className="session-controls">
               <a className="ghost-btn" href="/platform/users">Users</a>
+              <a className="ghost-btn" href="/platform/alerts">Alerts</a>
               {tokenLoginEnabled ? (
                 <>
                   <input

@@ -3341,6 +3341,7 @@ def list_alerts(
     limit: int = Query(default=100, ge=1, le=500),
     ctx: RequestContext = Depends(auth_context),
 ):
+    ensure_admin(ctx)
     if client_id:
         ensure_client_access(ctx, client_id)
     rows = _alert_store().list(
@@ -3357,6 +3358,7 @@ def list_alerts(
 
 @app.post("/alerts/{alert_id}/ack", response_model=AlertOut, summary="Acknowledge alert")
 def acknowledge_alert(alert_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_admin(ctx)
     current = _alert_store().get(alert_id)
     if not current:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -3366,6 +3368,7 @@ def acknowledge_alert(alert_id: UUID, ctx: RequestContext = Depends(auth_context
 
 @app.post("/alerts/{alert_id}/resolve", response_model=AlertOut, summary="Resolve alert manually")
 def resolve_alert(alert_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_admin(ctx)
     current = _alert_store().get(alert_id)
     if not current:
         raise HTTPException(status_code=404, detail="Alert not found")

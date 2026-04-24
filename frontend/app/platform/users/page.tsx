@@ -119,6 +119,7 @@ export default function PlatformUsersPage() {
             </div>
             <div className="session-controls">
               <a className="ghost-btn" href="/platform/agencies">Go To Agencies</a>
+              <a className="ghost-btn" href="/platform/alerts">Go To Alerts</a>
               {tokenLoginEnabled ? (
                 <>
                 <input value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base" />
