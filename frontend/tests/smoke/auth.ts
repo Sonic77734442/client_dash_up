@@ -63,3 +63,26 @@ export async function createClientSessionWithAccess(request: APIRequestContext) 
 
   return issueToken(request, user.id);
 }
+
+export async function createAgencySessionWithAccess(request: APIRequestContext) {
+  const adminToken = await createAdminSession(request);
+  const adminAuth = { Authorization: `Bearer ${adminToken}` };
+
+  const clientRes = await request.post(`${API_BASE}/clients`, {
+    headers: adminAuth,
+    data: { name: `agency-tenant-${Date.now()}`, status: "active", default_currency: "USD" },
+  });
+  if (!clientRes.ok()) throw new Error(`create_client_failed:${clientRes.status()}`);
+  const client = (await clientRes.json()) as { id: string };
+
+  const email = `agency-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}@test.local`;
+  const user = await createUser(request, "agency", email);
+
+  const grantRes = await request.post(`${API_BASE}/auth/internal/access`, {
+    headers: adminAuth,
+    data: { user_id: user.id, client_id: client.id, role: "agency" },
+  });
+  if (!grantRes.ok()) throw new Error(`assign_access_failed:${grantRes.status()}`);
+
+  return issueToken(request, user.id);
+}
