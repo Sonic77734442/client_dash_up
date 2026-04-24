@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
+import { attachSession, createClientSessionWithAccess } from "./auth";
 
-test("client portal shell is read-only", async ({ page }) => {
+test("client portal shell is read-only", async ({ page, context, request }) => {
+  const token = await createClientSessionWithAccess(request);
+  await attachSession(page, context, token);
   await page.goto("/portal");
 
   await expect(page.getByText("Client Overview")).toBeVisible();
