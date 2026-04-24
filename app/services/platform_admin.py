@@ -541,10 +541,7 @@ class SqlitePlatformAdminStore:
         password = (payload.password or "").strip()
         token_hash = _token_hash(payload.token.strip())
         if len(password) < 8:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
-            )
+            password = f"{secrets.token_urlsafe(18)}Aa1"
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM agency_invites WHERE token_hash=?",
@@ -894,10 +891,7 @@ class InMemoryPlatformAdminStore:
         now = datetime.utcnow()
         password = (payload.password or "").strip()
         if len(password) < 8:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
-            )
+            password = f"{secrets.token_urlsafe(18)}Aa1"
         invite_id = self.invite_token_hash_to_id.get(_token_hash(payload.token.strip()))
         if not invite_id or invite_id not in self.invites:
             raise HTTPException(status_code=404, detail={"code": "invite_not_found", "message": "Invite token is invalid"})

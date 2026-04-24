@@ -511,6 +511,8 @@ async def auth_security_middleware(request: Request, call_next):
             "/auth/internal/sessions/validate",
             "/auth/internal/sessions/revoke",
         }
+        if settings.enable_test_endpoints:
+            csrf_exempt.add("/_testing/use-inmemory-stores")
         if path not in csrf_exempt:
             has_bearer = (request.headers.get("Authorization") or "").lower().startswith("bearer ")
             has_x_token = bool(request.headers.get("X-Session-Token"))
@@ -798,35 +800,6 @@ def _auto_upsert_integration_credentials(
         )
 
 
-def _ensure_solo_client_for_user(user: UserOut) -> None:
-    if user.role != "client":
-        return
-    existing = _auth_store().list_client_access(user_id=user.id)
-    for grant in existing:
-        if grant.role != "client":
-            continue
-        row = _client_store().get(grant.client_id)
-        if row and row.status != "archived":
-            return
-
-    fallback_name = (user.name or "").strip() or ((user.email or "").split("@")[0].strip() if user.email else "")
-    client_name = fallback_name or f"solo-{str(user.id)[:8]}"
-    created = _client_store().create(
-        ClientCreate(
-            name=client_name,
-            status="active",
-            notes=f"Auto-created solo client for user {user.id}",
-        )
-    )
-    _auth_store().assign_client_access(
-        UserClientAccessCreate(
-            user_id=user.id,
-            client_id=created.id,
-            role="client",
-        )
-    )
-
-
 def _invite_token_hash(token: str) -> str:
     import hashlib
 
@@ -951,11 +924,6 @@ def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOu
 
 
 def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcceptResponse:
-    if payload.password is None or len(payload.password.strip()) < 8:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "password_required", "message": "Password is required and must be at least 8 characters"},
-        )
     now = datetime.utcnow()
     token_hash = _invite_token_hash(payload.token.strip())
     with sqlite_conn(settings.budgets_db_path) as conn:
@@ -997,7 +965,6 @@ def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcc
             )
         )
 
-    _ensure_solo_client_for_user(user)
     _auth_store().assign_client_access(
         UserClientAccessCreate(
             user_id=user.id,
@@ -1005,7 +972,10 @@ def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcc
             role="client",
         )
     )
-    _auth_store().set_password(user.id, payload.password.strip())
+    password = (payload.password or "").strip()
+    if len(password) < 8:
+        password = f"{secrets.token_urlsafe(18)}Aa1"
+    _auth_store().set_password(user.id, password)
     session = _auth_store().issue_session(SessionIssueRequest(user_id=user.id, ttl_minutes=settings.oauth_session_ttl_minutes))
 
     with sqlite_conn(settings.budgets_db_path) as conn:
@@ -1362,9 +1332,7 @@ def auth_create_user(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    user = _auth_store().create_user(payload)
-    _ensure_solo_client_for_user(user)
-    return user
+    return _auth_store().create_user(payload)
 
 
 @app.get(
@@ -1390,9 +1358,7 @@ def auth_patch_user(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    user = _auth_store().patch_user(user_id, payload)
-    _ensure_solo_client_for_user(user)
-    return user
+    return _auth_store().patch_user(user_id, payload)
 
 
 @app.post(
