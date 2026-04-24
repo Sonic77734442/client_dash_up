@@ -154,10 +154,11 @@ class AdAccountDiscoveryService:
 
         existing = {
             (
+                str(a.client_id),
                 (a.platform or "").lower().strip(),
                 _canonical_external_id((a.platform or "").lower().strip(), a.external_account_id),
             ): a
-            for a in self.account_store.list(status="all")
+            for a in self.account_store.list(client_id=client_id, status="all")
         }
         now_iso = datetime.utcnow().isoformat()
 
@@ -195,7 +196,7 @@ class AdAccountDiscoveryService:
                 discovered += 1
                 name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
                 currency = str(row.get("currency") or "USD").strip().upper() or "USD"
-                key = (p, external_account_id)
+                key = (str(client_id), p, external_account_id)
                 existing_account = existing.get(key)
                 discovery_meta = {
                     "discovered_at": now_iso,
@@ -210,8 +211,6 @@ class AdAccountDiscoveryService:
                         items.append(existing_account)
                         continue
                     patch_data: Dict[str, object] = {"metadata": merged_meta}
-                    if existing_account.client_id != client_id:
-                        patch_data["client_id"] = client_id
                     if name and name != existing_account.name:
                         patch_data["name"] = name
                     if currency and currency != existing_account.currency:
@@ -253,12 +252,13 @@ class AdAccountDiscoveryService:
                         raise
                     fallback_existing = existing.get(key)
                     if not fallback_existing:
-                        refreshed = self.account_store.list(status="all")
+                        refreshed = self.account_store.list(client_id=client_id, status="all")
                         fallback_existing = next(
                             (
                                 a
                                 for a in refreshed
-                                if (a.platform or "").lower().strip() == p
+                                if str(a.client_id) == str(client_id)
+                                and (a.platform or "").lower().strip() == p
                                 and _canonical_external_id(p, a.external_account_id) == external_account_id
                             ),
                             None,
@@ -270,7 +270,6 @@ class AdAccountDiscoveryService:
                     patched = self.account_store.patch(
                         fallback_existing.id,
                         AdAccountPatch(
-                            client_id=client_id if fallback_existing.client_id != client_id else None,
                             name=name if name and name != fallback_existing.name else None,
                             currency=currency if currency and currency != fallback_existing.currency else None,
                             status="active" if fallback_existing.status != "active" else None,
@@ -292,10 +291,11 @@ class AdAccountDiscoveryService:
             # Refresh map after provider batch to absorb possible concurrent updates and prevent stale-key conflicts.
             existing = {
                 (
+                    str(a.client_id),
                     (a.platform or "").lower().strip(),
                     _canonical_external_id((a.platform or "").lower().strip(), a.external_account_id),
                 ): a
-                for a in self.account_store.list(status="all")
+                for a in self.account_store.list(client_id=client_id, status="all")
             }
 
         for p, count in provider_conflicts.items():

@@ -123,3 +123,44 @@ def test_discover_returns_provider_failures_without_crashing():
     assert body["created"] == 0
     assert body["updated"] == 0
     assert body["providers_failed"]["meta"] == "meta unavailable"
+
+
+def test_duplicate_external_account_allowed_across_clients():
+    reset_state()
+    c1 = mk_client("Acme")
+    c2 = mk_client("Nova")
+
+    a1 = mk_account(c1["id"], "meta", "same-ext", "A1")
+    a2 = mk_account(c2["id"], "meta", "same-ext", "A2")
+
+    assert a1["client_id"] == c1["id"]
+    assert a2["client_id"] == c2["id"]
+    assert a1["external_account_id"] == a2["external_account_id"] == "same-ext"
+
+
+def test_discover_does_not_reassign_account_between_clients():
+    reset_state()
+    c1 = mk_client("Acme")
+    c2 = mk_client("Nova")
+    existing = mk_account(c1["id"], "google", "1234567890", "Acme Google")
+
+    app.state.ad_account_discovery_service.discoverers = {
+        "google": lambda: [{"external_account_id": "1234567890", "name": "Nova Google", "currency": "EUR"}]
+    }
+
+    run = client.post("/ad-accounts/discover", json={"provider": "google", "client_id": c2["id"], "upsert_existing": True})
+    assert run.status_code == 200
+    body = run.json()
+    assert body["created"] == 1
+    assert body["updated"] == 0
+    assert body["items"][0]["client_id"] == c2["id"]
+
+    list_c1 = client.get(f"/ad-accounts?client_id={c1['id']}&status=all")
+    assert list_c1.status_code == 200
+    rows_c1 = list_c1.json()["items"]
+    assert any(x["id"] == existing["id"] and x["client_id"] == c1["id"] for x in rows_c1)
+
+    list_c2 = client.get(f"/ad-accounts?client_id={c2['id']}&status=all")
+    assert list_c2.status_code == 200
+    rows_c2 = list_c2.json()["items"]
+    assert len([x for x in rows_c2 if x["platform"] == "google" and x["external_account_id"] == "1234567890"]) == 1

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS ad_accounts (
   FOREIGN KEY (client_id) REFERENCES clients(id)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_ad_accounts_platform_external_id ON ad_accounts(platform, external_account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ad_accounts_client_platform_external_id
+ON ad_accounts(client_id, platform, external_account_id);
 CREATE INDEX IF NOT EXISTS idx_ad_accounts_client_id ON ad_accounts(client_id);
 CREATE INDEX IF NOT EXISTS idx_ad_accounts_status ON ad_accounts(status);
 
@@ -366,6 +367,13 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ad_account_sync_jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
     if sync_cols and "next_retry_at" not in sync_cols:
         conn.execute("ALTER TABLE ad_account_sync_jobs ADD COLUMN next_retry_at TEXT NULL")
+
+    # Multi-tenant isolation: ad account identity must be unique only inside client scope.
+    conn.execute("DROP INDEX IF EXISTS uq_ad_accounts_platform_external_id")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_ad_accounts_client_platform_external_id "
+        "ON ad_accounts(client_id, platform, external_account_id)"
+    )
 
     cred_cols = {row[1] for row in conn.execute("PRAGMA table_info(integration_credentials)").fetchall()}
     if cred_cols and "status" not in cred_cols:

@@ -183,11 +183,16 @@ class InMemoryAdAccountStore:
         if not self.client_store.get(resolved):
             raise HTTPException(status_code=400, detail="client_id does not exist")
 
-    def _assert_unique(self, platform: str, external: str, exclude: Optional[UUID] = None) -> None:
+    def _assert_unique(self, client_id: UUID | str, platform: str, external: str, exclude: Optional[UUID] = None) -> None:
+        resolved_client_id = str(client_id)
         for item in self.items.values():
             if exclude and item.id == exclude:
                 continue
-            if item.platform == platform and item.external_account_id == external:
+            if (
+                str(item.client_id) == resolved_client_id
+                and item.platform == platform
+                and item.external_account_id == external
+            ):
                 raise HTTPException(status_code=409, detail="Account conflict: duplicate platform+external_account_id")
 
     @staticmethod
@@ -223,7 +228,7 @@ class InMemoryAdAccountStore:
 
     def create(self, payload: AdAccountCreate) -> AdAccountOut:
         self._assert_client_exists(payload.client_id)
-        self._assert_unique(payload.platform, payload.external_account_id)
+        self._assert_unique(payload.client_id, payload.platform, payload.external_account_id)
         now = datetime.utcnow()
         rec = AdAccountOut(
             id=uuid4(),
@@ -264,7 +269,7 @@ class InMemoryAdAccountStore:
             return existing
         merged = {**existing.model_dump(), **patch}
         self._assert_client_exists(merged["client_id"])
-        self._assert_unique(merged["platform"], merged["external_account_id"], exclude=account_id)
+        self._assert_unique(merged["client_id"], merged["platform"], merged["external_account_id"], exclude=account_id)
         sync_fields = self._sync_fields_from_metadata(merged.get("metadata"))
         rec = existing.model_copy(update={**patch, **sync_fields, "updated_at": datetime.utcnow()})
         self.items[account_id] = rec
