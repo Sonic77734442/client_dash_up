@@ -357,6 +357,35 @@ def _to_public_integration_credential(row: IntegrationCredentialOut) -> Integrat
     )
 
 
+def _visible_integration_credentials_for_ctx(
+    ctx: RequestContext,
+    *,
+    status: str = "active",
+    provider: Optional[str] = None,
+) -> List[IntegrationCredentialOut]:
+    rows = _integration_credential_store().list(status=status, provider=provider)
+    if ctx.role == "admin":
+        return rows
+    if ctx.role != "agency":
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
+    agency_ids = {str(x) for x in _agency_scope_ids_for_user(ctx.user_id)}
+    return [
+        x
+        for x in rows
+        if x.scope_type == "agency" and x.scope_id and str(x.scope_id) in agency_ids
+    ]
+
+
+def _ensure_credential_manage_access(ctx: RequestContext, row: IntegrationCredentialOut) -> None:
+    if ctx.role == "admin":
+        return
+    if ctx.role != "agency":
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
+    agency_ids = {str(x) for x in _agency_scope_ids_for_user(ctx.user_id)}
+    if row.scope_type != "agency" or not row.scope_id or str(row.scope_id) not in agency_ids:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential scope access denied"})
+
+
 def _status_code_to_error_code(status_code: int) -> str:
     mapping = {
         400: "bad_request",
@@ -1949,6 +1978,39 @@ def archive_integration_credential(
     ctx: RequestContext = Depends(auth_context),
 ):
     ensure_admin(ctx)
+    out = _integration_credential_store().archive(credential_id)
+    return _to_public_integration_credential(out)
+
+
+@app.get(
+    "/me/integration-connections",
+    summary="List my visible integration connections",
+    description="Agency sees only own agency-scope credentials. Admin sees all.",
+)
+def list_my_integration_connections(
+    status: str = Query(default="active", pattern="^(active|archived|all)$"),
+    provider: Optional[str] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    rows = _visible_integration_credentials_for_ctx(ctx, status=status, provider=provider)
+    safe_rows = [_to_public_integration_credential(x) for x in rows]
+    return {"items": [x.model_dump(mode="json") for x in safe_rows], "count": len(safe_rows)}
+
+
+@app.delete(
+    "/me/integration-connections/{credential_id}",
+    response_model=IntegrationCredentialPublicOut,
+    summary="Archive integration connection visible to current user",
+)
+def archive_my_integration_connection(
+    credential_id: UUID,
+    ctx: RequestContext = Depends(auth_context),
+):
+    rows = _integration_credential_store().list(status="all")
+    target = next((x for x in rows if str(x.id) == str(credential_id)), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Integration credential not found")
+    _ensure_credential_manage_access(ctx, target)
     out = _integration_credential_store().archive(credential_id)
     return _to_public_integration_credential(out)
 

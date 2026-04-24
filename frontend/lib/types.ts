@@ -222,6 +222,20 @@ export type IntegrationsOverview = {
   events: IntegrationEvent[];
 };
 
+export type IntegrationConnection = {
+  id: string;
+  provider: string;
+  scope_type: "global" | "agency" | "client";
+  scope_id?: string | null;
+  connection_key: string;
+  status: "active" | "archived";
+  created_by?: string | null;
+  created_at: string;
+  updated_at: string;
+  credential_keys: string[];
+  credentials_preview: Record<string, unknown>;
+};
+
 export type SessionContext = {
   valid: boolean;
   reason?: string | null;

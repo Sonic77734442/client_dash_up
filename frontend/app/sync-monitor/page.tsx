@@ -16,6 +16,7 @@ import {
   AdAccountSyncRunResponse,
   AuthMeResponse,
   ClientOut,
+  IntegrationConnection,
   IntegrationsOverview,
   IntegrationProvider,
 } from "../../lib/types";
@@ -105,6 +106,7 @@ export default function SyncMonitorPage() {
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [clients, setClients] = useState<ClientOut[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationsOverview | null>(null);
+  const [connections, setConnections] = useState<IntegrationConnection[]>([]);
   const [diagnostics, setDiagnostics] = useState<AdAccountSyncDiagnosticsResponse | null>(null);
   const [lastRun, setLastRun] = useState<AdAccountSyncRunResponse | null>(null);
 
@@ -127,12 +129,13 @@ export default function SyncMonitorPage() {
   const loadData = useCallback(async () => {
     const diagParams = new URLSearchParams({ status: "active", limit: "500" });
     if (discoverClientId) diagParams.set("client_id", discoverClientId);
-    const [jobRows, accRows, clientRows, integrationsRows, diagnosticsRows] = await Promise.all([
+    const [jobRows, accRows, clientRows, integrationsRows, diagnosticsRows, connectionsRows] = await Promise.all([
       req<{ items: AdAccountSyncJob[] }>(`/ad-accounts/sync/jobs?status=all&limit=500`),
       req<{ items: AdAccount[] }>("/ad-accounts?status=all"),
       req<{ items: ClientOut[] }>("/clients?status=all"),
       req<IntegrationsOverview>("/integrations/overview"),
       req<AdAccountSyncDiagnosticsResponse>(`/ad-accounts/sync/diagnostics?${diagParams.toString()}`),
+      req<{ items: IntegrationConnection[] }>("/me/integration-connections?status=all"),
     ]);
     const me = await req<AuthMeResponse>("/auth/me");
     setCurrentRole(me?.user?.role || "unknown");
@@ -141,6 +144,7 @@ export default function SyncMonitorPage() {
     setClients(clientRows.items || []);
     setIntegrations(integrationsRows);
     setDiagnostics(diagnosticsRows);
+    setConnections(connectionsRows.items || []);
   }, [req, discoverClientId]);
 
   useEffect(() => {
@@ -231,6 +235,18 @@ export default function SyncMonitorPage() {
     setConnectProviderName(providerName);
     setConnectMode("add");
     setOverwriteConnectionKey("");
+  }
+
+  function openOverwriteConnection(row: IntegrationConnection) {
+    const p = (row.provider || "").toLowerCase().trim();
+    const providerName = p === "google" ? "google" : (p === "meta" || p === "facebook" ? "facebook" : null);
+    if (!providerName) {
+      push("Reconnect is supported only for Google/Meta OAuth providers", "info");
+      return;
+    }
+    setConnectProviderName(providerName);
+    setConnectMode("overwrite");
+    setOverwriteConnectionKey(row.connection_key || "");
   }
 
   function closeConnectDialog() {
@@ -327,6 +343,24 @@ export default function SyncMonitorPage() {
       return;
     }
     await runSync({ accountId: selected.ad_account_id });
+  }
+
+  async function disconnectConnection(row: IntegrationConnection) {
+    if (currentRole === "client") {
+      push("Disconnect is available only for agency/admin users", "info");
+      return;
+    }
+    if (!window.confirm(`Disconnect ${providerLabel(row.provider)} (${row.connection_key})?`)) {
+      return;
+    }
+    try {
+      await req(`/me/integration-connections/${row.id}`, { method: "DELETE" });
+      push("Connection archived", "success");
+      await loadData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Disconnect failed";
+      push(msg, "error");
+    }
   }
 
   const kpis = useMemo(() => {
@@ -527,6 +561,54 @@ export default function SyncMonitorPage() {
                   {!diagnosticRows.length ? (
                     <tr>
                       <td colSpan={7} className="muted-note">No diagnostics rows.</td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="panel" style={{ marginTop: 12 }}>
+            <div className="panel-head">
+              <div>
+                <h3 style={{ margin: 0 }}>Connections</h3>
+                <div className="panel-subtitle">Credential registry visible to your role. Reconnect can overwrite by selected key.</div>
+              </div>
+              <button className="ghost-btn" onClick={() => void loadData()}>Refresh</button>
+            </div>
+            <div className="budgets-table-wrap" style={{ marginTop: 10 }}>
+              <table className="budgets-table">
+                <thead>
+                  <tr>
+                    <th>Provider</th>
+                    <th>Scope</th>
+                    <th>Connection Key</th>
+                    <th>Status</th>
+                    <th>Updated</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {connections.map((row) => (
+                    <tr key={row.id}>
+                      <td>{providerLabel(row.provider)}</td>
+                      <td>{row.scope_type}</td>
+                      <td>{row.connection_key}</td>
+                      <td><span className={`badge ${row.status === "active" ? "good" : "warn"}`}>{row.status}</span></td>
+                      <td>{fmtDate(row.updated_at)}</td>
+                      <td>
+                        <button className="ghost-btn" onClick={() => openOverwriteConnection(row)} disabled={syncLoading}>
+                          Reconnect
+                        </button>
+                        <button className="ghost-btn" onClick={() => void disconnectConnection(row)} disabled={syncLoading || row.status !== "active"}>
+                          Disconnect
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {!connections.length ? (
+                    <tr>
+                      <td colSpan={6} className="muted-note">No connections visible for current role.</td>
                     </tr>
                   ) : null}
                 </tbody>
