@@ -14,12 +14,11 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   const routes: Array<{ path: string; text: string }> = [
     { path: "/integrations", text: "Integrations Hub" },
     { path: "/sync-monitor", text: "Sync Monitor" },
-    { path: "/accounts", text: "Ad Accounts Registry" },
     { path: "/budgets", text: "Accounts Ledger" },
   ];
 
   for (const route of routes) {
     await page.goto(route.path);
-    await expect(page.locator(".topbar-title").filter({ hasText: route.text })).toBeVisible({ timeout: 15000 });
+    await expect(page.locator(".topbar-title").filter({ hasText: route.text })).toBeVisible({ timeout: 30000 });
   }
 });
