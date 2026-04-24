@@ -335,6 +335,29 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DE
 CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type ON audit_logs(event_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_user_id ON audit_logs(actor_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_client_id ON audit_logs(tenant_client_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('critical','high','medium','low')),
+  status TEXT NOT NULL CHECK (status IN ('open','acked','resolved')),
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  provider TEXT NULL,
+  client_id TEXT NULL,
+  ad_account_id TEXT NULL,
+  context_json TEXT NOT NULL,
+  occurrences INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  acknowledged_at TEXT NULL,
+  acknowledged_by TEXT NULL,
+  resolved_at TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_status_severity ON alerts(status, severity, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_provider_client ON alerts(provider, client_id, last_seen_at DESC);
 """
 
 

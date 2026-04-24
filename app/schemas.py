@@ -799,3 +799,23 @@ class AuditLogOut(BaseModel):
     tenant_client_id: Optional[UUID] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+
+
+class AlertOut(BaseModel):
+    id: UUID
+    code: str
+    severity: Literal["critical", "high", "medium", "low"]
+    status: Literal["open", "acked", "resolved"]
+    title: str
+    message: str
+    fingerprint: str
+    provider: Optional[str] = None
+    client_id: Optional[UUID] = None
+    ad_account_id: Optional[UUID] = None
+    context: Dict[str, Any] = Field(default_factory=dict)
+    occurrences: int = 1
+    first_seen_at: datetime
+    last_seen_at: datetime
+    acknowledged_at: Optional[datetime] = None
+    acknowledged_by: Optional[UUID] = None
+    resolved_at: Optional[datetime] = None

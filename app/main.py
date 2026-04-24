@@ -67,6 +67,7 @@ from app.schemas import (
     AuthProviderConfigOut,
     AuthProviderConfigPublicOut,
     AuditLogOut,
+    AlertOut,
     ExternalIdentityResolveRequest,
     ExternalIdentityResolveResponse,
     SessionIssueRequest,
@@ -125,6 +126,7 @@ from app.services.operational_actions import (
 from app.services.acl import RequestContext, ensure_account_access, ensure_admin, ensure_client_access
 from app.services.providers import google_ads
 from app.services.audit_log import AuditLogStore, InMemoryAuditLogStore, SqliteAuditLogStore
+from app.services.alerts import AlertSignal, AlertStore, InMemoryAlertStore, SqliteAlertStore
 from app.services.platform_admin import (
     InMemoryPlatformAdminStore,
     PlatformAdminStore,
@@ -240,6 +242,7 @@ app.state.overview_service = OverviewService(ad_stats_store=ad_stats_store, ad_a
 app.state.operational_insights_service = OperationalInsightsService(rules=settings.operational_insights_rules)
 app.state.operational_action_store = SqliteOperationalActionStore(settings.budgets_db_path)
 app.state.audit_log_store = SqliteAuditLogStore(settings.budgets_db_path)
+app.state.alert_store = SqliteAlertStore(settings.budgets_db_path)
 app.state.rate_limiter = InMemoryRateLimiter()
 
 
@@ -384,6 +387,14 @@ def _ensure_credential_manage_access(ctx: RequestContext, row: IntegrationCreden
     agency_ids = {str(x) for x in _agency_scope_ids_for_user(ctx.user_id)}
     if row.scope_type != "agency" or not row.scope_id or str(row.scope_id) not in agency_ids:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential scope access denied"})
+
+
+def _ensure_alert_access(ctx: RequestContext, row: AlertOut) -> None:
+    if ctx.role == "admin":
+        return
+    if row.client_id and row.client_id in ctx.accessible_client_ids:
+        return
+    raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Alert tenant access denied"})
 
 
 def _status_code_to_error_code(status_code: int) -> str:
@@ -642,6 +653,7 @@ def use_inmemory_stores():
     app.state.operational_insights_service = OperationalInsightsService(rules=settings.operational_insights_rules)
     app.state.operational_action_store = InMemoryOperationalActionStore()
     app.state.audit_log_store = InMemoryAuditLogStore()
+    app.state.alert_store = InMemoryAlertStore()
     app.state.rate_limiter = InMemoryRateLimiter()
     app.state.runtime_metrics = RuntimeMetrics()
     return {"status": "ok"}
@@ -711,6 +723,10 @@ def _audit_log_store() -> AuditLogStore:
     return app.state.audit_log_store
 
 
+def _alert_store() -> AlertStore:
+    return app.state.alert_store
+
+
 def _rate_limiter() -> InMemoryRateLimiter:
     return app.state.rate_limiter
 
@@ -741,6 +757,126 @@ def _audit_event(
     except Exception:
         # Audit write failure must not break primary business flow.
         return
+
+
+def _is_blocked_account_error(message: Optional[str]) -> bool:
+    m = str(message or "").strip().lower()
+    if not m:
+        return False
+    blocked_tokens = (
+        "customer_not_enabled",
+        "not enabled",
+        "blocked",
+        "disabled",
+        "suspended",
+    )
+    return any(t in m for t in blocked_tokens)
+
+
+def _build_sync_alert_signal(job: AdAccountSyncJobOut, *, client_id: UUID) -> Optional[AlertSignal]:
+    if job.status != "error":
+        return None
+    provider = (job.provider or "").lower().strip() or None
+    error_code = str(job.error_code or "").strip().lower()
+    message = str(job.error_message or "").strip() or "Sync failed with unknown provider error"
+
+    if _is_blocked_account_error(message):
+        return AlertSignal(
+            code="account.blocked_or_disabled",
+            severity="critical",
+            title="Ad account blocked/disabled",
+            message="Provider reports the ad account is blocked, disabled, or not enabled.",
+            fingerprint=f"account-blocked:{provider}:{job.ad_account_id}",
+            provider=provider,
+            client_id=client_id,
+            ad_account_id=job.ad_account_id,
+            context={"error_code": job.error_code, "raw_error": message},
+        )
+
+    if error_code == "auth_failed":
+        return AlertSignal(
+            code="provider.auth_failed",
+            severity="high",
+            title="Provider authorization failed",
+            message="Provider authorization or permissions failed. Reconnect credentials.",
+            fingerprint=f"provider-auth:{provider}:{job.ad_account_id}",
+            provider=provider,
+            client_id=client_id,
+            ad_account_id=job.ad_account_id,
+            context={"error_code": job.error_code, "raw_error": message},
+        )
+
+    if error_code in {"provider_unavailable", "rate_limited"}:
+        return AlertSignal(
+            code="provider.unavailable",
+            severity="medium",
+            title="Provider temporarily unavailable",
+            message="Provider API is unavailable or throttling sync calls.",
+            fingerprint=f"provider-unavailable:{provider}:{client_id}",
+            provider=provider,
+            client_id=client_id,
+            ad_account_id=None,
+            context={"error_code": job.error_code, "raw_error": message},
+        )
+
+    return None
+
+
+def _process_sync_alerts(*, jobs: List[AdAccountSyncJobOut], account_client_by_id: dict[UUID, UUID]) -> None:
+    for job in jobs:
+        client_id = account_client_by_id.get(job.ad_account_id)
+        if not client_id:
+            continue
+        provider = (job.provider or "").lower().strip()
+        if job.status == "success":
+            _alert_store().resolve_by_fingerprint(f"account-blocked:{provider}:{job.ad_account_id}")
+            _alert_store().resolve_by_fingerprint(f"provider-auth:{provider}:{job.ad_account_id}")
+            _alert_store().resolve_by_fingerprint(f"provider-unavailable:{provider}:{client_id}")
+            continue
+        signal = _build_sync_alert_signal(job, client_id=client_id)
+        if signal:
+            _alert_store().raise_alert(signal)
+
+
+def _process_discovery_alerts(
+    *,
+    target_client_id: UUID,
+    providers_attempted: List[str],
+    providers_failed: dict[str, str],
+) -> None:
+    attempted = {(x or "").lower().strip() for x in providers_attempted if str(x or "").strip()}
+    for provider, error in providers_failed.items():
+        p = (provider or "").lower().strip()
+        msg = str(error or "").strip()
+        lowered = msg.lower()
+        severity = "medium"
+        code = "discovery.provider_failed"
+        title = "Provider discovery failed"
+        if _is_blocked_account_error(msg):
+            code = "discovery.account_blocked_or_disabled"
+            severity = "critical"
+            title = "Provider reported blocked/disabled account during discovery"
+        elif "auth" in lowered or "permission" in lowered or "forbidden" in lowered or "unauthorized" in lowered:
+            code = "discovery.auth_failed"
+            severity = "high"
+            title = "Provider authorization failed during discovery"
+        _alert_store().raise_alert(
+            AlertSignal(
+                code=code,
+                severity=severity,
+                title=title,
+                message=msg or "Provider discovery failed",
+                fingerprint=f"discovery-failed:{p}:{target_client_id}",
+                provider=p or None,
+                client_id=target_client_id,
+                ad_account_id=None,
+                context={"raw_error": msg},
+            )
+        )
+
+    for provider in attempted:
+        if provider and provider not in {str(k).lower().strip() for k in providers_failed.keys()}:
+            _alert_store().resolve_by_fingerprint(f"discovery-failed:{provider}:{target_client_id}")
 
 
 def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
@@ -2514,6 +2650,11 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
         user_id=ctx.user_id,
         upsert_existing=payload.upsert_existing,
     )
+    _process_discovery_alerts(
+        target_client_id=target_client_id,
+        providers_attempted=result.providers_attempted,
+        providers_failed=result.providers_failed,
+    )
     _audit_event(
         event_type="ad_accounts.discover",
         resource_type="ad_account",
@@ -2580,6 +2721,10 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
         created_by=ctx.user_id,
         user_id=ctx.user_id,
         force=payload.force,
+    )
+    _process_sync_alerts(
+        jobs=result.jobs,
+        account_client_by_id={a.id: a.client_id for a in requested_accounts},
     )
     _audit_event(
         event_type="sync.run",
@@ -3180,6 +3325,55 @@ def list_audit_logs(
         tenant_client_id=tenant_client_id,
         limit=limit,
     )
+
+
+@app.get(
+    "/alerts",
+    response_model=List[AlertOut],
+    summary="List operational alerts",
+    description="Internal alert feed foundation. Delivery channels (Telegram/Slack/Email) can subscribe later.",
+)
+def list_alerts(
+    status: str = Query(default="open", pattern="^(open|acked|resolved|all)$"),
+    severity: Optional[str] = Query(default=None, pattern="^(critical|high|medium|low)$"),
+    provider: Optional[str] = None,
+    client_id: Optional[UUID] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    ctx: RequestContext = Depends(auth_context),
+):
+    if client_id:
+        ensure_client_access(ctx, client_id)
+    rows = _alert_store().list(
+        status=status,
+        severity=severity,
+        provider=provider,
+        client_id=client_id,
+        limit=limit,
+    )
+    if ctx.role != "admin":
+        rows = [x for x in rows if x.client_id and x.client_id in ctx.accessible_client_ids]
+    return rows
+
+
+@app.post("/alerts/{alert_id}/ack", response_model=AlertOut, summary="Acknowledge alert")
+def acknowledge_alert(alert_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    current = _alert_store().get(alert_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    _ensure_alert_access(ctx, current)
+    return _alert_store().acknowledge(alert_id, by_user_id=ctx.user_id)
+
+
+@app.post("/alerts/{alert_id}/resolve", response_model=AlertOut, summary="Resolve alert manually")
+def resolve_alert(alert_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    current = _alert_store().get(alert_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    _ensure_alert_access(ctx, current)
+    resolved = _alert_store().resolve_by_fingerprint(current.fingerprint)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return resolved
 
 
 @app.get("/meta/insights", response_model=MetaInsightsResponse)
