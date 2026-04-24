@@ -8,6 +8,7 @@ const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export function useAuth(defaultApiBase: string) {
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const [ready, setReady] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [role, setRole] = useState<"admin" | "agency" | "client" | null>(null);
@@ -15,7 +16,7 @@ export function useAuth(defaultApiBase: string) {
 
   const refresh = useCallback(async () => {
     const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
-    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
+    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
 
     try {
       const headers: HeadersInit = {};
@@ -42,30 +43,31 @@ export function useAuth(defaultApiBase: string) {
       setMe(null);
       setReady(true);
     }
-  }, [defaultApiBase]);
+  }, [defaultApiBase, tokenLoginEnabled]);
 
   const logout = useCallback(async () => {
     const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
-    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
-    if (token) {
-      try {
-        await fetch(`${apiBase}/auth/logout`, {
-          method: "POST",
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-          credentials: "include",
-        });
-      } catch {
-        // noop
-      }
+    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
+    try {
+      await fetch(`${apiBase}/auth/logout`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        credentials: "include",
+      });
+    } catch {
+      // noop
     }
     localStorage.removeItem(LS_SESSION_TOKEN);
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
     setAuthenticated(false);
     setRole(null);
     setMe(null);
-  }, [defaultApiBase]);
+  }, [defaultApiBase, tokenLoginEnabled]);
 
   useEffect(() => {
+    if (!tokenLoginEnabled) {
+      localStorage.removeItem(LS_SESSION_TOKEN);
+    }
     void refresh();
     const onStorage = () => void refresh();
     const onSessionUpdated = () => void refresh();
@@ -75,7 +77,7 @@ export function useAuth(defaultApiBase: string) {
       window.removeEventListener("storage", onStorage);
       window.removeEventListener(SESSION_UPDATED_EVENT, onSessionUpdated);
     };
-  }, [refresh]);
+  }, [refresh, tokenLoginEnabled]);
 
   return { ready, authenticated, role, me, refresh, logout };
 }

@@ -22,6 +22,9 @@ export function useSession(defaultApiBase: string) {
   useEffect(() => {
     const apiBase = localStorage.getItem(LS_API_BASE) || defaultApiBase;
     const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
+    if (!tokenLoginEnabled) {
+      localStorage.removeItem(LS_SESSION_TOKEN);
+    }
     setSession({ apiBase, token });
     setReady(true);
   }, [defaultApiBase, tokenLoginEnabled]);

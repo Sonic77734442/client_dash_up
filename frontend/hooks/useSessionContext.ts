@@ -6,6 +6,7 @@ import { AuthMeResponse, SessionContext } from "../lib/types";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export function useSessionContext() {
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const [context, setContext] = useState<SessionContext | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -13,7 +14,7 @@ export function useSessionContext() {
     setLoading(true);
     try {
       const apiBase = localStorage.getItem("ops_api_base") || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-      const token = localStorage.getItem("ops_session_token") || "";
+      const token = tokenLoginEnabled ? (localStorage.getItem("ops_session_token") || "") : "";
       const headers: HeadersInit = {};
       if (token) headers.Authorization = `Bearer ${token}`;
       const res = await fetch(`${apiBase.replace(/\/$/, "")}/auth/me`, {
@@ -32,7 +33,7 @@ export function useSessionContext() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [tokenLoginEnabled]);
 
   useEffect(() => {
     void refresh();

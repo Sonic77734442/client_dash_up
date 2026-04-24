@@ -56,6 +56,7 @@ function readCookie(name: string): string {
 const CSRF_COOKIE_NAME = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
 const CSRF_HEADER_NAME = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
 const CSRF_STORAGE_KEY = "ops_csrf_token";
+const TOKEN_LOGIN_ENABLED = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
 let csrfMemoryToken = "";
 
@@ -116,7 +117,9 @@ export async function fetchJson<T>(
   const method = (init?.method || "GET").toUpperCase();
   const resolvedToken = (token || "").trim();
   const fallbackToken =
-    typeof window !== "undefined" ? (localStorage.getItem("ops_session_token") || "").trim() : "";
+    TOKEN_LOGIN_ENABLED && typeof window !== "undefined"
+      ? (localStorage.getItem("ops_session_token") || "").trim()
+      : "";
 
   async function requestOnce(forceRefreshCsrf: boolean): Promise<{ res: Response; body: unknown }> {
     const headers = new Headers(init?.headers || {});

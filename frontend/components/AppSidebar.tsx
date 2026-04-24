@@ -40,11 +40,12 @@ export function AppSidebar({
   const { context } = useSessionContext();
   const showPlatformAdmin = Boolean(context?.valid) && context?.role === "admin";
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
   async function handleLogout() {
     try {
       const apiBase = (localStorage.getItem("ops_api_base") || defaultApiBase).replace(/\/$/, "");
-      const token = localStorage.getItem("ops_session_token") || "";
+      const token = tokenLoginEnabled ? (localStorage.getItem("ops_session_token") || "") : "";
       const headers: HeadersInit = {};
       if (token) headers.Authorization = `Bearer ${token}`;
       const csrfHeaderName = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
