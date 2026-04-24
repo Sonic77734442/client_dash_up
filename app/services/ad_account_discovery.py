@@ -209,13 +209,16 @@ class AdAccountDiscoveryService:
                         skipped += 1
                         items.append(existing_account)
                         continue
-                    patch = AdAccountPatch(
-                        client_id=client_id if existing_account.client_id != client_id else None,
-                        name=name if name and name != existing_account.name else None,
-                        currency=currency if currency and currency != existing_account.currency else None,
-                        status="active" if existing_account.status != "active" else None,
-                        metadata=merged_meta,
-                    )
+                    patch_data: Dict[str, object] = {"metadata": merged_meta}
+                    if existing_account.client_id != client_id:
+                        patch_data["client_id"] = client_id
+                    if name and name != existing_account.name:
+                        patch_data["name"] = name
+                    if currency and currency != existing_account.currency:
+                        patch_data["currency"] = currency
+                    if existing_account.status != "active":
+                        patch_data["status"] = "active"
+                    patch = AdAccountPatch(**patch_data)
                     try:
                         patched = self.account_store.patch(existing_account.id, patch)
                         existing[key] = patched

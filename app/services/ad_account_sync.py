@@ -157,7 +157,7 @@ class SyncRunResult:
 
 
 class AdAccountSyncService:
-    DEFAULT_INITIAL_LOOKBACK_DAYS = 90
+    DEFAULT_INITIAL_LOOKBACK_DAYS = 30
 
     def __init__(
         self,

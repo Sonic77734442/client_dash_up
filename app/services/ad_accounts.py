@@ -173,8 +173,14 @@ class InMemoryAdAccountStore:
         self.client_store = client_store
         self.items = {}
 
-    def _assert_client_exists(self, client_id: UUID) -> None:
-        if not self.client_store.get(client_id):
+    def _assert_client_exists(self, client_id: UUID | str) -> None:
+        resolved = client_id
+        if isinstance(client_id, str):
+            try:
+                resolved = UUID(client_id)
+            except Exception:
+                raise HTTPException(status_code=400, detail="client_id does not exist")
+        if not self.client_store.get(resolved):
             raise HTTPException(status_code=400, detail="client_id does not exist")
 
     def _assert_unique(self, platform: str, external: str, exclude: Optional[UUID] = None) -> None:
