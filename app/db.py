@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS integration_credentials (
   provider TEXT NOT NULL,
   scope_type TEXT NOT NULL CHECK (scope_type IN ('global','agency','client')),
   scope_id TEXT NULL,
+  connection_key TEXT NOT NULL DEFAULT 'default',
   credentials_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
   created_by TEXT NULL,
@@ -235,11 +236,6 @@ CREATE TABLE IF NOT EXISTS integration_credentials (
   updated_at TEXT NOT NULL,
   CHECK ((scope_type='global' AND scope_id IS NULL) OR (scope_type IN ('agency','client') AND scope_id IS NOT NULL))
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_integration_credentials_scope_provider
-ON integration_credentials(provider, scope_type, scope_id);
-CREATE INDEX IF NOT EXISTS idx_integration_credentials_status ON integration_credentials(status, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_integration_credentials_scope ON integration_credentials(scope_type, scope_id, status);
 
 CREATE INDEX IF NOT EXISTS idx_auth_identities_user_id ON auth_identities(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_identities_provider ON auth_identities(provider);
@@ -376,10 +372,25 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
     )
 
     cred_cols = {row[1] for row in conn.execute("PRAGMA table_info(integration_credentials)").fetchall()}
+    if cred_cols and "connection_key" not in cred_cols:
+        conn.execute("ALTER TABLE integration_credentials ADD COLUMN connection_key TEXT NOT NULL DEFAULT 'default'")
     if cred_cols and "status" not in cred_cols:
         conn.execute("ALTER TABLE integration_credentials ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
     if cred_cols and "created_by" not in cred_cols:
         conn.execute("ALTER TABLE integration_credentials ADD COLUMN created_by TEXT NULL")
+    conn.execute("DROP INDEX IF EXISTS uq_integration_credentials_scope_provider")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_integration_credentials_scope_provider_connection "
+        "ON integration_credentials(provider, scope_type, scope_id, connection_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_integration_credentials_status "
+        "ON integration_credentials(status, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_integration_credentials_scope "
+        "ON integration_credentials(scope_type, scope_id, status)"
+    )
 
 
 def init_sqlite(db_path: str) -> None:

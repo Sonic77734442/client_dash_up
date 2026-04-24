@@ -37,6 +37,13 @@ class IntegrationCredentialStore(Protocol):
         client_id: UUID,
         user_id: Optional[UUID] = None,
     ) -> Optional[IntegrationCredentialOut]: ...
+    def resolve_many_for_client(
+        self,
+        *,
+        provider: str,
+        client_id: UUID,
+        user_id: Optional[UUID] = None,
+    ) -> List[IntegrationCredentialOut]: ...
 
 
 class SqliteIntegrationCredentialStore:
@@ -51,6 +58,7 @@ class SqliteIntegrationCredentialStore:
             provider=row["provider"],
             scope_type=row["scope_type"],
             scope_id=UUID(row["scope_id"]) if row["scope_id"] else None,
+            connection_key=str(row["connection_key"] or "default") if "connection_key" in row.keys() else "default",
             credentials=json.loads(row["credentials_json"]) if row["credentials_json"] else {},
             status=row["status"],
             created_by=UUID(row["created_by"]) if row["created_by"] else None,
@@ -63,6 +71,7 @@ class SqliteIntegrationCredentialStore:
         cred_id = str(uuid4())
         provider = _normalize_provider(payload.provider)
         scope_id = str(payload.scope_id) if payload.scope_id else None
+        connection_key = str(payload.connection_key or "default").strip() or "default"
         if payload.scope_type == "global" and scope_id is not None:
             raise HTTPException(status_code=400, detail="scope_id must be null for global scope")
         if payload.scope_type in {"agency", "client"} and scope_id is None:
@@ -72,17 +81,17 @@ class SqliteIntegrationCredentialStore:
                 existing = conn.execute(
                     """
                     SELECT * FROM integration_credentials
-                    WHERE provider=? AND scope_type=? AND scope_id IS NULL
+                    WHERE provider=? AND scope_type=? AND scope_id IS NULL AND connection_key=?
                     """,
-                    (provider, payload.scope_type),
+                    (provider, payload.scope_type, connection_key),
                 ).fetchone()
             else:
                 existing = conn.execute(
                     """
                     SELECT * FROM integration_credentials
-                    WHERE provider=? AND scope_type=? AND scope_id=?
+                    WHERE provider=? AND scope_type=? AND scope_id=? AND connection_key=?
                     """,
-                    (provider, payload.scope_type, scope_id),
+                    (provider, payload.scope_type, scope_id, connection_key),
                 ).fetchone()
             if existing:
                 conn.execute(
@@ -105,14 +114,15 @@ class SqliteIntegrationCredentialStore:
             conn.execute(
                 """
                 INSERT INTO integration_credentials
-                (id, provider, scope_type, scope_id, credentials_json, status, created_by, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                (id, provider, scope_type, scope_id, connection_key, credentials_json, status, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
                     cred_id,
                     provider,
                     payload.scope_type,
                     scope_id,
+                    connection_key,
                     json.dumps(payload.credentials, separators=(",", ":"), ensure_ascii=True),
                     str(payload.created_by) if payload.created_by else None,
                     now,
@@ -165,6 +175,7 @@ class SqliteIntegrationCredentialStore:
                 "provider": _normalize_provider(patch.get("provider", existing["provider"])),
                 "scope_type": patch.get("scope_type", existing["scope_type"]),
                 "scope_id": str(patch["scope_id"]) if "scope_id" in patch and patch["scope_id"] else existing["scope_id"],
+                "connection_key": str(patch.get("connection_key", existing["connection_key"] or "default")).strip() or "default",
                 "credentials_json": json.dumps(
                     patch.get("credentials", json.loads(existing["credentials_json"] or "{}")),
                     separators=(",", ":"),
@@ -181,13 +192,14 @@ class SqliteIntegrationCredentialStore:
             conn.execute(
                 """
                 UPDATE integration_credentials
-                SET provider=?, scope_type=?, scope_id=?, credentials_json=?, status=?, created_by=?, updated_at=?
+                SET provider=?, scope_type=?, scope_id=?, connection_key=?, credentials_json=?, status=?, created_by=?, updated_at=?
                 WHERE id=?
                 """,
                 (
                     data["provider"],
                     data["scope_type"],
                     data["scope_id"],
+                    data["connection_key"],
                     data["credentials_json"],
                     data["status"],
                     data["created_by"],
@@ -220,24 +232,45 @@ class SqliteIntegrationCredentialStore:
         client_id: UUID,
         user_id: Optional[UUID] = None,
     ) -> Optional[IntegrationCredentialOut]:
+        rows = self.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        return rows[0] if rows else None
+
+    def resolve_many_for_client(
+        self,
+        *,
+        provider: str,
+        client_id: UUID,
+        user_id: Optional[UUID] = None,
+    ) -> List[IntegrationCredentialOut]:
         provider_norm = _normalize_provider(provider)
+        out: List[IntegrationCredentialOut] = []
+        seen_ids: set[str] = set()
+
+        def _push(row) -> None:
+            if not row:
+                return
+            rid = str(row["id"])
+            if rid in seen_ids:
+                return
+            seen_ids.add(rid)
+            out.append(self._to_out(row))
+
         with sqlite_conn(self.db_path) as conn:
             # 1) client-scoped credential.
-            client_row = conn.execute(
+            client_rows = conn.execute(
                 """
                 SELECT * FROM integration_credentials
                 WHERE provider=? AND scope_type='client' AND scope_id=? AND status='active'
-                ORDER BY updated_at DESC
-                LIMIT 1
+                ORDER BY updated_at DESC, connection_key ASC
                 """,
                 (provider_norm, str(client_id)),
-            ).fetchone()
-            if client_row:
-                return self._to_out(client_row)
+            ).fetchall()
+            for row in client_rows:
+                _push(row)
 
             # 2) agency-scoped credential for an agency that has this client.
             if user_id:
-                agency_row = conn.execute(
+                agency_rows = conn.execute(
                     """
                     SELECT ic.*
                     FROM integration_credentials ic
@@ -253,13 +286,12 @@ class SqliteIntegrationCredentialStore:
                       AND am.user_id=?
                       AND am.status='active'
                       AND u.status='active'
-                    ORDER BY ic.updated_at DESC
-                    LIMIT 1
+                    ORDER BY ic.updated_at DESC, ic.connection_key ASC
                     """,
                     (provider_norm, str(client_id), str(user_id)),
-                ).fetchone()
+                ).fetchall()
             else:
-                agency_row = conn.execute(
+                agency_rows = conn.execute(
                     """
                     SELECT ic.*
                     FROM integration_credentials ic
@@ -270,27 +302,25 @@ class SqliteIntegrationCredentialStore:
                       AND ic.status='active'
                       AND aca.client_id=?
                       AND a.status='active'
-                    ORDER BY ic.updated_at DESC
-                    LIMIT 1
+                    ORDER BY ic.updated_at DESC, ic.connection_key ASC
                     """,
                     (provider_norm, str(client_id)),
-                ).fetchone()
-            if agency_row:
-                return self._to_out(agency_row)
+                ).fetchall()
+            for row in agency_rows:
+                _push(row)
 
             # 3) global credential.
-            global_row = conn.execute(
+            global_rows = conn.execute(
                 """
                 SELECT * FROM integration_credentials
                 WHERE provider=? AND scope_type='global' AND status='active'
-                ORDER BY updated_at DESC
-                LIMIT 1
+                ORDER BY updated_at DESC, connection_key ASC
                 """,
                 (provider_norm,),
-            ).fetchone()
-            if global_row:
-                return self._to_out(global_row)
-        return None
+            ).fetchall()
+            for row in global_rows:
+                _push(row)
+        return out
 
 
 class InMemoryIntegrationCredentialStore:
@@ -300,12 +330,18 @@ class InMemoryIntegrationCredentialStore:
     def upsert(self, payload: IntegrationCredentialCreate) -> IntegrationCredentialOut:
         provider = _normalize_provider(payload.provider)
         for row in self.items.values():
-            if row.provider == provider and row.scope_type == payload.scope_type and row.scope_id == payload.scope_id:
+            if (
+                row.provider == provider
+                and row.scope_type == payload.scope_type
+                and row.scope_id == payload.scope_id
+                and row.connection_key == (payload.connection_key or "default")
+            ):
                 updated = IntegrationCredentialOut(
                     id=row.id,
                     provider=provider,
                     scope_type=payload.scope_type,
                     scope_id=payload.scope_id,
+                    connection_key=payload.connection_key or "default",
                     credentials=payload.credentials,
                     status="active",
                     created_by=payload.created_by or row.created_by,
@@ -320,6 +356,7 @@ class InMemoryIntegrationCredentialStore:
             provider=provider,
             scope_type=payload.scope_type,
             scope_id=payload.scope_id,
+            connection_key=payload.connection_key or "default",
             credentials=payload.credentials,
             status="active",
             created_by=payload.created_by,
@@ -362,6 +399,7 @@ class InMemoryIntegrationCredentialStore:
             provider=_normalize_provider(patch.get("provider", existing.provider)),
             scope_type=patch.get("scope_type", existing.scope_type),
             scope_id=patch.get("scope_id", existing.scope_id),
+            connection_key=str(patch.get("connection_key", existing.connection_key or "default")).strip() or "default",
             credentials=patch.get("credentials", existing.credentials),
             status=patch.get("status", existing.status),
             created_by=patch.get("created_by", existing.created_by),
@@ -381,18 +419,22 @@ class InMemoryIntegrationCredentialStore:
         client_id: UUID,
         user_id: Optional[UUID] = None,
     ) -> Optional[IntegrationCredentialOut]:
+        rows = self.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        return rows[0] if rows else None
+
+    def resolve_many_for_client(
+        self,
+        *,
+        provider: str,
+        client_id: UUID,
+        user_id: Optional[UUID] = None,
+    ) -> List[IntegrationCredentialOut]:
         p = _normalize_provider(provider)
         rows = [x for x in self.items.values() if x.status == "active" and x.provider == p]
         client_rows = [x for x in rows if x.scope_type == "client" and x.scope_id == client_id]
-        if client_rows:
-            client_rows.sort(key=lambda x: x.updated_at, reverse=True)
-            return client_rows[0]
+        client_rows.sort(key=lambda x: x.updated_at, reverse=True)
         agency_rows = [x for x in rows if x.scope_type == "agency"]
-        if agency_rows:
-            agency_rows.sort(key=lambda x: x.updated_at, reverse=True)
-            return agency_rows[0]
+        agency_rows.sort(key=lambda x: x.updated_at, reverse=True)
         global_rows = [x for x in rows if x.scope_type == "global"]
-        if global_rows:
-            global_rows.sort(key=lambda x: x.updated_at, reverse=True)
-            return global_rows[0]
-        return None
+        global_rows.sort(key=lambda x: x.updated_at, reverse=True)
+        return [*client_rows, *agency_rows, *global_rows]

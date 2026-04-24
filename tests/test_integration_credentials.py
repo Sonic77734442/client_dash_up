@@ -162,3 +162,53 @@ def test_sync_receives_resolved_tenant_credentials():
     assert run.status_code == 200
     assert captured["credentials"] is not None
     assert captured["credentials"]["refresh_token"] == "google-client-token"
+
+
+def test_integration_credentials_support_multiple_connection_keys_per_scope():
+    reset_state()
+    c = mk_client("Multi")
+
+    first = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "client",
+            "scope_id": c["id"],
+            "connection_key": "google:mcc-111",
+            "credentials": {"refresh_token": "rt-111"},
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "client",
+            "scope_id": c["id"],
+            "connection_key": "google:mcc-222",
+            "credentials": {"refresh_token": "rt-222"},
+        },
+    )
+    assert second.status_code == 200
+
+    update_first = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "client",
+            "scope_id": c["id"],
+            "connection_key": "google:mcc-111",
+            "credentials": {"refresh_token": "rt-111-updated"},
+        },
+    )
+    assert update_first.status_code == 200
+
+    store = app.state.integration_credential_store
+    resolved_many = store.resolve_many_for_client(provider="google", client_id=UUID(c["id"]))
+    assert len(resolved_many) == 2
+    keys = {row.connection_key for row in resolved_many}
+    assert keys == {"google:mcc-111", "google:mcc-222"}
+    token_by_key = {row.connection_key: row.credentials.get("refresh_token") for row in resolved_many}
+    assert token_by_key["google:mcc-111"] == "rt-111-updated"
+    assert token_by_key["google:mcc-222"] == "rt-222"

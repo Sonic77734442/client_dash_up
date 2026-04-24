@@ -213,4 +213,101 @@ def test_oauth_connect_flow_links_to_current_agency_user_and_saves_agency_creden
     assert len(creds) == 1
     assert creds[0].scope_type == "agency"
     assert str(creds[0].scope_id) == agency.json()["id"]
+    assert creds[0].connection_key == "google:google-user-123"
     assert creds[0].credentials.get("refresh_token") == "rt-agency-123"
+
+
+def test_oauth_connect_flow_adds_second_google_connection_for_same_agency():
+    reset_state()
+
+    class FakeGoogleAdapterMulti:
+        provider = "google"
+
+        def build_authorize_url(self, cfg, state: str) -> str:
+            return f"https://provider.example/google-auth?state={state}&client_id={cfg.client_id}"
+
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            if code == "ok-code-1":
+                return ExternalIdentityPayload(
+                    provider_user_id="google-user-123",
+                    email="agency.user@example.com",
+                    email_verified=True,
+                    name="Agency User",
+                    raw_profile={"sub": "google-user-123", "email": "agency.user@example.com"},
+                    oauth_tokens={"refresh_token": "rt-agency-123", "access_token": "at-agency-123"},
+                )
+            if code == "ok-code-2":
+                return ExternalIdentityPayload(
+                    provider_user_id="google-user-456",
+                    email="agency.user@example.com",
+                    email_verified=True,
+                    name="Agency User",
+                    raw_profile={"sub": "google-user-456", "email": "agency.user@example.com"},
+                    oauth_tokens={"refresh_token": "rt-agency-456", "access_token": "at-agency-456"},
+                )
+            raise AssertionError("Unexpected code")
+
+    app.state.oauth_adapters = {"google": FakeGoogleAdapterMulti()}
+
+    admin = client.post(
+        "/auth/internal/users",
+        json={"email": "admin2@test.local", "name": "Admin", "role": "admin", "status": "active"},
+    )
+    assert admin.status_code == 200
+    admin_token = client.post("/auth/internal/sessions/issue", json={"user_id": admin.json()["id"], "ttl_minutes": 60}).json()["token"]
+
+    agency_user = client.post(
+        "/auth/internal/users",
+        json={"email": "agency.user@example.com", "name": "Agency User", "role": "agency", "status": "active"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert agency_user.status_code == 200
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Agency Multi", "status": "active", "plan": "starter"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert agency.status_code == 200
+    member = client.post(
+        f"/platform/agencies/{agency.json()['id']}/members",
+        json={"user_id": agency_user.json()["id"], "role": "owner", "status": "active"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert member.status_code == 200
+
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "g-client",
+            "client_secret": "g-secret",
+            "redirect_uri": "http://127.0.0.1:8000/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    agency_token = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": agency_user.json()["id"], "ttl_minutes": 60},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()["token"]
+    client.cookies.set("ops_session", agency_token)
+
+    start1 = client.get("/auth/google/start?next=/sync-monitor", follow_redirects=False)
+    assert start1.status_code == 302
+    state1 = parse_qs(urlparse(start1.headers["location"]).query)["state"][0]
+    callback1 = client.get(f"/auth/google/callback?code=ok-code-1&state={state1}", follow_redirects=False)
+    assert callback1.status_code == 302
+
+    start2 = client.get("/auth/google/start?next=/sync-monitor", follow_redirects=False)
+    assert start2.status_code == 302
+    state2 = parse_qs(urlparse(start2.headers["location"]).query)["state"][0]
+    callback2 = client.get(f"/auth/google/callback?code=ok-code-2&state={state2}", follow_redirects=False)
+    assert callback2.status_code == 302
+
+    creds = app.state.integration_credential_store.list(status="all", provider="google")
+    agency_creds = [x for x in creds if x.scope_type == "agency" and str(x.scope_id) == agency.json()["id"]]
+    assert len(agency_creds) == 2
+    keys = {x.connection_key for x in agency_creds}
+    assert keys == {"google:google-user-123", "google:google-user-456"}

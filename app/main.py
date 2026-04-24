@@ -181,8 +181,25 @@ def _resolve_provider_credentials(
     client_id: UUID,
     user_id: Optional[UUID],
 ) -> Optional[dict]:
-    resolved = integration_credential_store.resolve_for_client(provider=provider, client_id=client_id, user_id=user_id)
-    return dict(resolved.credentials) if resolved else None
+    rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    if not rows:
+        return None
+    return dict(rows[0].credentials)
+
+
+def _resolve_provider_credentials_candidates(
+    provider: str,
+    client_id: UUID,
+    user_id: Optional[UUID],
+) -> List[dict]:
+    rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    out: List[dict] = []
+    for row in rows:
+        cred = dict(row.credentials)
+        cred["__credential_id"] = str(row.id)
+        cred["__connection_key"] = row.connection_key
+        out.append(cred)
+    return out
 
 
 ad_account_sync_service = AdAccountSyncService(
@@ -190,10 +207,12 @@ ad_account_sync_service = AdAccountSyncService(
     job_store=ad_account_sync_job_store,
     ad_stats_store=ad_stats_store,
     credential_resolver=_resolve_provider_credentials,
+    credential_candidates_resolver=_resolve_provider_credentials_candidates,
 )
 ad_account_discovery_service = AdAccountDiscoveryService(
     account_store=ad_account_store,
     credential_resolver=_resolve_provider_credentials,
+    credential_candidates_resolver=_resolve_provider_credentials_candidates,
 )
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
@@ -328,6 +347,7 @@ def _to_public_integration_credential(row: IntegrationCredentialOut) -> Integrat
         provider=row.provider,
         scope_type=row.scope_type,
         scope_id=row.scope_id,
+        connection_key=row.connection_key,
         status=row.status,
         created_by=row.created_by,
         created_at=row.created_at,
@@ -542,8 +562,23 @@ def use_inmemory_stores():
     a = InMemoryAdAccountStore(c)
     integration_creds = InMemoryIntegrationCredentialStore()
     def _resolve_provider_credentials_inmemory(provider: str, client_id: UUID, user_id: Optional[UUID]) -> Optional[dict]:
-        resolved = integration_creds.resolve_for_client(provider=provider, client_id=client_id, user_id=user_id)
-        return dict(resolved.credentials) if resolved else None
+        rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        if not rows:
+            return None
+        return dict(rows[0].credentials)
+    def _resolve_provider_credentials_candidates_inmemory(
+        provider: str,
+        client_id: UUID,
+        user_id: Optional[UUID],
+    ) -> List[dict]:
+        rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        out: List[dict] = []
+        for row in rows:
+            cred = dict(row.credentials)
+            cred["__credential_id"] = str(row.id)
+            cred["__connection_key"] = row.connection_key
+            out.append(cred)
+        return out
     sync_jobs = InMemoryAdAccountSyncJobStore()
     s = InMemoryAdStatsStore(a)
     sync_service = AdAccountSyncService(
@@ -551,10 +586,12 @@ def use_inmemory_stores():
         job_store=sync_jobs,
         ad_stats_store=s,
         credential_resolver=_resolve_provider_credentials_inmemory,
+        credential_candidates_resolver=_resolve_provider_credentials_candidates_inmemory,
     )
     discovery_service = AdAccountDiscoveryService(
         account_store=a,
         credential_resolver=_resolve_provider_credentials_inmemory,
+        credential_candidates_resolver=_resolve_provider_credentials_candidates_inmemory,
     )
     b = InMemoryBudgetStore()
     auth = InMemoryAuthStore()
@@ -750,51 +787,52 @@ def _auto_upsert_integration_credentials(
     *,
     provider: str,
     user: UserOut,
+    provider_user_id: Optional[str],
     oauth_tokens: Optional[dict],
     cfg: OAuthProviderConfig,
 ) -> None:
     credentials = _integration_credentials_from_oauth(provider, oauth_tokens, cfg)
     if not credentials:
         return
-    provider_norm = "meta" if provider == "facebook" else provider
+    provider_norm = "meta" if provider.strip().lower() == "facebook" else provider.strip().lower()
+
+    def _connection_key_for_credentials() -> str:
+        # Google users can connect multiple MCC trees; key credentials by login_customer_id when known.
+        if provider_norm == "google":
+            login_customer_id = str(credentials.get("login_customer_id") or "").strip()
+            if login_customer_id:
+                return f"google:{login_customer_id}"
+        normalized_provider_user = str(provider_user_id or "").strip()
+        if normalized_provider_user:
+            return f"{provider_norm}:{normalized_provider_user}"
+        return "default"
+
     if user.role == "agency":
         agency_ids = _agency_scope_ids_for_user(user.id)
         if not agency_ids:
             return
+        connection_key = _connection_key_for_credentials()
         for agency_id in agency_ids:
-            existing = _integration_credential_store().list(
-                status="all",
-                provider=provider_norm,
-                scope_type="agency",
-                scope_id=agency_id,
-            )
-            merged = dict(existing[0].credentials) if existing else {}
-            merged.update(credentials)
             _integration_credential_store().upsert(
                 IntegrationCredentialCreate(
                     provider=provider_norm,
                     scope_type="agency",
                     scope_id=agency_id,
-                    credentials=merged,
+                    connection_key=connection_key,
+                    credentials=credentials,
                     created_by=user.id,
                 )
             )
         return
     if user.role == "admin":
-        existing = _integration_credential_store().list(
-            status="all",
-            provider=provider_norm,
-            scope_type="global",
-            scope_id=None,
-        )
-        merged = dict(existing[0].credentials) if existing else {}
-        merged.update(credentials)
+        connection_key = _connection_key_for_credentials()
         _integration_credential_store().upsert(
             IntegrationCredentialCreate(
                 provider=provider_norm,
                 scope_type="global",
                 scope_id=None,
-                credentials=merged,
+                connection_key=connection_key,
+                credentials=credentials,
                 created_by=user.id,
             )
         )
@@ -1734,6 +1772,7 @@ def auth_oauth_callback(
     _auto_upsert_integration_credentials(
         provider=provider,
         user=resolved.user,
+        provider_user_id=identity.provider_user_id,
         oauth_tokens=identity.oauth_tokens,
         cfg=cfg,
     )

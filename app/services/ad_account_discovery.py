@@ -85,9 +85,11 @@ class AdAccountDiscoveryService:
         *,
         discoverers: Optional[Dict[str, AccountDiscoverer]] = None,
         credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
+        credential_candidates_resolver: Optional[Callable[[str, UUID, Optional[UUID]], List[Dict[str, object]]]] = None,
     ):
         self.account_store = account_store
         self.credential_resolver = credential_resolver
+        self.credential_candidates_resolver = credential_candidates_resolver
         self.discoverers: Dict[str, AccountDiscoverer] = discoverers or {
             "meta": self._discover_meta_accounts,
             "google": self._discover_google_accounts,
@@ -175,119 +177,144 @@ class AdAccountDiscoveryService:
             if not discoverer:
                 providers_failed[p] = "Provider discovery not configured"
                 continue
-            provider_credentials: Optional[Dict[str, object]] = None
-            if self.credential_resolver:
-                provider_credentials = self.credential_resolver(p, client_id, user_id)
-            try:
+            provider_runs: List[tuple[Optional[str], List[Dict[str, object]]]] = []
+            provider_errors: List[str] = []
+
+            candidate_credentials: List[Optional[Dict[str, object]]] = []
+            if self.credential_candidates_resolver:
+                rows = self.credential_candidates_resolver(p, client_id, user_id)
+                candidate_credentials = rows if rows else []
+            elif self.credential_resolver:
+                candidate_credentials = [self.credential_resolver(p, client_id, user_id)]
+            else:
+                candidate_credentials = []
+            if not candidate_credentials:
+                candidate_credentials = [None]
+
+            for candidate in candidate_credentials:
+                cred_id = str((candidate or {}).get("__credential_id") or "").strip() or None
+                provider_credentials = dict(candidate or {})
+                provider_credentials.pop("__credential_id", None)
+                provider_credentials.pop("__connection_key", None)
                 try:
-                    rows = discoverer(provider_credentials) or []
-                except TypeError:
-                    # Backward-compatible path for tests/custom discoverers without credentials param.
-                    rows = discoverer() or []
-            except Exception as exc:
-                providers_failed[p] = self._safe_provider_error(exc)
+                    try:
+                        rows = discoverer(provider_credentials) or []
+                    except TypeError:
+                        # Backward-compatible path for tests/custom discoverers without credentials param.
+                        rows = discoverer() or []
+                    provider_runs.append((cred_id, rows))
+                except Exception as exc:
+                    provider_errors.append(self._safe_provider_error(exc))
+
+            if not provider_runs and provider_errors:
+                providers_failed[p] = provider_errors[-1]
                 continue
 
-            for row in rows:
-                external_account_id = _canonical_external_id(p, row.get("external_account_id"))
-                if not external_account_id:
-                    skipped += 1
-                    continue
-                discovered += 1
-                name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
-                currency = str(row.get("currency") or "USD").strip().upper() or "USD"
-                key = (str(client_id), p, external_account_id)
-                existing_account = existing.get(key)
-                discovery_meta = {
-                    "discovered_at": now_iso,
-                    "discovery_provider": p,
-                    "discovery_source": str(row.get("source") or "provider_api_or_env_fallback"),
-                }
-                if existing_account:
-                    merged_meta = dict(existing_account.metadata or {})
-                    merged_meta.update(discovery_meta)
-                    if not upsert_existing:
+            for cred_id, rows in provider_runs:
+                for row in rows:
+                    external_account_id = _canonical_external_id(p, row.get("external_account_id"))
+                    if not external_account_id:
                         skipped += 1
-                        items.append(existing_account)
                         continue
-                    patch_data: Dict[str, object] = {"metadata": merged_meta}
-                    if name and name != existing_account.name:
-                        patch_data["name"] = name
-                    if currency and currency != existing_account.currency:
-                        patch_data["currency"] = currency
-                    if existing_account.status != "active":
-                        patch_data["status"] = "active"
-                    patch = AdAccountPatch(**patch_data)
+                    discovered += 1
+                    name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
+                    currency = str(row.get("currency") or "USD").strip().upper() or "USD"
+                    key = (str(client_id), p, external_account_id)
+                    existing_account = existing.get(key)
+                    discovery_meta = {
+                        "discovered_at": now_iso,
+                        "discovery_provider": p,
+                        "discovery_source": str(row.get("source") or "provider_api_or_env_fallback"),
+                    }
+                    if cred_id:
+                        discovery_meta["integration_credential_id"] = cred_id
+                    if existing_account:
+                        merged_meta = dict(existing_account.metadata or {})
+                        merged_meta.update(discovery_meta)
+                        if not upsert_existing:
+                            skipped += 1
+                            items.append(existing_account)
+                            continue
+                        patch_data: Dict[str, object] = {"metadata": merged_meta}
+                        if name and name != existing_account.name:
+                            patch_data["name"] = name
+                        if currency and currency != existing_account.currency:
+                            patch_data["currency"] = currency
+                        if existing_account.status != "active":
+                            patch_data["status"] = "active"
+                        patch = AdAccountPatch(**patch_data)
+                        try:
+                            patched = self.account_store.patch(existing_account.id, patch)
+                            existing[key] = patched
+                            items.append(patched)
+                            updated += 1
+                        except HTTPException as exc:
+                            if exc.status_code == 409:
+                                skipped += 1
+                                provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
+                                continue
+                            raise
+                        continue
+
                     try:
-                        patched = self.account_store.patch(existing_account.id, patch)
-                        existing[key] = patched
-                        items.append(patched)
-                        updated += 1
+                        created_row = self.account_store.create(
+                            AdAccountCreate(
+                                client_id=client_id,
+                                platform=p,
+                                external_account_id=external_account_id,
+                                name=name,
+                                currency=currency,
+                                status="active",
+                                metadata=discovery_meta,
+                            )
+                        )
+                        existing[key] = created_row
+                        items.append(created_row)
+                        created += 1
+                    except HTTPException as exc:
+                        # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
+                        if exc.status_code == 409:
+                            fallback_existing = existing.get(key)
+                            if not fallback_existing:
+                                refreshed = self.account_store.list(client_id=client_id, status="all")
+                                fallback_existing = next(
+                                    (
+                                        a
+                                        for a in refreshed
+                                        if str(a.client_id) == str(client_id)
+                                        and (a.platform or "").lower().strip() == p
+                                        and _canonical_external_id(p, a.external_account_id) == external_account_id
+                                    ),
+                                    None,
+                                )
+                            if not fallback_existing:
+                                raise
+                            merged_meta = dict(fallback_existing.metadata or {})
+                            merged_meta.update(discovery_meta)
+                            patched = self.account_store.patch(
+                                fallback_existing.id,
+                                AdAccountPatch(
+                                    name=name if name and name != fallback_existing.name else None,
+                                    currency=currency if currency and currency != fallback_existing.currency else None,
+                                    status="active" if fallback_existing.status != "active" else None,
+                                    metadata=merged_meta,
+                                ),
+                            )
+                            existing[key] = patched
+                            items.append(patched)
+                            updated += 1
+                            continue
+                        raise
                     except HTTPException as exc:
                         if exc.status_code == 409:
                             skipped += 1
                             provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
                             continue
                         raise
-                    continue
+                
+            if provider_errors and p not in providers_failed:
+                providers_failed[p] = provider_errors[-1]
 
-                try:
-                    created_row = self.account_store.create(
-                        AdAccountCreate(
-                            client_id=client_id,
-                            platform=p,
-                            external_account_id=external_account_id,
-                            name=name,
-                            currency=currency,
-                            status="active",
-                            metadata=discovery_meta,
-                        )
-                    )
-                    existing[key] = created_row
-                    items.append(created_row)
-                    created += 1
-                except HTTPException as exc:
-                    # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
-                    if exc.status_code != 409:
-                        raise
-                    fallback_existing = existing.get(key)
-                    if not fallback_existing:
-                        refreshed = self.account_store.list(client_id=client_id, status="all")
-                        fallback_existing = next(
-                            (
-                                a
-                                for a in refreshed
-                                if str(a.client_id) == str(client_id)
-                                and (a.platform or "").lower().strip() == p
-                                and _canonical_external_id(p, a.external_account_id) == external_account_id
-                            ),
-                            None,
-                        )
-                    if not fallback_existing:
-                        raise
-                    merged_meta = dict(fallback_existing.metadata or {})
-                    merged_meta.update(discovery_meta)
-                    patched = self.account_store.patch(
-                        fallback_existing.id,
-                        AdAccountPatch(
-                            name=name if name and name != fallback_existing.name else None,
-                            currency=currency if currency and currency != fallback_existing.currency else None,
-                            status="active" if fallback_existing.status != "active" else None,
-                            metadata=merged_meta,
-                        ),
-                    )
-                    existing[key] = patched
-                    items.append(patched)
-                    updated += 1
-                except HTTPException as exc:
-                    if exc.status_code == 409:
-                        skipped += 1
-                        provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
-                        continue
-                    raise
-                
-                
-                
             # Refresh map after provider batch to absorb possible concurrent updates and prevent stale-key conflicts.
             existing = {
                 (

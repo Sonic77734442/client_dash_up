@@ -697,6 +697,7 @@ class IntegrationCredentialBase(BaseModel):
     provider: str
     scope_type: Literal["global", "agency", "client"] = "global"
     scope_id: Optional[UUID] = None
+    connection_key: str = "default"
     credentials: Dict[str, Any] = Field(default_factory=dict)
     created_by: Optional[UUID] = None
 
@@ -706,6 +707,8 @@ class IntegrationCredentialBase(BaseModel):
             raise ValueError("scope_id must be null for scope_type='global'")
         if self.scope_type in {"agency", "client"} and self.scope_id is None:
             raise ValueError("scope_id is required for scope_type='agency' or 'client'")
+        if not str(self.connection_key or "").strip():
+            raise ValueError("connection_key is required")
         return self
 
 
@@ -717,6 +720,7 @@ class IntegrationCredentialPatch(BaseModel):
     provider: Optional[str] = None
     scope_type: Optional[Literal["global", "agency", "client"]] = None
     scope_id: Optional[UUID] = None
+    connection_key: Optional[str] = None
     credentials: Optional[Dict[str, Any]] = None
     status: Optional[Literal["active", "archived"]] = None
     created_by: Optional[UUID] = None
@@ -727,6 +731,7 @@ class IntegrationCredentialOut(BaseModel):
     provider: str
     scope_type: Literal["global", "agency", "client"]
     scope_id: Optional[UUID] = None
+    connection_key: str = "default"
     credentials: Dict[str, Any] = Field(default_factory=dict)
     status: Literal["active", "archived"]
     created_by: Optional[UUID] = None
@@ -739,6 +744,7 @@ class IntegrationCredentialPublicOut(BaseModel):
     provider: str
     scope_type: Literal["global", "agency", "client"]
     scope_id: Optional[UUID] = None
+    connection_key: str = "default"
     status: Literal["active", "archived"]
     created_by: Optional[UUID] = None
     created_at: datetime

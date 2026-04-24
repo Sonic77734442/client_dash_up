@@ -167,11 +167,13 @@ class AdAccountSyncService:
         *,
         provider_fetchers: Optional[Dict[str, Callable[..., List[Dict[str, object]]]]] = None,
         credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
+        credential_candidates_resolver: Optional[Callable[[str, UUID, Optional[UUID]], List[Dict[str, object]]]] = None,
     ):
         self.account_store = account_store
         self.job_store = job_store
         self.ad_stats_store = ad_stats_store
         self.credential_resolver = credential_resolver
+        self.credential_candidates_resolver = credential_candidates_resolver
         try:
             self.initial_lookback_days = max(
                 1,
@@ -423,16 +425,47 @@ class AdAccountSyncService:
                 error_category = "configuration"
                 retryable = False
                 next_retry_at = None
+                used_credential_id: Optional[str] = None
             else:
+                used_credential_id = None
                 try:
-                    provider_credentials: Optional[Dict[str, object]] = None
-                    if self.credential_resolver:
-                        provider_credentials = self.credential_resolver(provider, account.client_id, user_id)
-                    try:
-                        rows = fetcher(account.external_account_id, from_str, to_str, provider_credentials)
-                    except TypeError:
-                        # Backward-compatible path for tests/custom fetchers with legacy signature.
-                        rows = fetcher(account.external_account_id, from_str, to_str)
+                    credential_candidates: List[Dict[str, object]] = []
+                    if self.credential_candidates_resolver:
+                        credential_candidates = self.credential_candidates_resolver(provider, account.client_id, user_id) or []
+                    elif self.credential_resolver:
+                        single = self.credential_resolver(provider, account.client_id, user_id)
+                        if single:
+                            credential_candidates = [single]
+                    if not credential_candidates:
+                        credential_candidates = [{}]
+
+                    preferred_credential_id = str((account.metadata or {}).get("integration_credential_id") or "").strip()
+                    if preferred_credential_id:
+                        preferred = [c for c in credential_candidates if str(c.get("__credential_id") or "") == preferred_credential_id]
+                        remaining = [c for c in credential_candidates if str(c.get("__credential_id") or "") != preferred_credential_id]
+                        credential_candidates = [*preferred, *remaining]
+
+                    used_credential_id: Optional[str] = None
+                    last_exc: Optional[Exception] = None
+                    rows: List[Dict[str, object]] = []
+                    for candidate in credential_candidates:
+                        used_credential_id = str(candidate.get("__credential_id") or "").strip() or None
+                        provider_credentials = dict(candidate)
+                        provider_credentials.pop("__credential_id", None)
+                        provider_credentials.pop("__connection_key", None)
+                        try:
+                            try:
+                                rows = fetcher(account.external_account_id, from_str, to_str, provider_credentials)
+                            except TypeError:
+                                # Backward-compatible path for tests/custom fetchers with legacy signature.
+                                rows = fetcher(account.external_account_id, from_str, to_str)
+                            last_exc = None
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            continue
+                    if last_exc is not None:
+                        raise last_exc
                     status = "success"
                     records = self._ingest_provider_rows(
                         account_id=account.id,
@@ -486,6 +519,9 @@ class AdAccountSyncService:
             next_meta["sync_next_retry_at"] = next_retry_at.isoformat() if next_retry_at else None
             next_meta["sync_attempt"] = attempt
             next_meta["last_sync_job_id"] = str(job.id)
+            if status == "success":
+                if used_credential_id:
+                    next_meta["integration_credential_id"] = used_credential_id
             self.account_store.patch(account.id, AdAccountPatch(metadata=next_meta))
 
             if status == "success":
