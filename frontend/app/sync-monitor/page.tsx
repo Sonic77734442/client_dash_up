@@ -115,6 +115,9 @@ export default function SyncMonitorPage() {
   const [syncLoading, setSyncLoading] = useState(false);
   const [discoverClientId, setDiscoverClientId] = useState("");
   const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
+  const [connectProviderName, setConnectProviderName] = useState<"google" | "facebook" | null>(null);
+  const [connectMode, setConnectMode] = useState<"add" | "overwrite">("add");
+  const [overwriteConnectionKey, setOverwriteConnectionKey] = useState("");
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -220,14 +223,39 @@ export default function SyncMonitorPage() {
 
   const providerOptions = useMemo(() => ["all", ...Array.from(new Set(jobs.map((j) => j.provider))).sort()], [jobs]);
 
-  function connectProvider(providerName: "google" | "facebook") {
+  function openConnectProvider(providerName: "google" | "facebook") {
     if (currentRole === "client") {
       push("Provider connection is available only for agency/admin users", "info");
       return;
     }
+    setConnectProviderName(providerName);
+    setConnectMode("add");
+    setOverwriteConnectionKey("");
+  }
+
+  function closeConnectDialog() {
+    setConnectProviderName(null);
+    setConnectMode("add");
+    setOverwriteConnectionKey("");
+  }
+
+  function startConnectProvider() {
+    if (!connectProviderName) return;
+    const key = overwriteConnectionKey.trim();
+    if (connectMode === "overwrite" && !key) {
+      push("Enter connection key to overwrite existing credential", "info");
+      return;
+    }
     const base = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
+    const q = new URLSearchParams({
+      next: "/sync-monitor",
+      connect_mode: connectMode,
+    });
+    if (connectMode === "overwrite") {
+      q.set("connection_key", key);
+    }
     localStorage.setItem("ops_api_base", base);
-    window.location.href = `${base}/auth/${providerName}/start?next=/sync-monitor`;
+    window.location.href = `${base}/auth/${connectProviderName}/start?${q.toString()}`;
   }
 
   async function runSync(opts?: { platform?: "meta" | "google" | "tiktok"; accountId?: string }) {
@@ -384,8 +412,8 @@ export default function SyncMonitorPage() {
                 <button className="ghost-btn" onClick={() => void discoverAccounts()} disabled={syncLoading}>
                   Discover Accounts
                 </button>
-                <button className="ghost-btn" onClick={() => connectProvider("google")}>Connect Google</button>
-                <button className="ghost-btn" onClick={() => connectProvider("facebook")}>Connect Facebook</button>
+                <button className="ghost-btn" onClick={() => openConnectProvider("google")}>Connect Google</button>
+                <button className="ghost-btn" onClick={() => openConnectProvider("facebook")}>Connect Facebook</button>
                 <button className="primary-btn" onClick={() => void runSync()} disabled={syncLoading}>Sync All</button>
               </div>
             </div>
@@ -627,6 +655,73 @@ export default function SyncMonitorPage() {
           </section>
         </main>
       </div>
+
+      {connectProviderName ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(9, 16, 30, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1200,
+            padding: 16,
+          }}
+        >
+          <div className="panel" style={{ width: "min(560px, 96vw)" }}>
+            <div className="panel-head">
+              <div>
+                <h3 style={{ margin: 0 }}>Connect {providerLabel(connectProviderName)}</h3>
+                <div className="panel-subtitle">Choose behavior for repeated connect in this tenant scope.</div>
+              </div>
+            </div>
+            <div className="chip-row" style={{ marginTop: 8 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="radio"
+                  name="connect-mode"
+                  checked={connectMode === "add"}
+                  onChange={() => setConnectMode("add")}
+                />
+                Add new connection
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="radio"
+                  name="connect-mode"
+                  checked={connectMode === "overwrite"}
+                  onChange={() => setConnectMode("overwrite")}
+                />
+                Overwrite existing by key
+              </label>
+            </div>
+            {connectMode === "overwrite" ? (
+              <div style={{ marginTop: 10 }}>
+                <label>
+                  Connection Key
+                  <input
+                    value={overwriteConnectionKey}
+                    onChange={(e) => setOverwriteConnectionKey(e.target.value)}
+                    placeholder={connectProviderName === "google" ? "google:1234567890 or google:user-id" : `${connectProviderName}:user-id`}
+                  />
+                </label>
+                <div className="muted-note" style={{ marginTop: 6 }}>
+                  If key exists, OAuth tokens will update that connection. If key is new, a new connection is created.
+                </div>
+              </div>
+            ) : (
+              <div className="muted-note" style={{ marginTop: 10 }}>
+                New provider identity/MCC will be saved as an additional connection automatically.
+              </div>
+            )}
+            <div className="budgets-detail-actions" style={{ marginTop: 14 }}>
+              <button className="primary-btn" onClick={startConnectProvider}>Continue OAuth</button>
+              <button className="ghost-btn" onClick={closeConnectDialog}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <ToastHost toasts={toasts} />
     </>

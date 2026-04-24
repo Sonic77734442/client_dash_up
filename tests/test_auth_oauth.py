@@ -311,3 +311,105 @@ def test_oauth_connect_flow_adds_second_google_connection_for_same_agency():
     assert len(agency_creds) == 2
     keys = {x.connection_key for x in agency_creds}
     assert keys == {"google:google-user-123", "google:google-user-456"}
+
+
+def test_oauth_connect_flow_overwrite_mode_uses_explicit_connection_key():
+    reset_state()
+
+    class FakeGoogleAdapterOverwrite:
+        provider = "google"
+
+        def build_authorize_url(self, cfg, state: str) -> str:
+            return f"https://provider.example/google-auth?state={state}&client_id={cfg.client_id}"
+
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            assert code == "ok-code"
+            return ExternalIdentityPayload(
+                provider_user_id="google-user-new",
+                email="agency.user@example.com",
+                email_verified=True,
+                name="Agency User",
+                raw_profile={"sub": "google-user-new", "email": "agency.user@example.com"},
+                oauth_tokens={"refresh_token": "rt-overwrite", "access_token": "at-overwrite"},
+            )
+
+    app.state.oauth_adapters = {"google": FakeGoogleAdapterOverwrite()}
+
+    admin = client.post(
+        "/auth/internal/users",
+        json={"email": "admin3@test.local", "name": "Admin", "role": "admin", "status": "active"},
+    )
+    assert admin.status_code == 200
+    admin_token = client.post("/auth/internal/sessions/issue", json={"user_id": admin.json()["id"], "ttl_minutes": 60}).json()["token"]
+
+    agency_user = client.post(
+        "/auth/internal/users",
+        json={"email": "agency.user@example.com", "name": "Agency User", "role": "agency", "status": "active"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert agency_user.status_code == 200
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Agency Overwrite", "status": "active", "plan": "starter"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert agency.status_code == 200
+    member = client.post(
+        f"/platform/agencies/{agency.json()['id']}/members",
+        json={"user_id": agency_user.json()["id"], "role": "owner", "status": "active"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert member.status_code == 200
+
+    # Seed existing credential that should be overwritten by explicit key.
+    seeded = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "agency",
+            "scope_id": agency.json()["id"],
+            "connection_key": "google:mcc-777",
+            "credentials": {"refresh_token": "old-token"},
+        },
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert seeded.status_code == 200
+
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "g-client",
+            "client_secret": "g-secret",
+            "redirect_uri": "http://127.0.0.1:8000/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    agency_token = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": agency_user.json()["id"], "ttl_minutes": 60},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()["token"]
+    client.cookies.set("ops_session", agency_token)
+
+    start = client.get(
+        "/auth/google/start?next=/sync-monitor&connect_mode=overwrite&connection_key=google:mcc-777",
+        follow_redirects=False,
+    )
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+
+    creds = app.state.integration_credential_store.list(status="all", provider="google")
+    agency_creds = [x for x in creds if x.scope_type == "agency" and str(x.scope_id) == agency.json()["id"]]
+    assert len(agency_creds) == 1
+    assert agency_creds[0].connection_key == "google:mcc-777"
+    assert agency_creds[0].credentials.get("refresh_token") == "rt-overwrite"
+
+    cb_loc = callback.headers["location"]
+    parsed = urlparse(cb_loc)
+    next_path = parse_qs(parsed.query).get("next", [""])[0]
+    assert next_path == "/sync-monitor"

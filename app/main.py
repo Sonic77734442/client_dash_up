@@ -6,7 +6,7 @@ import time
 import os
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Union
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -788,6 +788,8 @@ def _auto_upsert_integration_credentials(
     provider: str,
     user: UserOut,
     provider_user_id: Optional[str],
+    connect_mode: str = "add",
+    requested_connection_key: Optional[str] = None,
     oauth_tokens: Optional[dict],
     cfg: OAuthProviderConfig,
 ) -> None:
@@ -797,6 +799,9 @@ def _auto_upsert_integration_credentials(
     provider_norm = "meta" if provider.strip().lower() == "facebook" else provider.strip().lower()
 
     def _connection_key_for_credentials() -> str:
+        explicit_key = str(requested_connection_key or "").strip()
+        if connect_mode == "overwrite" and explicit_key:
+            return explicit_key
         # Google users can connect multiple MCC trees; key credentials by login_customer_id when known.
         if provider_norm == "google":
             login_customer_id = str(credentials.get("login_customer_id") or "").strip()
@@ -1046,6 +1051,51 @@ def _normalize_next_path(next_path: Optional[str]) -> str:
     if value.startswith("//"):
         return "/"
     return value
+
+
+def _with_oauth_connect_options(
+    next_path: str,
+    *,
+    connect_mode: str,
+    connection_key: Optional[str],
+) -> str:
+    parsed = urlsplit(_normalize_next_path(next_path))
+    query_items = [
+        (k, v)
+        for (k, v) in parse_qsl(parsed.query, keep_blank_values=True)
+        if k not in {"ops_connect_mode", "ops_connection_key"}
+    ]
+    mode = (connect_mode or "add").strip().lower()
+    if mode not in {"add", "overwrite"}:
+        mode = "add"
+    query_items.append(("ops_connect_mode", mode))
+    key = str(connection_key or "").strip()
+    if mode == "overwrite" and key:
+        query_items.append(("ops_connection_key", key))
+    return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
+
+
+def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, Optional[str]]:
+    parsed = urlsplit(_normalize_next_path(next_path))
+    mode = "add"
+    key: Optional[str] = None
+    clean_items: List[tuple[str, str]] = []
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        if k == "ops_connect_mode":
+            candidate = str(v or "").strip().lower()
+            if candidate in {"add", "overwrite"}:
+                mode = candidate
+            continue
+        if k == "ops_connection_key":
+            candidate = str(v or "").strip()
+            if candidate:
+                key = candidate
+            continue
+        clean_items.append((k, v))
+    if mode == "overwrite" and not key:
+        mode = "add"
+    clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
+    return clean_next, mode, key
 
 
 def _cookie_samesite_value() -> str:
@@ -1669,13 +1719,19 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
 def auth_oauth_start(
     provider: str,
     next_path: Optional[str] = Query(default="/", alias="next"),
+    connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
+    connection_key: Optional[str] = Query(default=None),
 ):
     adapters = _oauth_adapters()
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
     cfg = _oauth_provider_config_or_400(provider)
-    normalized_next = _normalize_next_path(next_path)
+    normalized_next = _with_oauth_connect_options(
+        _normalize_next_path(next_path),
+        connect_mode=connect_mode,
+        connection_key=connection_key,
+    )
     nonce = secrets.token_urlsafe(24)
     state = _oauth_state_store().create_state(
         provider=provider,
@@ -1769,16 +1825,20 @@ def auth_oauth_callback(
     if not resolved.session:
         raise HTTPException(status_code=500, detail="OAuth session was not issued")
 
+    redirect_next, connect_mode, requested_connection_key = _extract_oauth_connect_options(consumed.next_path or "/")
+
     _auto_upsert_integration_credentials(
         provider=provider,
         user=resolved.user,
         provider_user_id=identity.provider_user_id,
+        connect_mode=connect_mode,
+        requested_connection_key=requested_connection_key,
         oauth_tokens=identity.oauth_tokens,
         cfg=cfg,
     )
 
     base = settings.frontend_base_url.rstrip("/")
-    next_encoded = quote(consumed.next_path or "/", safe="/?=&")
+    next_encoded = quote(redirect_next or "/", safe="/?=&")
     token_fragment = quote(resolved.session.token, safe="")
     redirect_url = f"{base}/login/success?next={next_encoded}#token={token_fragment}"
     response = RedirectResponse(url=redirect_url, status_code=302)
