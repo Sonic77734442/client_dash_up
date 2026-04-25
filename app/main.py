@@ -397,6 +397,24 @@ def _ensure_alert_access(ctx: RequestContext, row: AlertOut) -> None:
     raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Alert tenant access denied"})
 
 
+def _ensure_agency_member_access(ctx: RequestContext, agency_id: UUID, *, manage: bool = False) -> None:
+    if ctx.role == "admin":
+        return
+    if ctx.role != "agency" or not ctx.user_id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
+    try:
+        members = _platform_admin_store().list_members(agency_id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    me = next((m for m in members if m.user_id == ctx.user_id and m.status == "active"), None)
+    if not me:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency access denied"})
+    if manage and me.role not in {"owner", "manager"}:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency management access denied"})
+
+
 def _status_code_to_error_code(status_code: int) -> str:
     mapping = {
         400: "bad_request",
@@ -2185,8 +2203,20 @@ def platform_list_agencies(
     status: str = Query(default="all", pattern="^(active|suspended|all)$"),
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
-    rows = _platform_admin_store().list_agencies(status=status)
+    if ctx.role == "admin":
+        rows = _platform_admin_store().list_agencies(status=status)
+    elif ctx.role == "agency" and ctx.user_id:
+        ids = _agency_scope_ids_for_user(ctx.user_id)
+        rows = []
+        for agency_id in ids:
+            row = _platform_admin_store().get_agency(agency_id)
+            if not row:
+                continue
+            if status != "all" and row.status != status:
+                continue
+            rows.append(row)
+    else:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
     return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
 
 
@@ -2197,7 +2227,7 @@ def platform_list_agencies(
     description="Temporary internal/admin-only plumbing endpoint for agency provisioning.",
 )
 def platform_get_agency(agency_id: UUID, ctx: RequestContext = Depends(auth_context)):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id)
     row = _platform_admin_store().get_agency(agency_id)
     if not row:
         raise HTTPException(status_code=404, detail="Agency not found")
@@ -2251,7 +2281,7 @@ def platform_upsert_agency_member(
     description="Temporary internal/admin-only plumbing endpoint for agency provisioning.",
 )
 def platform_list_agency_members(agency_id: UUID, ctx: RequestContext = Depends(auth_context)):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id)
     return _platform_admin_store().list_members(agency_id)
 
 
@@ -2376,7 +2406,7 @@ def platform_deactivate_agency_member(
     member_id: UUID,
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id, manage=True)
     return _platform_admin_store().deactivate_member(agency_id, member_id)
 
 
@@ -2389,7 +2419,7 @@ def platform_remove_agency_member(
     member_id: UUID,
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id, manage=True)
     _platform_admin_store().remove_member(agency_id, member_id)
     return {"status": "removed"}
 

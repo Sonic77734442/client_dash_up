@@ -78,8 +78,12 @@ export default function PlatformAgenciesPage() {
   );
 
   const loadRefData = useCallback(async () => {
-    const usersRes = await req<{ items: UserItem[] }>("/auth/internal/users");
-    setUsers((usersRes.items || []).filter((u) => u.role === "agency" || u.role === "admin"));
+    try {
+      const usersRes = await req<{ items: UserItem[] }>("/auth/internal/users");
+      setUsers((usersRes.items || []).filter((u) => u.role === "agency" || u.role === "admin"));
+    } catch {
+      setUsers([]);
+    }
   }, [req]);
 
   const loadAgencies = useCallback(async () => {
@@ -95,14 +99,14 @@ export default function PlatformAgenciesPage() {
 
   const loadAgencyDetails = useCallback(
     async (agencyId: string) => {
-      const [m, i] = await Promise.all([
-        req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`),
-        req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`),
-      ]);
+      const m = await req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`);
+      const i = ctx?.role === "admin"
+        ? await req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`)
+        : [];
       setMembers(m || []);
       setInvites(i || []);
     },
-    [req]
+    [ctx?.role, req]
   );
 
   const reloadAll = useCallback(async () => {
@@ -313,6 +317,14 @@ export default function PlatformAgenciesPage() {
   }
 
   const adminOnly = ctx && ctx.role !== "admin";
+  const canManageMembers = useMemo(() => {
+    if (!ctx) return false;
+    if (ctx.role === "admin") return true;
+    if (ctx.role !== "agency" || !ctx.user_id) return false;
+    const me = members.find((m) => m.user_id === ctx.user_id);
+    if (!me || me.status !== "active") return false;
+    return me.role === "owner" || me.role === "manager";
+  }, [ctx, members]);
   const canActivate = selectedAgency?.status === "suspended";
   const canSuspend = selectedAgency?.status === "active";
 
@@ -485,12 +497,12 @@ export default function PlatformAgenciesPage() {
                         <div className="alert-actions" style={{ marginTop: 6 }}>
                           <button
                             className="mini-btn"
-                            disabled={adminOnly === true || m.status !== "active"}
+                            disabled={!canManageMembers || m.status !== "active"}
                             onClick={() => void deactivateMember(m.id)}
                           >
                             Deactivate
                           </button>
-                          <button className="mini-btn" disabled={adminOnly === true} onClick={() => void removeMember(m.id)}>
+                          <button className="mini-btn" disabled={!canManageMembers} onClick={() => void removeMember(m.id)}>
                             Remove
                           </button>
                         </div>

@@ -125,3 +125,31 @@ def test_new_active_member_gets_backfilled_access_from_existing_agency_bindings(
 
     allowed = client.get(f"/clients/{tenant['id']}", headers=auth_header(agency_token))
     assert allowed.status_code == 200
+
+
+def test_agency_user_can_list_own_agencies_and_members():
+    reset_state()
+    admin = mk_user("admin3@platform.local", "admin")
+    agency_user = mk_user("agency3@platform.local", "agency")
+    admin_token = issue_token(admin["id"])
+    agency_token = issue_token(agency_user["id"])
+
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Nebula Agency", "status": "active", "plan": "starter"},
+        headers=auth_header(admin_token),
+    ).json()
+    member = client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": agency_user["id"], "role": "owner", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    assert member.status_code == 200
+
+    listed = client.get("/platform/agencies?status=all", headers=auth_header(agency_token))
+    assert listed.status_code == 200
+    assert any(x["id"] == agency["id"] for x in listed.json()["items"])
+
+    members = client.get(f"/platform/agencies/{agency['id']}/members", headers=auth_header(agency_token))
+    assert members.status_code == 200
+    assert any(x["user_id"] == agency_user["id"] for x in members.json())

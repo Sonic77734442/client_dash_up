@@ -204,3 +204,44 @@ def test_delete_agency_detaches_members_and_keeps_users():
     detached = next((u for u in users.json()["items"] if u["id"] == agency_user["id"]), None)
     assert detached is not None
     assert detached["role"] == "client"
+
+
+def test_agency_owner_can_remove_member_but_member_cannot_manage():
+    reset_state()
+    admin = mk_user("admin5@lifecycle.local", "admin")
+    owner_user = mk_user("owner@lifecycle.local", "agency")
+    member_user = mk_user("member@lifecycle.local", "agency")
+    admin_token = issue_token(admin["id"])
+    owner_token = issue_token(owner_user["id"])
+    member_token = issue_token(member_user["id"])
+
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Lifecycle Agency E", "status": "active", "plan": "starter"},
+        headers=auth_header(admin_token),
+    ).json()
+    client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": owner_user["id"], "role": "owner", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    add_member = client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": member_user["id"], "role": "member", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    assert add_member.status_code == 200
+    member_id = add_member.json()["id"]
+
+    denied = client.delete(
+        f"/platform/agencies/{agency['id']}/members/{member_id}",
+        headers=auth_header(member_token),
+    )
+    assert denied.status_code == 403
+
+    removed = client.delete(
+        f"/platform/agencies/{agency['id']}/members/{member_id}",
+        headers=auth_header(owner_token),
+    )
+    assert removed.status_code == 200
+    assert removed.json()["status"] == "removed"
