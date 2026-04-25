@@ -2337,7 +2337,7 @@ def platform_issue_agency_invite(
     payload: AgencyInviteCreate,
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id, manage=True)
     return _platform_admin_store().issue_invite(
         agency_id,
         payload,
@@ -2357,7 +2357,7 @@ def platform_list_agency_invites(
     status: str = Query(default="all", pattern="^(pending|accepted|revoked|expired|all)$"),
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id)
     return _platform_admin_store().list_invites(agency_id, status=status)
 
 
@@ -2371,7 +2371,7 @@ def platform_revoke_agency_invite(
     invite_id: UUID,
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id, manage=True)
     return _platform_admin_store().revoke_invite(agency_id, invite_id)
 
 
@@ -2386,7 +2386,7 @@ def platform_resend_agency_invite(
     payload: AgencyInviteResendRequest,
     ctx: RequestContext = Depends(auth_context),
 ):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id, manage=True)
     return _platform_admin_store().resend_invite(
         agency_id,
         invite_id,

@@ -100,13 +100,16 @@ export default function PlatformAgenciesPage() {
   const loadAgencyDetails = useCallback(
     async (agencyId: string) => {
       const m = await req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`);
-      const i = ctx?.role === "admin"
-        ? await req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`)
-        : [];
+      let i: AgencyInviteOut[] = [];
+      try {
+        i = await req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`);
+      } catch {
+        i = [];
+      }
       setMembers(m || []);
       setInvites(i || []);
     },
-    [ctx?.role, req]
+    [req]
   );
 
   const reloadAll = useCallback(async () => {
@@ -525,7 +528,7 @@ export default function PlatformAgenciesPage() {
                   />
                 </div>
                 <div className="alert-actions" style={{ marginTop: 8 }}>
-                  <button className="primary-btn" disabled={!selectedAgency || !inviteEmail || adminOnly === true} onClick={() => void issueInvite()}>
+                  <button className="primary-btn" disabled={!selectedAgency || !inviteEmail || !canManageMembers} onClick={() => void issueInvite()}>
                     Issue Invite
                   </button>
                   <button className="ghost-btn" disabled={!lastInviteUrl} onClick={() => void copyInviteUrl()}>
@@ -547,14 +550,14 @@ export default function PlatformAgenciesPage() {
                       <div className="alert-actions" style={{ marginTop: 6 }}>
                         <button
                           className="mini-btn"
-                          disabled={adminOnly === true || inv.status === "accepted"}
+                          disabled={!canManageMembers || inv.status === "accepted"}
                           onClick={() => void resendInvite(inv.id)}
                         >
                           Resend
                         </button>
                         <button
                           className="mini-btn"
-                          disabled={adminOnly === true || inv.status === "accepted" || inv.status === "expired"}
+                          disabled={!canManageMembers || inv.status === "accepted" || inv.status === "expired"}
                           onClick={() => void revokeInvite(inv.id)}
                         >
                           Revoke

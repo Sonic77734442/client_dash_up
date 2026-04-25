@@ -245,3 +245,57 @@ def test_agency_owner_can_remove_member_but_member_cannot_manage():
     )
     assert removed.status_code == 200
     assert removed.json()["status"] == "removed"
+
+
+def test_agency_owner_can_manage_invites_but_member_cannot():
+    reset_state()
+    admin = mk_user("admin6@lifecycle.local", "admin")
+    owner_user = mk_user("owner2@lifecycle.local", "agency")
+    member_user = mk_user("member2@lifecycle.local", "agency")
+    admin_token = issue_token(admin["id"])
+    owner_token = issue_token(owner_user["id"])
+    member_token = issue_token(member_user["id"])
+
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Lifecycle Agency F", "status": "active", "plan": "starter"},
+        headers=auth_header(admin_token),
+    ).json()
+    client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": owner_user["id"], "role": "owner", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": member_user["id"], "role": "member", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+
+    denied_issue = client.post(
+        f"/platform/agencies/{agency['id']}/invites",
+        json={"email": "x@agency.local", "member_role": "member", "expires_in_days": 7},
+        headers=auth_header(member_token),
+    )
+    assert denied_issue.status_code == 403
+
+    issued = client.post(
+        f"/platform/agencies/{agency['id']}/invites",
+        json={"email": "x@agency.local", "member_role": "member", "expires_in_days": 7},
+        headers=auth_header(owner_token),
+    )
+    assert issued.status_code == 200
+    invite_id = issued.json()["invite"]["id"]
+
+    denied_revoke = client.post(
+        f"/platform/agencies/{agency['id']}/invites/{invite_id}/revoke",
+        headers=auth_header(member_token),
+    )
+    assert denied_revoke.status_code == 403
+
+    revoked = client.post(
+        f"/platform/agencies/{agency['id']}/invites/{invite_id}/revoke",
+        headers=auth_header(owner_token),
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
