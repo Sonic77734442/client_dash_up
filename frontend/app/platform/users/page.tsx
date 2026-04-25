@@ -39,6 +39,7 @@ export default function PlatformUsersPage() {
 
   const [warning, setWarning] = useState("");
   const [users, setUsers] = useState<UserItem[]>([]);
+  const [currentUserId, setCurrentUserId] = useState<string>("");
   const [search, setSearch] = useState("");
   const [createEmail, setCreateEmail] = useState("");
   const [createName, setCreateName] = useState("");
@@ -51,7 +52,8 @@ export default function PlatformUsersPage() {
   );
 
   const loadUsers = useCallback(async () => {
-    await req<AuthMeResponse>("/auth/me");
+    const me = await req<AuthMeResponse>("/auth/me");
+    setCurrentUserId(me.user.id);
     const rows = await req<{ items: UserItem[] }>("/auth/internal/users");
     setUsers(rows.items || []);
   }, [req]);
@@ -97,6 +99,20 @@ export default function PlatformUsersPage() {
       push("User updated", "success");
     } catch (err) {
       push(err instanceof Error ? err.message : "User update failed", "error");
+    }
+  }
+
+  async function deleteUser(user: UserItem) {
+    const label = user.email || user.name || user.id;
+    if (!window.confirm(`Delete user ${label}? This is permanent.`)) return;
+    try {
+      await req<{ status: string }>(`/auth/internal/users/${user.id}`, {
+        method: "DELETE",
+      });
+      await loadUsers();
+      push("User deleted", "success");
+    } catch (err) {
+      push(err instanceof Error ? err.message : "User delete failed", "error");
     }
   }
 
@@ -180,6 +196,7 @@ export default function PlatformUsersPage() {
                     <th>Role</th>
                     <th>Status</th>
                     <th>Updated</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -201,11 +218,28 @@ export default function PlatformUsersPage() {
                         </select>
                       </td>
                       <td>{fmtDate(u.updated_at || u.created_at)}</td>
+                      <td>
+                        <div className="alert-actions">
+                          <button
+                            className="mini-btn"
+                            onClick={() => void patchUser(u.id, { status: u.status === "active" ? "inactive" : "active" })}
+                          >
+                            {u.status === "active" ? "Deactivate" : "Activate"}
+                          </button>
+                          <button
+                            className="mini-btn"
+                            disabled={u.id === currentUserId}
+                            onClick={() => void deleteUser(u)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}
                   {!filtered.length ? (
                     <tr>
-                      <td colSpan={5} className="muted-note">No users.</td>
+                      <td colSpan={6} className="muted-note">No users.</td>
                     </tr>
                   ) : null}
                 </tbody>

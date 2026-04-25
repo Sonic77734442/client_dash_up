@@ -1614,6 +1614,20 @@ def auth_patch_user(
     return _auth_store().patch_user(user_id, payload)
 
 
+@app.delete(
+    "/auth/internal/users/{user_id}",
+    summary="[INTERNAL/TEMP] Delete internal user",
+    description="Temporary internal/admin-only endpoint for hard user removal and cleanup.",
+)
+def auth_delete_user(
+    user_id: UUID,
+    ctx: Optional[RequestContext] = Depends(optional_auth_context),
+):
+    _enforce_internal_admin(ctx)
+    _auth_store().delete_user(user_id)
+    return {"status": "deleted"}
+
+
 @app.post(
     "/auth/internal/identities/link",
     response_model=AuthIdentityOut,
@@ -2199,6 +2213,20 @@ def platform_get_agency(agency_id: UUID, ctx: RequestContext = Depends(auth_cont
 def platform_patch_agency(agency_id: UUID, payload: AgencyPatch, ctx: RequestContext = Depends(auth_context)):
     ensure_admin(ctx)
     return _platform_admin_store().patch_agency(agency_id, payload)
+
+
+@app.delete(
+    "/platform/agencies/{agency_id}",
+    summary="[INTERNAL/TEMP] Delete agency",
+    description=(
+        "Temporary internal/admin-only endpoint for hard agency removal. "
+        "Agency users are not deleted; their agency bindings are removed."
+    ),
+)
+def platform_delete_agency(agency_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_admin(ctx)
+    _platform_admin_store().delete_agency(agency_id)
+    return {"status": "deleted"}
 
 
 @app.post(

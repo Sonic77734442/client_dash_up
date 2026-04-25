@@ -26,6 +26,7 @@ from app.schemas import (
     AgencyPatch,
     UserClientAccessCreate,
     UserCreate,
+    UserPatch,
     SessionIssueRequest,
 )
 from app.services.auth_arch import AuthStore
@@ -36,6 +37,7 @@ class PlatformAdminStore(Protocol):
     def list_agencies(self, *, status: str = "all") -> List[AgencyOut]: ...
     def get_agency(self, agency_id: UUID) -> Optional[AgencyOut]: ...
     def patch_agency(self, agency_id: UUID, payload: AgencyPatch) -> AgencyOut: ...
+    def delete_agency(self, agency_id: UUID) -> None: ...
     def upsert_member(self, agency_id: UUID, payload: AgencyMemberCreate) -> AgencyMemberOut: ...
     def list_members(self, agency_id: UUID) -> List[AgencyMemberOut]: ...
     def assign_client(self, agency_id: UUID, payload: AgencyClientAccessCreate) -> AgencyClientAccessOut: ...
@@ -280,6 +282,51 @@ class SqlitePlatformAdminStore:
                 raise HTTPException(status_code=409, detail=f"Agency conflict: {exc}")
             row = conn.execute("SELECT * FROM agencies WHERE id=?", (str(agency_id),)).fetchone()
         return self._to_agency(row)
+
+    def _should_demote_agency_user(self, conn, user_id: UUID) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM agency_members am
+            JOIN agencies a ON a.id = am.agency_id
+            WHERE am.user_id=?
+              AND am.status='active'
+              AND a.status='active'
+            LIMIT 1
+            """,
+            (str(user_id),),
+        ).fetchone()
+        return row is None
+
+    def delete_agency(self, agency_id: UUID) -> None:
+        now = datetime.utcnow().isoformat()
+        with sqlite_conn(self.db_path) as conn:
+            self._agency_or_404(conn, agency_id)
+            member_rows = conn.execute(
+                "SELECT DISTINCT user_id FROM agency_members WHERE agency_id=?",
+                (str(agency_id),),
+            ).fetchall()
+            affected_user_ids = [UUID(r["user_id"]) for r in member_rows]
+
+            conn.execute("DELETE FROM agency_invites WHERE agency_id=?", (str(agency_id),))
+            conn.execute("DELETE FROM agency_client_access WHERE agency_id=?", (str(agency_id),))
+            conn.execute("DELETE FROM agency_members WHERE agency_id=?", (str(agency_id),))
+            conn.execute(
+                "DELETE FROM integration_credentials WHERE scope_type='agency' AND scope_id=?",
+                (str(agency_id),),
+            )
+            conn.execute("DELETE FROM agencies WHERE id=?", (str(agency_id),))
+
+            for user_id in affected_user_ids:
+                self._rebuild_user_agency_access(conn, user_id)
+                user_row = conn.execute("SELECT role FROM users WHERE id=?", (str(user_id),)).fetchone()
+                if user_row and user_row["role"] == "agency" and self._should_demote_agency_user(conn, user_id):
+                    conn.execute(
+                        "UPDATE users SET role='client', updated_at=? WHERE id=?",
+                        (now, str(user_id)),
+                    )
+
+            conn.commit()
 
     def upsert_member(self, agency_id: UUID, payload: AgencyMemberCreate) -> AgencyMemberOut:
         now = datetime.utcnow().isoformat()
@@ -724,6 +771,39 @@ class InMemoryPlatformAdminStore:
         rec = existing.model_copy(update={**patch, "updated_at": datetime.utcnow()})
         self.agencies[agency_id] = rec
         return rec
+
+    def delete_agency(self, agency_id: UUID) -> None:
+        self._agency_or_404(agency_id)
+        affected_user_ids = {m.user_id for m in self.members.values() if m.agency_id == agency_id}
+
+        for inv in [x for x in self.invites.values() if x.agency_id == agency_id]:
+            self.invites.pop(inv.id, None)
+        for key, invite_id in list(self.invite_token_hash_to_id.items()):
+            if invite_id not in self.invites:
+                self.invite_token_hash_to_id.pop(key, None)
+
+        for key, binding in list(self.clients.items()):
+            if binding.agency_id == agency_id:
+                self.clients.pop(key, None)
+        for key, member in list(self.members.items()):
+            if member.agency_id == agency_id:
+                self.members.pop(key, None)
+        self.agencies.pop(agency_id, None)
+
+        for user_id in affected_user_ids:
+            self._rebuild_user_agency_access(user_id)
+            user = self.auth_store.get_user(user_id)
+            if not user or user.role != "agency":
+                continue
+            still_active_member = any(
+                m.user_id == user_id
+                and m.status == "active"
+                and (self.agencies.get(m.agency_id) is not None)
+                and self.agencies[m.agency_id].status == "active"
+                for m in self.members.values()
+            )
+            if not still_active_member:
+                self.auth_store.patch_user(user_id, UserPatch(role="client"))
 
     def upsert_member(self, agency_id: UUID, payload: AgencyMemberCreate) -> AgencyMemberOut:
         self._agency_or_404(agency_id)

@@ -50,6 +50,7 @@ class AuthStore(Protocol):
     def find_user_by_email(self, email: str) -> Optional[UserOut]: ...
     def list_users(self) -> List[UserOut]: ...
     def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut: ...
+    def delete_user(self, user_id: UUID) -> None: ...
     def find_identity(self, provider: str, provider_user_id: str) -> Optional[AuthIdentityOut]: ...
     def link_identity(self, payload: AuthIdentityLink) -> AuthIdentityOut: ...
     def list_identities(self, user_id: Optional[UUID] = None) -> List[AuthIdentityOut]: ...
@@ -205,6 +206,32 @@ class SqliteAuthStore:
                 raise HTTPException(status_code=409, detail=f"User conflict: {exc}")
             updated = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
         return self._to_user(updated)
+
+    def delete_user(self, user_id: UUID) -> None:
+        with sqlite_conn(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+            if row["role"] == "admin":
+                other_admin = conn.execute(
+                    "SELECT id FROM users WHERE role='admin' AND status='active' AND id<>? LIMIT 1",
+                    (str(user_id),),
+                ).fetchone()
+                if not other_admin:
+                    raise HTTPException(status_code=409, detail="Cannot delete last active admin")
+
+            conn.execute("DELETE FROM agency_members WHERE user_id=?", (str(user_id),))
+            conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
+            conn.execute("DELETE FROM auth_identities WHERE user_id=?", (str(user_id),))
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (str(user_id),))
+            conn.execute("UPDATE agency_invites SET invited_by=NULL WHERE invited_by=?", (str(user_id),))
+            conn.execute("UPDATE agency_invites SET accepted_user_id=NULL WHERE accepted_user_id=?", (str(user_id),))
+            conn.execute("UPDATE client_invites SET invited_by=NULL WHERE invited_by=?", (str(user_id),))
+            conn.execute("UPDATE client_invites SET accepted_user_id=NULL WHERE accepted_user_id=?", (str(user_id),))
+            conn.execute("UPDATE integration_credentials SET created_by=NULL WHERE created_by=?", (str(user_id),))
+            conn.execute("UPDATE alerts SET acknowledged_by=NULL WHERE acknowledged_by=?", (str(user_id),))
+            conn.execute("DELETE FROM users WHERE id=?", (str(user_id),))
+            conn.commit()
 
     def set_password(self, user_id: UUID, password: str) -> None:
         now = datetime.utcnow().isoformat()
@@ -540,6 +567,30 @@ class InMemoryAuthStore:
         updated = existing.model_copy(update={**patch, "updated_at": datetime.utcnow()})
         self.users[user_id] = updated
         return updated
+
+    def delete_user(self, user_id: UUID) -> None:
+        existing = self.users.get(user_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="User not found")
+        if existing.role == "admin":
+            has_other_admin = any(
+                u.id != user_id and u.role == "admin" and u.status == "active"
+                for u in self.users.values()
+            )
+            if not has_other_admin:
+                raise HTTPException(status_code=409, detail="Cannot delete last active admin")
+
+        self.users.pop(user_id, None)
+        self.password_hashes.pop(user_id, None)
+        for key, value in list(self.identities.items()):
+            if value.user_id == user_id:
+                self.identities.pop(key, None)
+        for key, value in list(self.access.items()):
+            if value.user_id == user_id:
+                self.access.pop(key, None)
+        for key, session in list(self.sessions.items()):
+            if session.get("user_id") == user_id:
+                self.sessions.pop(key, None)
 
     def set_password(self, user_id: UUID, password: str) -> None:
         user = self.users.get(user_id)

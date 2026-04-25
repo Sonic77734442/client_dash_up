@@ -160,3 +160,47 @@ def test_invite_revoke_and_resend_flow():
     assert resent.status_code == 200
     assert resent.json()["invite"]["status"] == "pending"
     assert resent.json()["invite"]["id"] != invite_id
+
+
+def test_delete_agency_detaches_members_and_keeps_users():
+    reset_state()
+    admin = mk_user("admin4@lifecycle.local", "admin")
+    agency_user = mk_user("agency4@lifecycle.local", "agency")
+    admin_token = issue_token(admin["id"])
+    agency_token = issue_token(agency_user["id"])
+
+    tenant = mk_client("Tenant C", admin_token)
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Lifecycle Agency D", "status": "active", "plan": "starter"},
+        headers=auth_header(admin_token),
+    ).json()
+    client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": agency_user["id"], "role": "member", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    client.post(
+        f"/platform/agencies/{agency['id']}/clients",
+        json={"client_id": tenant["id"]},
+        headers=auth_header(admin_token),
+    )
+
+    allowed = client.get(f"/clients/{tenant['id']}", headers=auth_header(agency_token))
+    assert allowed.status_code == 200
+
+    deleted = client.delete(
+        f"/platform/agencies/{agency['id']}",
+        headers=auth_header(admin_token),
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+
+    denied = client.get(f"/clients/{tenant['id']}", headers=auth_header(agency_token))
+    assert denied.status_code == 403
+
+    users = client.get("/auth/internal/users", headers=auth_header(admin_token))
+    assert users.status_code == 200
+    detached = next((u for u in users.json()["items"] if u["id"] == agency_user["id"]), None)
+    assert detached is not None
+    assert detached["role"] == "client"

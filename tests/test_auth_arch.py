@@ -142,6 +142,21 @@ def test_user_client_access_assignment():
     assert listed2["items"][0]["role"] == "client"
 
 
+def test_delete_user_allows_email_recreate():
+    reset_state()
+    u = mk_user("recreate@example.com", role="agency")
+
+    deleted = client.delete(f"/auth/internal/users/{u['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+
+    recreated = client.post(
+        "/auth/internal/users",
+        json={"email": "recreate@example.com", "name": "Recreated", "role": "client", "status": "active"},
+    )
+    assert recreated.status_code == 200
+
+
 def test_auth_facade_resolve_or_create_and_identity_upsert():
     reset_state()
     # First resolve should create internal user + link identity + session

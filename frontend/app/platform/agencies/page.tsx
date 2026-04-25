@@ -195,6 +195,22 @@ export default function PlatformAgenciesPage() {
     }
   }
 
+  async function deleteAgency() {
+    if (!selectedAgency) return;
+    if (!window.confirm(`Delete agency ${selectedAgency.name}? Members will be detached, not deleted.`)) return;
+    try {
+      await req<{ status: string }>(`/platform/agencies/${selectedAgency.id}`, {
+        method: "DELETE",
+      });
+      await loadAgencies();
+      setMembers([]);
+      setInvites([]);
+      push("Agency deleted", "success");
+    } catch (err) {
+      push(err instanceof Error ? err.message : "Delete agency failed", "error");
+    }
+  }
+
   async function upsertMember() {
     if (!selectedAgency || !memberUserId) return;
     try {
@@ -419,6 +435,7 @@ export default function PlatformAgenciesPage() {
                 <div className="session-controls">
                   <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canActivate} onClick={() => void setAgencyStatus("active")}>Activate</button>
                   <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canSuspend} onClick={() => void setAgencyStatus("suspended")}>Suspend</button>
+                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true} onClick={() => void deleteAgency()}>Delete</button>
                 </div>
               </div>
 
