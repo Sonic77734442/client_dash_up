@@ -2,13 +2,13 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse } from "../lib/types";
+import { fetchJson } from "../lib/api";
 
 const LS_API_BASE = "ops_api_base";
 const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export function useAuth(defaultApiBase: string) {
-  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const [ready, setReady] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [role, setRole] = useState<"admin" | "agency" | "client" | null>(null);
@@ -16,23 +16,10 @@ export function useAuth(defaultApiBase: string) {
 
   const refresh = useCallback(async () => {
     const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
-    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
 
     try {
-      const headers: HeadersInit = {};
-      if (token) headers.Authorization = `Bearer ${token}`;
-      const res = await fetch(`${apiBase}/auth/me`, {
-        headers,
-        credentials: "include",
-      });
-      if (!res.ok) {
-        setAuthenticated(false);
-        setRole(null);
-        setMe(null);
-        setReady(true);
-        return;
-      }
-      const body = (await res.json()) as AuthMeResponse;
+      // Ask backend via cookie auth first; fetchJson retries with localStorage bearer token on 401.
+      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", "");
       setMe(body);
       setRole(body.session.role || null);
       setAuthenticated(Boolean(body.session.valid));
@@ -43,16 +30,13 @@ export function useAuth(defaultApiBase: string) {
       setMe(null);
       setReady(true);
     }
-  }, [defaultApiBase, tokenLoginEnabled]);
+  }, [defaultApiBase]);
 
   const logout = useCallback(async () => {
     const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
-    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
     try {
-      await fetch(`${apiBase}/auth/logout`, {
+      await fetchJson<{ status: string }>(apiBase, "/auth/logout", "", {
         method: "POST",
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        credentials: "include",
       });
     } catch {
       // noop
@@ -62,12 +46,9 @@ export function useAuth(defaultApiBase: string) {
     setAuthenticated(false);
     setRole(null);
     setMe(null);
-  }, [defaultApiBase, tokenLoginEnabled]);
+  }, [defaultApiBase]);
 
   useEffect(() => {
-    if (!tokenLoginEnabled) {
-      localStorage.removeItem(LS_SESSION_TOKEN);
-    }
     void refresh();
     const onStorage = () => void refresh();
     const onSessionUpdated = () => void refresh();
@@ -77,7 +58,7 @@ export function useAuth(defaultApiBase: string) {
       window.removeEventListener("storage", onStorage);
       window.removeEventListener(SESSION_UPDATED_EVENT, onSessionUpdated);
     };
-  }, [refresh, tokenLoginEnabled]);
+  }, [refresh]);
 
   return { ready, authenticated, role, me, refresh, logout };
 }
