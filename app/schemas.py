@@ -222,7 +222,7 @@ class AdAccountDiscoverRequest(BaseModel):
     )
     client_id: Optional[UUID] = Field(
         default=None,
-        description="Target internal client for imported ad accounts. Required when multiple clients are in scope.",
+        description="Optional target internal client for imported ad accounts. If omitted, discovery uses inbox fallback.",
     )
     upsert_existing: bool = Field(
         default=True,

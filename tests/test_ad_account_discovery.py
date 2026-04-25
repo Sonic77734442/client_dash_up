@@ -40,19 +40,25 @@ def mk_account(client_id: str, platform: str, external: str, name: str, status: 
     return res.json()
 
 
-def test_discover_requires_client_id_when_multiple_clients_available():
+def test_discover_uses_discovery_inbox_when_client_id_omitted_for_multiple_clients():
     reset_state()
-    mk_client("Acme")
-    mk_client("Nova")
+    c1 = mk_client("Acme")
+    c2 = mk_client("Nova")
 
     app.state.ad_account_discovery_service.discoverers = {
         "meta": lambda: [{"external_account_id": "m-1", "name": "Meta One", "currency": "USD"}]
     }
 
     res = client.post("/ad-accounts/discover", json={"provider": "meta"})
-    assert res.status_code == 400
+    assert res.status_code == 200
     body = res.json()
-    assert body["error"]["code"] == "client_id_required"
+    assert body["created"] == 1
+    assert body["client_id"] not in {c1["id"], c2["id"]}
+
+    inbox = client.get(f"/clients/{body['client_id']}")
+    assert inbox.status_code == 200
+    assert inbox.json()["name"] == "Discovery Inbox"
+    assert str(inbox.json().get("notes") or "").startswith("system:discovery_inbox:")
 
 
 def test_discover_uses_single_client_when_client_id_not_provided():

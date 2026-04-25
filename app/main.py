@@ -1453,14 +1453,35 @@ def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optio
         candidates = [cid for cid in ctx.accessible_client_ids if _client_store().get(cid) is not None]
     if len(candidates) == 1:
         return candidates[0]
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "code": "client_id_required",
-            "message": "client_id is required for discovery when multiple clients are available",
-            "details": {"client_count": len(candidates)},
-        },
+    inbox_scope = "global" if ctx.global_access else (
+        "agency:" + ",".join(sorted(str(x) for x in _agency_scope_ids_for_user(ctx.user_id)))
+        if ctx.role == "agency" and ctx.user_id
+        else "tenant"
     )
+    inbox_marker = f"system:discovery_inbox:{inbox_scope}"
+    for row in _client_store().list(status="all"):
+        if (row.notes or "").strip() != inbox_marker:
+            continue
+        if row.status != "active":
+            row = _client_store().patch(row.id, ClientPatch(status="active"))
+        return row.id
+
+    created = _client_store().create(
+        ClientCreate(
+            name="Discovery Inbox",
+            status="active",
+            default_currency="USD",
+            notes=inbox_marker,
+        )
+    )
+    if ctx.role == "agency" and ctx.user_id:
+        for agency_id in _agency_scope_ids_for_user(ctx.user_id):
+            try:
+                _platform_admin_store().assign_client(agency_id, AgencyClientAccessCreate(client_id=created.id))
+            except Exception:
+                # Best effort binding for agency scoped discovery. Discovery still proceeds for created inbox.
+                continue
+    return created.id
 
 
 def _infer_single_tenant_client(ctx: RequestContext) -> Optional[UUID]:

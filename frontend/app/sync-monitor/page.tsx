@@ -313,13 +313,10 @@ export default function SyncMonitorPage() {
       push("Discovery is available only for agency/admin users", "info");
       return;
     }
-    if (!discoverClientId) {
-      push("Select client for imported accounts", "info");
-      return;
-    }
     try {
       setSyncLoading(true);
-      const payload: Record<string, unknown> = { client_id: discoverClientId, upsert_existing: true };
+      const payload: Record<string, unknown> = { upsert_existing: true };
+      if (discoverClientId) payload.client_id = discoverClientId;
       if (providerName) payload.provider = providerName;
       const res = await req<AdAccountDiscoverResponse>("/ad-accounts/discover", {
         method: "POST",
@@ -434,9 +431,9 @@ export default function SyncMonitorPage() {
                 <select
                   value={discoverClientId}
                   onChange={(e) => setDiscoverClientId(e.target.value)}
-                  title="Target client for imported accounts"
+                  title="Optional target client for imported accounts"
                 >
-                  <option value="">Select client</option>
+                  <option value="">Auto (Discovery Inbox)</option>
                   {clients.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
