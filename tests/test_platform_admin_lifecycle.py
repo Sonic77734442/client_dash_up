@@ -299,3 +299,47 @@ def test_agency_owner_can_manage_invites_but_member_cannot():
     )
     assert revoked.status_code == 200
     assert revoked.json()["status"] == "revoked"
+
+
+def test_resend_accepted_invite_creates_new_pending_invite():
+    reset_state()
+    admin = mk_user("admin7@lifecycle.local", "admin")
+    owner_user = mk_user("owner3@lifecycle.local", "agency")
+    admin_token = issue_token(admin["id"])
+    owner_token = issue_token(owner_user["id"])
+
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Lifecycle Agency G", "status": "active", "plan": "starter"},
+        headers=auth_header(admin_token),
+    ).json()
+    client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": owner_user["id"], "role": "owner", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+
+    issued = client.post(
+        f"/platform/agencies/{agency['id']}/invites",
+        json={"email": "accepted@agency.local", "member_role": "member", "expires_in_days": 7},
+        headers=auth_header(owner_token),
+    )
+    assert issued.status_code == 200
+    invite_id = issued.json()["invite"]["id"]
+    token = issued.json()["invite_token"]
+
+    accepted = client.post(
+        "/auth/invites/accept",
+        json={"token": token, "name": "Accepted User", "password": "acceptedPwd123"},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["invite"]["status"] == "accepted"
+
+    resent = client.post(
+        f"/platform/agencies/{agency['id']}/invites/{invite_id}/resend",
+        json={"expires_in_days": 7},
+        headers=auth_header(owner_token),
+    )
+    assert resent.status_code == 200
+    assert resent.json()["invite"]["status"] == "pending"
+    assert resent.json()["invite"]["id"] != invite_id

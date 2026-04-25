@@ -513,8 +513,6 @@ class SqlitePlatformAdminStore:
             ).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Invite not found")
-            if row["status"] == "accepted":
-                raise HTTPException(status_code=409, detail="Accepted invite cannot be resent")
             if row["status"] == "pending":
                 conn.execute(
                     "UPDATE agency_invites SET status='revoked', updated_at=? WHERE id=?",
@@ -928,8 +926,6 @@ class InMemoryPlatformAdminStore:
         invite = self.invites.get(invite_id)
         if not invite or invite.agency_id != agency_id:
             raise HTTPException(status_code=404, detail="Invite not found")
-        if invite.status == "accepted":
-            raise HTTPException(status_code=409, detail="Accepted invite cannot be resent")
         if invite.status == "pending":
             self.invites[invite_id] = invite.model_copy(update={"status": "revoked", "updated_at": datetime.utcnow()})
         return self.issue_invite(

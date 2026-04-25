@@ -12,7 +12,6 @@ type SessionState = {
 };
 
 export function useSession(defaultApiBase: string) {
-  const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const [session, setSession] = useState<SessionState>({
     apiBase: defaultApiBase,
     token: "",
@@ -21,13 +20,12 @@ export function useSession(defaultApiBase: string) {
 
   useEffect(() => {
     const apiBase = localStorage.getItem(LS_API_BASE) || defaultApiBase;
-    const token = tokenLoginEnabled ? (localStorage.getItem(LS_SESSION_TOKEN) || "") : "";
-    if (!tokenLoginEnabled) {
-      localStorage.removeItem(LS_SESSION_TOKEN);
-    }
+    // Keep token even when token-login UI is hidden:
+    // cross-domain cookie auth may be blocked and Bearer fallback is required.
+    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
     setSession({ apiBase, token });
     setReady(true);
-  }, [defaultApiBase, tokenLoginEnabled]);
+  }, [defaultApiBase]);
 
   const persist = useCallback((next: SessionState) => {
     localStorage.setItem(LS_API_BASE, next.apiBase);
