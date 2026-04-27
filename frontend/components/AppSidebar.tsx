@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { useSessionContext } from "../hooks/useSessionContext";
+import { useLocale } from "../hooks/useLocale";
+import { t } from "../lib/i18n";
 
 type SidebarSection =
   | "dashboard"
@@ -38,6 +40,7 @@ export function AppSidebar({
   className?: string;
 }) {
   const { context } = useSessionContext();
+  const { locale } = useLocale();
   const showPlatformAdmin = Boolean(context?.valid) && context?.role === "admin";
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -72,20 +75,20 @@ export function AppSidebar({
       <div className="brand">Editorial Rigor</div>
       <div className="panel-subtitle">{subtitle}</div>
       <nav className="menu">
-        <Link className={itemClass("dashboard", active)} href="/">Dashboard</Link>
-        <Link className={itemClass("accounts", active)} href="/accounts">Accounts</Link>
-        <Link className={itemClass("traffic", active)} href="/traffic">Traffic</Link>
-        <Link className={itemClass("integrations", active)} href="/integrations">Integrations</Link>
-        <Link className={itemClass("sync_monitor", active)} href="/sync-monitor">Sync Monitor</Link>
-        <Link className={itemClass("budgets", active)} href="/budgets">Budgets</Link>
-        <Link className={itemClass("clients", active)} href="/clients">Clients</Link>
-        {showPlatformAdmin ? <Link className={itemClass("platform_admin", active)} href="/platform/users">Platform Admin</Link> : null}
+        <Link className={itemClass("dashboard", active)} href="/">{t(locale, "tab_dashboard", "Dashboard")}</Link>
+        <Link className={itemClass("accounts", active)} href="/accounts">{t(locale, "tab_accounts", "Accounts")}</Link>
+        <Link className={itemClass("traffic", active)} href="/traffic">{t(locale, "tab_traffic", "Traffic")}</Link>
+        <Link className={itemClass("integrations", active)} href="/integrations">{t(locale, "tab_integrations", "Integrations")}</Link>
+        <Link className={itemClass("sync_monitor", active)} href="/sync-monitor">{t(locale, "tab_sync_monitor", "Sync Monitor")}</Link>
+        <Link className={itemClass("budgets", active)} href="/budgets">{t(locale, "tab_budgets", "Budgets")}</Link>
+        <Link className={itemClass("clients", active)} href="/clients">{t(locale, "tab_clients", "Clients")}</Link>
+        {showPlatformAdmin ? <Link className={itemClass("platform_admin", active)} href="/platform/users">{t(locale, "tab_platform_admin", "Platform Admin")}</Link> : null}
       </nav>
       <div className="sidebar-footer">
-        <a className="menu-item" href="#">Documentation</a>
-        <a className="menu-item" href="#">Support</a>
+        <a className="menu-item" href="#">{t(locale, "sidebar_docs", "Documentation")}</a>
+        <a className="menu-item" href="#">{t(locale, "sidebar_support", "Support")}</a>
         <button className="menu-item" onClick={() => void handleLogout()} style={{ textAlign: "left" }}>
-          Log Out
+          {t(locale, "sidebar_logout", "Log Out")}
         </button>
       </div>
     </aside>
