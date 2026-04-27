@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { useLocale } from "../../hooks/useLocale";
+import { Locale } from "../../lib/i18n";
 
 const LS_API_BASE = "ops_api_base";
 const LS_SESSION_TOKEN = "ops_session_token";
@@ -21,6 +23,7 @@ export default function LoginPage() {
   const [invitePassword, setInvitePassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const { locale, setLocale } = useLocale();
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
 
@@ -134,6 +137,18 @@ export default function LoginPage() {
     <main className="login-shell">
       <section className="login-card">
         <h1>Sign In</h1>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
+          <select
+            className="locale-switch"
+            value={locale}
+            onChange={(e) => setLocale(e.target.value as Locale)}
+            aria-label="Language"
+            title="Language"
+          >
+            <option value="en">EN</option>
+            <option value="ru">RU</option>
+          </select>
+        </div>
         <p className="panel-subtitle">Sign in using your connected provider.</p>
 
         {tokenLoginEnabled ? (
