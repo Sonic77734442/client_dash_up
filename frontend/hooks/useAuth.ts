@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse } from "../lib/types";
 import { fetchJson } from "../lib/api";
+import { resolveApiBase } from "../lib/apiBase";
 
-const LS_API_BASE = "ops_api_base";
 const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
@@ -15,7 +15,7 @@ export function useAuth(defaultApiBase: string) {
   const [me, setMe] = useState<AuthMeResponse | null>(null);
 
   const refresh = useCallback(async () => {
-    const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
+    const apiBase = resolveApiBase(defaultApiBase);
 
     try {
       // Ask backend via cookie auth first; fetchJson retries with localStorage bearer token on 401.
@@ -33,7 +33,7 @@ export function useAuth(defaultApiBase: string) {
   }, [defaultApiBase]);
 
   const logout = useCallback(async () => {
-    const apiBase = (localStorage.getItem(LS_API_BASE) || defaultApiBase).replace(/\/$/, "");
+    const apiBase = resolveApiBase(defaultApiBase);
     try {
       await fetchJson<{ status: string }>(apiBase, "/auth/logout", "", {
         method: "POST",

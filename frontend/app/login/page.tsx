@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
 import { Locale } from "../../lib/i18n";
+import { normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
 
 const LS_API_BASE = "ops_api_base";
 const LS_SESSION_TOKEN = "ops_session_token";
@@ -15,7 +16,7 @@ export default function LoginPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
-  const [apiBase, setApiBase] = useState(defaultApiBase);
+  const [apiBase, setApiBase] = useState(normalizeApiBase(defaultApiBase, "http://localhost:8000"));
   const [token, setToken] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -28,12 +29,12 @@ export default function LoginPage() {
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
 
   useEffect(() => {
-    const base = localStorage.getItem(LS_API_BASE) || defaultApiBase;
+    const base = resolveApiBase(defaultApiBase);
     setApiBase(base);
   }, [defaultApiBase]);
 
   async function signInWithToken() {
-    const base = apiBase.trim().replace(/\/$/, "");
+    const base = normalizeApiBase(apiBase, defaultApiBase);
     const t = token.trim();
     if (!base || !t) {
       setError("API base and session token are required");
@@ -62,7 +63,7 @@ export default function LoginPage() {
   }
 
   async function acceptInvite() {
-    const base = apiBase.trim().replace(/\/$/, "");
+    const base = normalizeApiBase(apiBase, defaultApiBase);
     if (!base || !inviteToken) {
       setError("Invite token is missing");
       return;
@@ -102,7 +103,7 @@ export default function LoginPage() {
   }
 
   async function signInWithPassword() {
-    const base = apiBase.trim().replace(/\/$/, "");
+    const base = normalizeApiBase(apiBase, defaultApiBase);
     const em = email.trim().toLowerCase();
     if (!base || !em || password.length < 8) {
       setError("Email and password (min 8 chars) are required");
@@ -217,7 +218,7 @@ export default function LoginPage() {
           <button
             className="ghost-btn"
             onClick={() => {
-              const base = apiBase.trim().replace(/\/$/, "");
+              const base = normalizeApiBase(apiBase, defaultApiBase);
               localStorage.setItem(LS_API_BASE, base);
               localStorage.removeItem(LS_SESSION_TOKEN);
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
@@ -229,7 +230,7 @@ export default function LoginPage() {
           <button
             className="ghost-btn"
             onClick={() => {
-              const base = apiBase.trim().replace(/\/$/, "");
+              const base = normalizeApiBase(apiBase, defaultApiBase);
               localStorage.setItem(LS_API_BASE, base);
               localStorage.removeItem(LS_SESSION_TOKEN);
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));

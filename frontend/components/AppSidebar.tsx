@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useSessionContext } from "../hooks/useSessionContext";
 import { useLocale } from "../hooks/useLocale";
 import { t } from "../lib/i18n";
+import { resolveApiBase } from "../lib/apiBase";
 
 type SidebarSection =
   | "dashboard"
@@ -47,7 +48,7 @@ export function AppSidebar({
 
   async function handleLogout() {
     try {
-      const apiBase = (localStorage.getItem("ops_api_base") || defaultApiBase).replace(/\/$/, "");
+      const apiBase = resolveApiBase(defaultApiBase);
       const token = tokenLoginEnabled ? (localStorage.getItem("ops_session_token") || "") : "";
       const headers: HeadersInit = {};
       if (token) headers.Authorization = `Bearer ${token}`;

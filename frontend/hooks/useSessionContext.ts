@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse, SessionContext } from "../lib/types";
 import { fetchJson } from "../lib/api";
+import { resolveApiBase } from "../lib/apiBase";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
@@ -13,8 +14,8 @@ export function useSessionContext() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const apiBase = localStorage.getItem("ops_api_base") || process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-      const body = await fetchJson<AuthMeResponse>(apiBase.replace(/\/$/, ""), "/auth/me", "");
+      const apiBase = resolveApiBase(process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000");
+      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", "");
       setContext(body.session || null);
     } catch {
       setContext(null);
