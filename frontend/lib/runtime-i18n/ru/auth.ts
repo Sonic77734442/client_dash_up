@@ -1,0 +1,21 @@
+export const ruAuthMap: Record<string, string> = {
+  "Sign In": "Вход",
+  "Sign in using your connected provider.": "Войдите через подключенный способ авторизации.",
+  "Internal token login": "Вход по внутреннему токену",
+  "API base": "API адрес",
+  "Session token": "Токен сессии",
+  "Sign In with Password": "Войти по паролю",
+  "Email and password": "Email и пароль",
+  "Email": "Email",
+  "Password": "Пароль",
+  "At least 8 characters": "Минимум 8 символов",
+  "Agency invite": "Инвайт агентства",
+  "Your name (optional)": "Ваше имя (необязательно)",
+  "Set password": "Задайте пароль",
+  "Accept Invite": "Принять инвайт",
+  "Accepting...": "Принимаем...",
+  "OAuth providers": "OAuth провайдеры",
+  "Continue with Facebook": "Продолжить через Facebook",
+  "Continue with Google": "Продолжить через Google",
+};
+
