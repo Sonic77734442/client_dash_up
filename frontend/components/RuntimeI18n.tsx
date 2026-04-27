@@ -2,16 +2,53 @@
 
 import { useEffect } from "react";
 import { useLocale } from "../hooks/useLocale";
-import { runtimeRuMap, runtimeRuToEnMap } from "../lib/runtime-i18n";
+import {
+  runtimeRuMap,
+  runtimeRuToEnMap,
+  runtimeRuToEnWordMap,
+  runtimeRuWordMap,
+} from "../lib/runtime-i18n";
 
 const ATTRS = ["placeholder", "title", "aria-label"] as const;
+
+const runtimeRuWordMapLower: Record<string, string> = Object.fromEntries(
+  Object.entries(runtimeRuWordMap).map(([en, ru]) => [en.toLowerCase(), ru]),
+);
+const runtimeRuToEnWordMapLower: Record<string, string> = Object.fromEntries(
+  Object.entries(runtimeRuToEnWordMap).map(([ru, en]) => [ru.toLowerCase(), en]),
+);
+
+function applyCase(source: string, translated: string): string {
+  if (!source) return translated;
+  const hasLetters = /[A-Za-z\u0400-\u04FF]/.test(source);
+  if (!hasLetters) return translated;
+  const isUpper = source === source.toUpperCase() && source !== source.toLowerCase();
+  if (isUpper) return translated.toUpperCase();
+  const isCapitalized = source[0] === source[0].toUpperCase() && source.slice(1) === source.slice(1).toLowerCase();
+  if (isCapitalized) return translated.charAt(0).toUpperCase() + translated.slice(1);
+  return translated;
+}
+
+function translateToken(token: string, ru: boolean): string {
+  const direct = ru ? runtimeRuWordMap[token] : runtimeRuToEnWordMap[token];
+  if (direct) return direct;
+  const lower = token.toLowerCase();
+  const fallback = ru ? runtimeRuWordMapLower[lower] : runtimeRuToEnWordMapLower[lower];
+  if (!fallback) return token;
+  return applyCase(token, fallback);
+}
 
 function translateValue(value: string, ru: boolean): string {
   const trimmed = value.trim();
   if (!trimmed) return value;
-  const translated = ru
+  const exact = ru
     ? (runtimeRuMap[trimmed] || trimmed)
     : (runtimeRuToEnMap[trimmed] || trimmed);
+  let translated = exact;
+  if (translated === trimmed) {
+    translated = trimmed.replace(/\p{L}[\p{L}\p{N}_]*/gu, (token) => translateToken(token, ru));
+    if (!translated) translated = trimmed;
+  }
   if (translated === trimmed) return value;
   const leading = value.match(/^\s*/)?.[0] || "";
   const trailing = value.match(/\s*$/)?.[0] || "";
@@ -75,4 +112,3 @@ export function RuntimeI18n() {
 
   return null;
 }
-
