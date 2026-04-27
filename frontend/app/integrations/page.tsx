@@ -30,6 +30,17 @@ function statusClass(status: IntegrationProvider["status"]) {
   return "bad";
 }
 
+function authStateLabel(state?: string | null) {
+  const s = String(state || "").trim().toLowerCase();
+  if (!s) return "--";
+  if (s === "connected" || s === "authorized" || s === "valid") return "connected";
+  if (s === "expired") return "expired";
+  if (s === "revoked") return "revoked";
+  if (s === "invalid") return "invalid";
+  if (s === "missing") return "missing";
+  return state || "--";
+}
+
 export default function IntegrationsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -223,7 +234,7 @@ export default function IntegrationsPage() {
                   <div className="panel" style={{ marginTop: 10 }}>
                     <div className="kpi-title">Auth Status</div>
                     <div className="detail-grid">
-                      <div className="detail-item"><div className="detail-k">Auth State</div><div className="detail-v">{selected.auth_state}</div></div>
+                      <div className="detail-item"><div className="detail-k">Auth State</div><div className="detail-v">{authStateLabel(selected.auth_state)}</div></div>
                       <div className="detail-item"><div className="detail-k">Sync Ready</div><div className="detail-v">{selected.sync_ready ? "Yes" : "No"}</div></div>
                       <div className="detail-item"><div className="detail-k">Identity Linked Users</div><div className="detail-v">{selected.identity_linked_users}</div></div>
                       <div className="detail-item"><div className="detail-k">Last Success</div><div className="detail-v">{fmtDate(selected.last_successful_sync_at)}</div></div>

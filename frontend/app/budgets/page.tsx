@@ -84,7 +84,7 @@ function statusClass(pace: BudgetRow["pace"]) {
 }
 
 function paceLabel(pace: BudgetRow["pace"]) {
-  if (pace === "overspending") return "OVESPENDING";
+  if (pace === "overspending") return "OVERSPENDING";
   if (pace === "underspending") return "UNDERSPENDING";
   if (pace === "on_track") return "ON TRACK";
   return "NO SIGNAL";

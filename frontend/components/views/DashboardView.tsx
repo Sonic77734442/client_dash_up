@@ -210,7 +210,8 @@ export function DashboardView({
             <tbody>
               {riskRows.map((r) => {
                 const rec = r.cpc > 3 ? { label: "Cap -10%", cls: "cap" } : r.ctr < 0.03 ? { label: "Pause", cls: "pause" } : { label: "Scale +10%", cls: "scale" };
-                const pace = r.cpc > 3 ? "critical_overspend" : r.ctr < 0.03 ? "warning_pace" : "efficient_scale";
+                const pace = r.cpc > 3 ? "critical_overspend" : r.ctr < 0.03 ? "warning_pace" : "effective_scale";
+                const paceLabel = r.cpc > 3 ? "critical overspend" : r.ctr < 0.03 ? "overspending" : "effective scale";
                 return (
                   <tr key={r.account_id}>
                     <td>
@@ -220,7 +221,7 @@ export function DashboardView({
                     <td>{fmtMoney(Number(r.spend || 0) / Math.max(1, periodDays))}</td>
                     <td>
                       <span className={`badge ${paceClass(pace.includes("critical") ? "overspending" : pace.includes("warning") ? "underspending" : "on_track")}`}>
-                        {pace.replaceAll("_", " ")}
+                        {paceLabel}
                       </span>
                     </td>
                     <td>

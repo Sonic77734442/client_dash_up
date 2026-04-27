@@ -46,7 +46,8 @@ function translateValue(value: string, ru: boolean): string {
     : (runtimeRuToEnMap[trimmed] || trimmed);
   let translated = exact;
   if (translated === trimmed) {
-    translated = trimmed.replace(/\p{L}[\p{L}\p{N}_]*/gu, (token) => translateToken(token, ru));
+    const normalized = trimmed.replaceAll("_", " ");
+    translated = normalized.replace(/\p{L}[\p{L}\p{N}]*/gu, (token) => translateToken(token, ru));
     if (!translated) translated = trimmed;
   }
   if (translated === trimmed) return value;

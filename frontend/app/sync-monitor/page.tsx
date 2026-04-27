@@ -38,6 +38,24 @@ function syncStateClass(state: AdAccountSyncDiagnostic["sync_state"]) {
   return "bad";
 }
 
+function syncStateLabel(state: AdAccountSyncDiagnostic["sync_state"]) {
+  if (state === "healthy") return "excellent";
+  if (state === "retry_scheduled") return "retry scheduled";
+  if (state === "never_synced") return "never synced";
+  return "error";
+}
+
+function authStateLabel(state?: string | null) {
+  const s = String(state || "").trim().toLowerCase();
+  if (!s) return "--";
+  if (s === "connected" || s === "authorized" || s === "valid") return "connected";
+  if (s === "expired") return "expired";
+  if (s === "revoked") return "revoked";
+  if (s === "invalid") return "invalid";
+  if (s === "missing") return "missing";
+  return state || "--";
+}
+
 function providerLabel(v: string) {
   const p = (v || "").toLowerCase();
   if (p === "meta" || p === "facebook") return "Meta";
@@ -513,7 +531,7 @@ export default function SyncMonitorPage() {
                 <div className="kpi-value">{diagnostics?.summary.total_accounts || 0}</div>
               </article>
               <article className="kpi-card good">
-                <div className="kpi-title">Healthy</div>
+                <div className="kpi-title">Excellent</div>
                 <div className="kpi-value">{diagnostics?.summary.healthy || 0}</div>
               </article>
               <article className="kpi-card bad">
@@ -549,7 +567,7 @@ export default function SyncMonitorPage() {
                       <td>{providerLabel(d.platform)}</td>
                       <td>{d.account_name}</td>
                       <td>{d.client_name || clientMap.get(d.client_id) || "--"}</td>
-                      <td><span className={`badge ${syncStateClass(d.sync_state)}`}>{d.sync_state}</span></td>
+                      <td><span className={`badge ${syncStateClass(d.sync_state)}`}>{syncStateLabel(d.sync_state)}</span></td>
                       <td>{d.diagnostic_message}</td>
                       <td>{d.action_hint}</td>
                       <td>{fmtDate(d.last_sync_at)}</td>
@@ -693,7 +711,7 @@ export default function SyncMonitorPage() {
                         <div className="detail-grid" style={{ marginTop: 8 }}>
                           <div className="detail-item"><div className="detail-k">Provider</div><div className="detail-v">{providerLabel(selectedProviderState.provider)}</div></div>
                           <div className="detail-item"><div className="detail-k">Sync Ready</div><div className="detail-v">{selectedProviderState.sync_ready ? "Yes" : "No"}</div></div>
-                          <div className="detail-item"><div className="detail-k">Auth State</div><div className="detail-v">{selectedProviderState.auth_state}</div></div>
+                          <div className="detail-item"><div className="detail-k">Auth State</div><div className="detail-v">{authStateLabel(selectedProviderState.auth_state)}</div></div>
                           <div className="detail-item"><div className="detail-k">Linked Users</div><div className="detail-v">{selectedProviderState.identity_linked_users}</div></div>
                         </div>
                         <div className="muted-note" style={{ marginTop: 8 }}>
@@ -706,7 +724,7 @@ export default function SyncMonitorPage() {
                     ) : null}
                     {selectedDiagnostic && selectedDiagnostic.sync_state !== "healthy" ? (
                       <div className="alert-card high" style={{ marginTop: 10 }}>
-                        <div className="alert-priority high">{selectedDiagnostic.sync_state.toUpperCase()}</div>
+                        <div className="alert-priority high">{syncStateLabel(selectedDiagnostic.sync_state).toUpperCase()}</div>
                         <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>{selectedDiagnostic.diagnostic_message}</div>
                         <div className="muted-note" style={{ marginTop: 8 }}>{selectedDiagnostic.action_hint}</div>
                         <div className="muted-note" style={{ marginTop: 8 }}>
