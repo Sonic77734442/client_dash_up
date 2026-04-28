@@ -161,7 +161,7 @@ class SyncRunResult:
 
 
 class AdAccountSyncService:
-    DEFAULT_INITIAL_LOOKBACK_DAYS = 30
+    DEFAULT_INITIAL_LOOKBACK_DAYS = 180
 
     def __init__(
         self,
@@ -324,15 +324,21 @@ class AdAccountSyncService:
         explicit_from: Optional[date],
         explicit_to: date,
     ) -> tuple[str, str]:
+        meta = account.metadata or {}
+        backfill_completed_at = self._parse_last_sync_date(meta.get("history_backfill_completed_at"))
         if explicit_from:
             from_date = explicit_from
         else:
-            last_sync = self._parse_last_sync_date(getattr(account, "last_sync_at", None))
-            if not last_sync:
-                last_sync = self._parse_last_sync_date((account.metadata or {}).get("last_sync_at"))
-            if last_sync:
-                from_date = last_sync
+            if backfill_completed_at:
+                last_sync = self._parse_last_sync_date(getattr(account, "last_sync_at", None))
+                if not last_sync:
+                    last_sync = self._parse_last_sync_date(meta.get("last_sync_at"))
+                if last_sync:
+                    from_date = last_sync
+                else:
+                    from_date = explicit_to - timedelta(days=self.initial_lookback_days - 1)
             else:
+                # One-time historical backfill for account, then incremental mode.
                 from_date = explicit_to - timedelta(days=self.initial_lookback_days - 1)
         if from_date > explicit_to:
             from_date = explicit_to
@@ -526,6 +532,9 @@ class AdAccountSyncService:
             if status == "success":
                 if used_credential_id:
                     next_meta["integration_credential_id"] = used_credential_id
+                if not next_meta.get("history_backfill_completed_at"):
+                    next_meta["history_backfill_completed_at"] = f_at.isoformat()
+                    next_meta["history_backfill_window_days"] = self.initial_lookback_days
             self.account_store.patch(account.id, AdAccountPatch(metadata=next_meta))
 
             if status == "success":

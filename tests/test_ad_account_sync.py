@@ -187,7 +187,7 @@ def test_sync_error_classification_for_google_manager_metrics_error():
     assert retryable is False
 
 
-def test_sync_auto_date_range_uses_last_sync_or_default_lookback():
+def test_sync_auto_date_range_uses_one_time_backfill_before_incremental_mode():
     reset_state()
     c = mk_client("Auto Range")
     fresh = mk_account(c["id"], "meta", "meta-fresh")
@@ -214,9 +214,10 @@ def test_sync_auto_date_range_uses_last_sync_or_default_lookback():
     assert run.status_code == 200
 
     by_external = {external_id: (date_from, date_to) for (external_id, date_from, date_to) in seen}
-    assert by_external["meta-existing"] == ("2026-04-10", "2026-04-20")
-    # 30-day inclusive window when account has never been synced.
-    assert by_external["meta-fresh"] == ("2026-03-22", "2026-04-20")
+    expected_fresh_from = "2025-10-23"
+    # Without history_backfill_completed_at marker, both accounts run one-time backfill.
+    assert by_external["meta-existing"] == (expected_fresh_from, "2026-04-20")
+    assert by_external["meta-fresh"] == (expected_fresh_from, "2026-04-20")
 
 
 def test_sync_rounds_money_fields_before_ingest():
