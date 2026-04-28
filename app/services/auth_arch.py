@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import secrets
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -26,6 +26,13 @@ from app.schemas import (
     UserPatch,
     UserOut,
 )
+
+
+def _utcnow() -> datetime:
+    now_fn = getattr(datetime, "now", None)
+    if callable(now_fn):
+        return now_fn(timezone.utc).replace(tzinfo=None)
+    return datetime.utcnow()
 
 
 ROLE_ACCESS_MODEL = {
@@ -151,7 +158,7 @@ class SqliteAuthStore:
         )
 
     def create_user(self, payload: UserCreate) -> UserOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         user_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             try:
@@ -191,7 +198,7 @@ class SqliteAuthStore:
                 raise HTTPException(status_code=404, detail="User not found")
             if not patch:
                 return self._to_user(row)
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             email = patch.get("email", row["email"])
             name = patch.get("name", row["name"])
             role = patch.get("role", row["role"])
@@ -234,7 +241,7 @@ class SqliteAuthStore:
             conn.commit()
 
     def set_password(self, user_id: UUID, password: str) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute("SELECT id FROM users WHERE id=?", (str(user_id),)).fetchone()
             if not row:
@@ -273,7 +280,7 @@ class SqliteAuthStore:
         if not self.get_user(payload.user_id):
             raise HTTPException(status_code=400, detail="user_id does not exist")
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         identity_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             existing = conn.execute(
@@ -339,7 +346,7 @@ class SqliteAuthStore:
         if not self.get_user(payload.user_id):
             raise HTTPException(status_code=400, detail="user_id does not exist")
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         access_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             client_exists = conn.execute("SELECT id FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
@@ -383,7 +390,7 @@ class SqliteAuthStore:
         if not user or user.status != "active":
             raise HTTPException(status_code=400, detail="cannot issue session for inactive/missing user")
 
-        now = datetime.utcnow()
+        now = _utcnow()
         expires_at = now + timedelta(minutes=payload.ttl_minutes)
         token = secrets.token_urlsafe(36)
         session_id = str(uuid4())
@@ -412,7 +419,7 @@ class SqliteAuthStore:
         )
 
     def validate_session(self, token: str) -> SessionValidationResponse:
-        now = datetime.utcnow()
+        now = _utcnow()
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE token_hash=?",
@@ -443,7 +450,7 @@ class SqliteAuthStore:
             )
 
     def revoke_session(self, token: str) -> Dict[str, object]:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute("SELECT id FROM sessions WHERE token_hash=?", (_token_hash(token),)).fetchone()
             if not row:
@@ -456,7 +463,7 @@ class SqliteAuthStore:
         current = self.validate_session(token)
         if not current.valid or not current.session_id:
             return current
-        now = datetime.utcnow()
+        now = _utcnow()
         new_exp = now + timedelta(minutes=ttl_minutes)
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
@@ -474,7 +481,7 @@ class SqliteAuthStore:
         )
 
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM auth_provider_configs WHERE provider=?", (payload.provider,)).fetchone()
             if existing:
@@ -534,7 +541,7 @@ class InMemoryAuthStore:
         self.provider_cfg: Dict[str, AuthProviderConfigOut] = {}
 
     def create_user(self, payload: UserCreate) -> UserOut:
-        now = datetime.utcnow()
+        now = _utcnow()
         if payload.email and any(u.email == payload.email for u in self.users.values()):
             raise HTTPException(status_code=409, detail="User conflict: duplicate email")
         rec = UserOut(id=uuid4(), email=payload.email, name=payload.name, role=payload.role, status=payload.status, created_at=now, updated_at=now)
@@ -564,7 +571,7 @@ class InMemoryAuthStore:
                 if uid != user_id and (u.email or "").lower() == new_email:
                     raise HTTPException(status_code=409, detail="User conflict: duplicate email")
             patch["email"] = new_email
-        updated = existing.model_copy(update={**patch, "updated_at": datetime.utcnow()})
+        updated = existing.model_copy(update={**patch, "updated_at": _utcnow()})
         self.users[user_id] = updated
         return updated
 
@@ -597,7 +604,7 @@ class InMemoryAuthStore:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         self.password_hashes[user_id] = _password_hash(password)
-        self.users[user_id] = user.model_copy(update={"updated_at": datetime.utcnow()})
+        self.users[user_id] = user.model_copy(update={"updated_at": _utcnow()})
 
     def authenticate_password(self, email: str, password: str) -> Optional[UserOut]:
         norm_email = (email or "").strip().lower()
@@ -619,7 +626,7 @@ class InMemoryAuthStore:
             raise HTTPException(status_code=400, detail="user_id does not exist")
         key = f"{payload.provider}:{payload.provider_user_id}"
         existing = self.identities.get(key)
-        now = datetime.utcnow()
+        now = _utcnow()
         if existing and existing.user_id != payload.user_id:
             raise HTTPException(status_code=409, detail="provider identity already linked to another internal user")
         if existing:
@@ -650,7 +657,7 @@ class InMemoryAuthStore:
         if payload.user_id not in self.users:
             raise HTTPException(status_code=400, detail="user_id does not exist")
         key = f"{payload.user_id}:{payload.client_id}"
-        now = datetime.utcnow()
+        now = _utcnow()
         existing = self.access.get(key)
         if existing:
             rec = existing.model_copy(update={"role": payload.role, "updated_at": now})
@@ -670,7 +677,7 @@ class InMemoryAuthStore:
         user = self.users.get(payload.user_id)
         if not user or user.status != "active":
             raise HTTPException(status_code=400, detail="cannot issue session for inactive/missing user")
-        now = datetime.utcnow()
+        now = _utcnow()
         exp = now + timedelta(minutes=payload.ttl_minutes)
         token = secrets.token_urlsafe(36)
         sid = uuid4()
@@ -683,7 +690,7 @@ class InMemoryAuthStore:
         return SessionIssueResponse(token=token, session_id=sid, user_id=payload.user_id, expires_at=exp)
 
     def validate_session(self, token: str) -> SessionValidationResponse:
-        now = datetime.utcnow()
+        now = _utcnow()
         s = self.sessions.get(_token_hash(token))
         if not s:
             return SessionValidationResponse(valid=False, reason="not_found")
@@ -707,7 +714,7 @@ class InMemoryAuthStore:
         current = self.validate_session(token)
         if not current.valid or not current.session_id:
             return current
-        now = datetime.utcnow()
+        now = _utcnow()
         new_exp = now + timedelta(minutes=ttl_minutes)
         key = _token_hash(token)
         if key in self.sessions:
@@ -722,7 +729,7 @@ class InMemoryAuthStore:
         )
 
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut:
-        now = datetime.utcnow()
+        now = _utcnow()
         existing = self.provider_cfg.get(payload.provider)
         if existing:
             rec = existing.model_copy(update={"client_id": payload.client_id, "client_secret": payload.client_secret, "redirect_uri": payload.redirect_uri, "enabled": payload.enabled, "updated_at": now})
@@ -742,3 +749,4 @@ class InMemoryAuthStore:
 
     def list_provider_configs(self) -> List[AuthProviderConfigOut]:
         return [self.provider_cfg[k] for k in sorted(self.provider_cfg.keys())]
+

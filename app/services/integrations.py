@@ -1,7 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Dict, List, Optional
 from uuid import UUID
 
@@ -275,7 +279,9 @@ def build_integrations_overview(
         "warning_connections": warning,
         "critical_issues": error + disconnected,
         "active_nodes": len(accounts),
-        "total_errors_24h": len([e for e in events if e.level == "error" and (datetime.utcnow() - e.occurred_at).total_seconds() <= 86400]),
+        "total_errors_24h": len([e for e in events if e.level == "error" and (_utcnow() - e.occurred_at).total_seconds() <= 86400]),
     }
 
     return IntegrationsOverviewResponse(summary=summary, providers=provider_rows, events=events)
+
+

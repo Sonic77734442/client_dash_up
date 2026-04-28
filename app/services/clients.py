@@ -1,6 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -38,7 +42,7 @@ class SqliteClientStore:
         )
 
     def create(self, payload: ClientCreate) -> ClientOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         client_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
@@ -83,7 +87,7 @@ class SqliteClientStore:
         if not patch:
             return existing
         data = {**existing.model_dump(), **patch}
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
                 """
@@ -110,7 +114,7 @@ class SqliteClientStore:
         existing = self.get(client_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Client not found")
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute("UPDATE clients SET status='archived', updated_at=? WHERE id=?", (now, str(client_id)))
             conn.commit()
@@ -123,7 +127,7 @@ class InMemoryClientStore:
         self.items = {}
 
     def create(self, payload: ClientCreate) -> ClientOut:
-        now = datetime.utcnow()
+        now = _utcnow()
         rec = ClientOut(
             id=uuid4(),
             name=payload.name,
@@ -156,7 +160,7 @@ class InMemoryClientStore:
         update = payload.model_dump(exclude_unset=True)
         if not update:
             return existing
-        rec = existing.model_copy(update={**update, "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={**update, "updated_at": _utcnow()})
         self.items[client_id] = rec
         return rec
 
@@ -164,6 +168,8 @@ class InMemoryClientStore:
         existing = self.get(client_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Client not found")
-        rec = existing.model_copy(update={"status": "archived", "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={"status": "archived", "updated_at": _utcnow()})
         self.items[client_id] = rec
         return rec
+
+

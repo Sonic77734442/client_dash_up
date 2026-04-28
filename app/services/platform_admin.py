@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 import hashlib
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
@@ -141,7 +145,7 @@ class SqlitePlatformAdminStore:
         return row
 
     def _sync_user_access_for_agency_client(self, conn, agency_id: UUID, client_id: UUID) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         member_rows = conn.execute(
             """
             SELECT m.user_id
@@ -166,7 +170,7 @@ class SqlitePlatformAdminStore:
             )
 
     def _sync_user_access_for_new_member(self, conn, agency_id: UUID, user_id: UUID) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         client_rows = conn.execute(
             "SELECT client_id FROM agency_client_access WHERE agency_id=?",
             (str(agency_id),),
@@ -184,7 +188,7 @@ class SqlitePlatformAdminStore:
             )
 
     def _rebuild_user_agency_access(self, conn, user_id: UUID) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         conn.execute(
             "DELETE FROM user_client_access WHERE user_id=? AND role='agency'",
             (str(user_id),),
@@ -216,7 +220,7 @@ class SqlitePlatformAdminStore:
             )
 
     def create_agency(self, payload: AgencyCreate) -> AgencyOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         agency_id = str(uuid4())
         slug = _slugify(payload.slug or payload.name)
         with sqlite_conn(self.db_path) as conn:
@@ -252,7 +256,7 @@ class SqlitePlatformAdminStore:
             existing = self._agency_or_404(conn, agency_id)
             if not patch:
                 return self._to_agency(existing)
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             data = {
                 "name": patch.get("name", existing["name"]),
                 "slug": _slugify(patch.get("slug", existing["slug"])),
@@ -299,7 +303,7 @@ class SqlitePlatformAdminStore:
         return row is None
 
     def delete_agency(self, agency_id: UUID) -> None:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             member_rows = conn.execute(
@@ -329,7 +333,7 @@ class SqlitePlatformAdminStore:
             conn.commit()
 
     def upsert_member(self, agency_id: UUID, payload: AgencyMemberCreate) -> AgencyMemberOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             user = conn.execute("SELECT * FROM users WHERE id=?", (str(payload.user_id),)).fetchone()
@@ -381,7 +385,7 @@ class SqlitePlatformAdminStore:
         return [self._to_member(r) for r in rows]
 
     def assign_client(self, agency_id: UUID, payload: AgencyClientAccessCreate) -> AgencyClientAccessOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             client = conn.execute("SELECT id FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
@@ -422,7 +426,7 @@ class SqlitePlatformAdminStore:
     def issue_invite(
         self, agency_id: UUID, payload: AgencyInviteCreate, *, invited_by: Optional[UUID], frontend_base_url: str
     ) -> AgencyInviteIssueResponse:
-        now = datetime.utcnow()
+        now = _utcnow()
         expires_at = now + timedelta(days=payload.expires_in_days)
         invite_id = str(uuid4())
         token = secrets.token_urlsafe(32)
@@ -477,7 +481,7 @@ class SqlitePlatformAdminStore:
         return [self._to_invite(r) for r in rows]
 
     def revoke_invite(self, agency_id: UUID, invite_id: UUID) -> AgencyInviteOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
@@ -516,7 +520,7 @@ class SqlitePlatformAdminStore:
             if row["status"] == "pending":
                 conn.execute(
                     "UPDATE agency_invites SET status='revoked', updated_at=? WHERE id=?",
-                    (datetime.utcnow().isoformat(), str(invite_id)),
+                    (_utcnow().isoformat(), str(invite_id)),
                 )
                 conn.commit()
         return self.issue_invite(
@@ -531,7 +535,7 @@ class SqlitePlatformAdminStore:
         )
 
     def deactivate_member(self, agency_id: UUID, member_id: UUID) -> AgencyMemberOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
@@ -582,7 +586,7 @@ class SqlitePlatformAdminStore:
             conn.commit()
 
     def accept_invite(self, payload: AgencyInviteAcceptRequest, *, session_ttl_minutes: int) -> AgencyInviteAcceptResponse:
-        now = datetime.utcnow()
+        now = _utcnow()
         password = (payload.password or "").strip()
         token_hash = _token_hash(payload.token.strip())
         if len(password) < 8:
@@ -722,7 +726,7 @@ class InMemoryPlatformAdminStore:
                     )
 
     def create_agency(self, payload: AgencyCreate) -> AgencyOut:
-        now = datetime.utcnow()
+        now = _utcnow()
         slug = _slugify(payload.slug or payload.name)
         if any(a.slug == slug for a in self.agencies.values()):
             raise HTTPException(status_code=409, detail="Agency conflict: duplicate slug")
@@ -766,7 +770,7 @@ class InMemoryPlatformAdminStore:
             for agency in self.agencies.values():
                 if agency.id != agency_id and agency.slug == patch["slug"]:
                     raise HTTPException(status_code=409, detail="Agency conflict: duplicate slug")
-        rec = existing.model_copy(update={**patch, "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={**patch, "updated_at": _utcnow()})
         self.agencies[agency_id] = rec
         return rec
 
@@ -812,7 +816,7 @@ class InMemoryPlatformAdminStore:
             raise HTTPException(status_code=400, detail="agency members must have role agency or admin")
 
         key = f"{agency_id}:{payload.user_id}"
-        now = datetime.utcnow()
+        now = _utcnow()
         existing = self.members.get(key)
         if existing:
             rec = existing.model_copy(update={"role": payload.role, "status": payload.status, "updated_at": now})
@@ -843,7 +847,7 @@ class InMemoryPlatformAdminStore:
     def assign_client(self, agency_id: UUID, payload: AgencyClientAccessCreate) -> AgencyClientAccessOut:
         self._agency_or_404(agency_id)
         key = f"{agency_id}:{payload.client_id}"
-        now = datetime.utcnow()
+        now = _utcnow()
         existing = self.clients.get(key)
         if existing:
             rec = existing.model_copy(update={"updated_at": now})
@@ -869,7 +873,7 @@ class InMemoryPlatformAdminStore:
         self, agency_id: UUID, payload: AgencyInviteCreate, *, invited_by: Optional[UUID], frontend_base_url: str
     ) -> AgencyInviteIssueResponse:
         self._agency_or_404(agency_id)
-        now = datetime.utcnow()
+        now = _utcnow()
         email = payload.email.strip().lower()
         for invite in list(self.invites.values()):
             if invite.agency_id == agency_id and invite.email.lower() == email and invite.status == "pending":
@@ -909,7 +913,7 @@ class InMemoryPlatformAdminStore:
             raise HTTPException(status_code=404, detail="Invite not found")
         if invite.status in {"accepted", "expired"}:
             raise HTTPException(status_code=409, detail="Invite cannot be revoked in current status")
-        updated = invite.model_copy(update={"status": "revoked", "updated_at": datetime.utcnow()})
+        updated = invite.model_copy(update={"status": "revoked", "updated_at": _utcnow()})
         self.invites[invite_id] = updated
         return updated
 
@@ -927,7 +931,7 @@ class InMemoryPlatformAdminStore:
         if not invite or invite.agency_id != agency_id:
             raise HTTPException(status_code=404, detail="Invite not found")
         if invite.status == "pending":
-            self.invites[invite_id] = invite.model_copy(update={"status": "revoked", "updated_at": datetime.utcnow()})
+            self.invites[invite_id] = invite.model_copy(update={"status": "revoked", "updated_at": _utcnow()})
         return self.issue_invite(
             agency_id,
             AgencyInviteCreate(email=invite.email, member_role=invite.member_role, expires_in_days=payload.expires_in_days),
@@ -940,7 +944,7 @@ class InMemoryPlatformAdminStore:
         target = next((m for m in self.members.values() if m.id == member_id and m.agency_id == agency_id), None)
         if not target:
             raise HTTPException(status_code=404, detail="Member not found")
-        updated = target.model_copy(update={"status": "inactive", "updated_at": datetime.utcnow()})
+        updated = target.model_copy(update={"status": "inactive", "updated_at": _utcnow()})
         self.members[f"{agency_id}:{target.user_id}"] = updated
         self._rebuild_user_agency_access(target.user_id)
         return updated
@@ -964,7 +968,7 @@ class InMemoryPlatformAdminStore:
                 self._rebuild_user_agency_access(member.user_id)
 
     def accept_invite(self, payload: AgencyInviteAcceptRequest, *, session_ttl_minutes: int) -> AgencyInviteAcceptResponse:
-        now = datetime.utcnow()
+        now = _utcnow()
         password = (payload.password or "").strip()
         if len(password) < 8:
             password = f"{secrets.token_urlsafe(18)}Aa1"
@@ -1020,3 +1024,4 @@ class InMemoryPlatformAdminStore:
             user=user,
             session=session,
         )
+

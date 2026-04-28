@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
@@ -276,7 +280,7 @@ class SqliteBudgetStore:
         _validate_period(payload.start_date, payload.end_date)
         _validate_scope(payload.scope, payload.account_id)
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         budget_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -409,7 +413,7 @@ class SqliteBudgetStore:
         if candidate_normalized == existing_normalized:
             return existing
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         new_version = int(existing.version) + 1
         with sqlite_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -486,7 +490,7 @@ class SqliteBudgetStore:
         if not existing:
             raise HTTPException(status_code=404, detail="Budget not found")
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
                 "UPDATE budgets SET status='archived', updated_at=? WHERE id=?",
@@ -512,7 +516,7 @@ class SqliteBudgetStore:
         if transfer_amount > source_amount:
             raise HTTPException(status_code=400, detail="Transfer amount exceeds source budget amount")
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             source_row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(source_budget_id),)).fetchone()
@@ -859,7 +863,7 @@ class InMemoryBudgetStore:
             status="active",
         )
 
-        now = datetime.utcnow()
+        now = _utcnow()
         rec = BudgetOut(
             id=uuid4(),
             client_id=payload.client_id,
@@ -974,7 +978,7 @@ class InMemoryBudgetStore:
                 **update,
                 "amount": candidate_normalized["amount"],
                 "version": existing.version + 1,
-                "updated_at": datetime.utcnow(),
+                "updated_at": _utcnow(),
             }
         )
         self.items[budget_id] = rec
@@ -982,7 +986,7 @@ class InMemoryBudgetStore:
         hist = BudgetHistoryOut(
             id=len(self.hist.get(budget_id, [])) + 1,
             budget_id=budget_id,
-            changed_at=datetime.utcnow(),
+            changed_at=_utcnow(),
             changed_by=changed_by,
             previous_values=existing.model_dump(mode="json"),
             new_values=rec.model_dump(mode="json"),
@@ -994,7 +998,7 @@ class InMemoryBudgetStore:
         existing = self.get(budget_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Budget not found")
-        rec = existing.model_copy(update={"status": "archived", "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={"status": "archived", "updated_at": _utcnow()})
         self.items[budget_id] = rec
         return rec
 
@@ -1014,7 +1018,7 @@ class InMemoryBudgetStore:
         if transfer_amount > source_amount:
             raise HTTPException(status_code=400, detail="Transfer amount exceeds source budget amount")
 
-        now = datetime.utcnow()
+        now = _utcnow()
         source_next = source.model_copy(
             update={
                 "amount": _q_money(source_amount - transfer_amount),
@@ -1230,3 +1234,4 @@ def calculate_financial_metrics(
 
 def utc_today_date() -> date:
     return datetime.now(timezone.utc).date()
+

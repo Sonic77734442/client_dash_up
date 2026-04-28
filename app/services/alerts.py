@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -69,7 +73,7 @@ class SqliteAlertStore:
         )
 
     def raise_alert(self, signal: AlertSignal) -> AlertOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE fingerprint=?", (signal.fingerprint,)).fetchone()
             if existing:
@@ -137,7 +141,7 @@ class SqliteAlertStore:
             return self._to_out(row)
 
     def resolve_by_fingerprint(self, fingerprint: str) -> Optional[AlertOut]:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE fingerprint=?", (fingerprint,)).fetchone()
             if not existing:
@@ -153,7 +157,7 @@ class SqliteAlertStore:
             return self._to_out(row)
 
     def acknowledge(self, alert_id: UUID, *, by_user_id: Optional[UUID]) -> AlertOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE id=?", (str(alert_id),)).fetchone()
             if not existing:
@@ -209,7 +213,7 @@ class InMemoryAlertStore:
         self.index: Dict[str, UUID] = {}
 
     def raise_alert(self, signal: AlertSignal) -> AlertOut:
-        now = datetime.utcnow()
+        now = _utcnow()
         existing_id = self.index.get(signal.fingerprint)
         if existing_id and existing_id in self.items:
             row = self.items[existing_id]
@@ -265,7 +269,7 @@ class InMemoryAlertStore:
             return None
         if row.status == "resolved":
             return row
-        updated = row.model_copy(update={"status": "resolved", "resolved_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()})
+        updated = row.model_copy(update={"status": "resolved", "resolved_at": _utcnow(), "last_seen_at": _utcnow()})
         self.items[alert_id] = updated
         return updated
 
@@ -274,7 +278,7 @@ class InMemoryAlertStore:
         if not row:
             raise HTTPException(status_code=404, detail="Alert not found")
         updated = row.model_copy(
-            update={"status": "acked", "acknowledged_at": datetime.utcnow(), "acknowledged_by": by_user_id, "last_seen_at": datetime.utcnow()}
+            update={"status": "acked", "acknowledged_at": _utcnow(), "acknowledged_by": by_user_id, "last_seen_at": _utcnow()}
         )
         self.items[alert_id] = updated
         return updated
@@ -303,3 +307,5 @@ class InMemoryAlertStore:
 
     def get(self, alert_id: UUID) -> Optional[AlertOut]:
         return self.items.get(alert_id)
+
+

@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Dict, Optional, Protocol
 from urllib.parse import urlencode
 
@@ -58,7 +62,7 @@ class SqliteOAuthStateStore:
         init_sqlite(db_path)
 
     def create_state(self, provider: str, next_path: str, nonce: str, ttl_minutes: int = 10) -> OAuthState:
-        now = datetime.utcnow()
+        now = _utcnow()
         state = secrets.token_urlsafe(32)
         expires_at = now + timedelta(minutes=ttl_minutes)
         with sqlite_conn(self.db_path) as conn:
@@ -73,7 +77,7 @@ class SqliteOAuthStateStore:
         return OAuthState(state=state, provider=provider, next_path=next_path, nonce=nonce, expires_at=expires_at)
 
     def consume_state(self, provider: str, state: str, nonce: str) -> OAuthState:
-        now = datetime.utcnow()
+        now = _utcnow()
         with sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM oauth_states WHERE state=? AND provider=?",
@@ -114,7 +118,7 @@ class InMemoryOAuthStateStore:
             provider=provider,
             next_path=next_path,
             nonce=nonce,
-            expires_at=datetime.utcnow() + timedelta(minutes=ttl_minutes),
+            expires_at=_utcnow() + timedelta(minutes=ttl_minutes),
         )
         self.items[state] = rec
         return rec
@@ -127,7 +131,7 @@ class InMemoryOAuthStateStore:
             raise HTTPException(status_code=400, detail="OAuth nonce mismatch")
         if state in self.used:
             raise HTTPException(status_code=400, detail="OAuth state already used")
-        if rec.expires_at <= datetime.utcnow():
+        if rec.expires_at <= _utcnow():
             raise HTTPException(status_code=400, detail="OAuth state expired")
         self.used.add(state)
         return rec
@@ -255,3 +259,4 @@ class GoogleOAuthAdapter:
                 "token_type": token_json.get("token_type"),
             },
         )
+

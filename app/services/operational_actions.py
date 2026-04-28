@@ -1,7 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -45,7 +49,7 @@ class SqliteOperationalActionStore:
 
     def create(self, payload: OperationalActionExecuteRequest, *, created_by: Optional[UUID] = None) -> OperationalActionOut:
         rec_id = str(uuid4())
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
                 """
@@ -118,7 +122,7 @@ class InMemoryOperationalActionStore:
             account_id=payload.account_id,
             status="queued",
             created_by=created_by,
-            created_at=datetime.utcnow(),
+            created_at=_utcnow(),
         )
         self.items.insert(0, rec)
         return rec
@@ -141,3 +145,5 @@ class InMemoryOperationalActionStore:
         if status:
             rows = [x for x in rows if x.status == status]
         return rows
+
+

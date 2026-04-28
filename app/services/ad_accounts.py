@@ -1,7 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -65,7 +69,7 @@ class SqliteAdAccountStore:
 
     def create(self, payload: AdAccountCreate) -> AdAccountOut:
         self._assert_client_exists(payload.client_id)
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         account_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
             try:
@@ -128,7 +132,7 @@ class SqliteAdAccountStore:
         if data.get("client_id"):
             self._assert_client_exists(data["client_id"])
 
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             try:
                 conn.execute(
@@ -160,7 +164,7 @@ class SqliteAdAccountStore:
         existing = self.get(account_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Ad account not found")
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute("UPDATE ad_accounts SET status='archived', updated_at=? WHERE id=?", (now, str(account_id)))
             conn.commit()
@@ -229,7 +233,7 @@ class InMemoryAdAccountStore:
     def create(self, payload: AdAccountCreate) -> AdAccountOut:
         self._assert_client_exists(payload.client_id)
         self._assert_unique(payload.client_id, payload.platform, payload.external_account_id)
-        now = datetime.utcnow()
+        now = _utcnow()
         rec = AdAccountOut(
             id=uuid4(),
             client_id=payload.client_id,
@@ -271,7 +275,7 @@ class InMemoryAdAccountStore:
         self._assert_client_exists(merged["client_id"])
         self._assert_unique(merged["client_id"], merged["platform"], merged["external_account_id"], exclude=account_id)
         sync_fields = self._sync_fields_from_metadata(merged.get("metadata"))
-        rec = existing.model_copy(update={**patch, **sync_fields, "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={**patch, **sync_fields, "updated_at": _utcnow()})
         self.items[account_id] = rec
         return rec
 
@@ -279,6 +283,8 @@ class InMemoryAdAccountStore:
         existing = self.get(account_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Ad account not found")
-        rec = existing.model_copy(update={"status": "archived", "updated_at": datetime.utcnow()})
+        rec = existing.model_copy(update={"status": "archived", "updated_at": _utcnow()})
         self.items[account_id] = rec
         return rec
+
+

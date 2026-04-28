@@ -129,7 +129,7 @@ def get_settings() -> Settings:
         request_log_enabled=_bool_from_env("REQUEST_LOG_ENABLED", True),
         metrics_enabled=_bool_from_env("METRICS_ENABLED", True),
         observability_public=_bool_from_env("OBSERVABILITY_PUBLIC", not is_prod),
-        enable_test_endpoints=_bool_from_env("ENABLE_TEST_ENDPOINTS", False),
+        enable_test_endpoints=_bool_from_env("ENABLE_TEST_ENDPOINTS", app_env.lower() == "test"),
         api_docs_enabled=_bool_from_env("API_DOCS_ENABLED", not is_prod),
         operational_insights_rules=_operational_insights_rules_from_env(),
     )

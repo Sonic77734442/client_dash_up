@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
@@ -82,7 +86,7 @@ class SqliteAdStatsStore:
     def ingest(self, payload: AdStatsIngestRequest, *, idempotency_key: Optional[str] = None) -> Dict[str, object]:
         inserted = 0
         updated = 0
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         request_hash = self._payload_hash(payload)
         with sqlite_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -360,7 +364,7 @@ class InMemoryAdStatsStore:
             if not self.ad_account_store.get(row.ad_account_id):
                 raise HTTPException(status_code=400, detail=f"ad_account_id not found: {row.ad_account_id}")
             key = f"{row.ad_account_id}:{row.date.isoformat()}:{row.platform}"
-            now = datetime.utcnow()
+            now = _utcnow()
             if key in self.items:
                 prev = self.items[key]
                 self.items[key] = prev.model_copy(
@@ -517,3 +521,4 @@ class InMemoryAdStatsStore:
             "per_client": [_pack(by_client[k]) for k in sorted(by_client.keys())],
             "per_account": [_pack(by_account[k]) for k in sorted(by_account.keys())],
         }
+

@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import secrets
 import threading
 import time
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
@@ -14,6 +14,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.responses import Response
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 from app.schemas import (
     AdAccountCreate,
@@ -533,7 +538,7 @@ async def auth_security_middleware(request: Request, call_next):
             _runtime_metrics().record(method=method, path=route_path, status_code=resp.status_code, duration_seconds=duration)
         if settings.request_log_enabled:
             log_line = {
-                "ts": datetime.utcnow().isoformat(),
+                "ts": _utcnow().isoformat(),
                 "request_id": request_id,
                 "method": method,
                 "path": route_path,
@@ -1059,7 +1064,7 @@ def _issue_client_invite(
     expires_in_days: int,
     invited_by: Optional[UUID],
 ) -> ClientInviteIssueResponse:
-    now = datetime.utcnow()
+    now = _utcnow()
     expires_at = now + timedelta(days=max(1, int(expires_in_days)))
     invite_id = str(uuid4())
     token = secrets.token_urlsafe(32)
@@ -1106,7 +1111,7 @@ def _issue_client_invite(
 
 
 def _list_client_invites(*, client_id: UUID, status: str = "all") -> List[ClientInviteOut]:
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = _utcnow().isoformat()
     with sqlite_conn(settings.budgets_db_path) as conn:
         conn.execute(
             """
@@ -1130,7 +1135,7 @@ def _list_client_invites(*, client_id: UUID, status: str = "all") -> List[Client
 
 
 def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOut:
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = _utcnow().isoformat()
     with sqlite_conn(settings.budgets_db_path) as conn:
         row = conn.execute(
             "SELECT * FROM client_invites WHERE id=? AND client_id=?",
@@ -1150,7 +1155,7 @@ def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOu
 
 
 def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcceptResponse:
-    now = datetime.utcnow()
+    now = _utcnow()
     token_hash = _invite_token_hash(payload.token.strip())
     with sqlite_conn(settings.budgets_db_path) as conn:
         row = conn.execute(
@@ -1516,7 +1521,7 @@ def health(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> di
 
 @app.get("/healthz")
 def healthz() -> dict:
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": _utcnow().isoformat()}
 
 
 @app.get("/readyz")
@@ -1840,7 +1845,7 @@ def auth_password_login(payload: AuthPasswordLoginRequest):
         raise HTTPException(status_code=500, detail="Session context failed")
     body = AuthMeResponse(user=user, session=session_ctx)
     response = JSONResponse(content=body.model_dump(mode="json"))
-    max_age = max(60, int((issued.expires_at - datetime.utcnow()).total_seconds()))
+    max_age = max(60, int((issued.expires_at - _utcnow()).total_seconds()))
     response.set_cookie(
         key=settings.auth_cookie_name,
         value=issued.token,
@@ -1915,7 +1920,7 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
         }
     )
     if refreshed.expires_at:
-        max_age = max(60, int((refreshed.expires_at - datetime.utcnow()).total_seconds()))
+        max_age = max(60, int((refreshed.expires_at - _utcnow()).total_seconds()))
         response.set_cookie(
             key=settings.auth_cookie_name,
             value=token,
@@ -2061,7 +2066,7 @@ def auth_oauth_callback(
     redirect_url = f"{base}/login/success?next={next_encoded}#token={token_fragment}"
     response = RedirectResponse(url=redirect_url, status_code=302)
     max_age = (
-        max(60, int((resolved.session.expires_at - datetime.utcnow()).total_seconds()))
+        max(60, int((resolved.session.expires_at - _utcnow()).total_seconds()))
         if resolved.session and resolved.session.expires_at
         else 86400
     )
@@ -2481,7 +2486,7 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
             raise
         accepted = _accept_client_invite(payload)
     response = JSONResponse(content=accepted.model_dump(mode="json"))
-    max_age = max(60, int((accepted.session.expires_at - datetime.utcnow()).total_seconds()))
+    max_age = max(60, int((accepted.session.expires_at - _utcnow()).total_seconds()))
     response.set_cookie(
         key=settings.auth_cookie_name,
         value=accepted.session.token,
@@ -2881,7 +2886,7 @@ def ad_account_sync_diagnostics(
 
     latest = _ad_account_sync_service().latest_by_account_ids([x.id for x in rows])
     client_names = {c.id: c.name for c in _client_store().list(status="all")}
-    now = datetime.utcnow()
+    now = _utcnow()
     items: List[AdAccountSyncDiagnosticOut] = []
 
     for account in rows:
@@ -3480,3 +3485,4 @@ def tiktok_insights(date_from: str, date_to: str, account_id: Optional[str] = No
     if not date_from or not date_to:
         raise HTTPException(status_code=400, detail="date_from and date_to are required")
     return get_tiktok_insights(load_accounts(settings), date_from, date_to, account_id)
+

@@ -1,7 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Any, Dict, List, Optional, Protocol
 from uuid import UUID
 
@@ -62,7 +66,7 @@ class SqliteAuditLogStore:
         tenant_client_id: Optional[UUID] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> AuditLogOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         body = payload or {}
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
@@ -139,7 +143,7 @@ class InMemoryAuditLogStore:
             actor_role=actor_role,
             tenant_client_id=tenant_client_id,
             payload=dict(payload or {}),
-            created_at=datetime.utcnow(),
+            created_at=_utcnow(),
         )
         self._next_id += 1
         self.items.insert(0, row)
@@ -161,3 +165,5 @@ class InMemoryAuditLogStore:
         if tenant_client_id:
             rows = [x for x in rows if x.tenant_client_id == tenant_client_id]
         return rows[: max(1, min(limit, 500))]
+
+

@@ -1,10 +1,14 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Callable, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
@@ -376,7 +380,7 @@ class AdAccountSyncService:
         user_id: Optional[UUID] = None,
         force: bool = False,
     ) -> SyncRunResult:
-        started_at = datetime.utcnow()
+        started_at = _utcnow()
         sync_to = date_to or started_at.date()
 
         accounts = self.account_store.list(status="all")
@@ -394,7 +398,7 @@ class AdAccountSyncService:
         latest = self.job_store.latest_by_account_ids([a.id for a in accounts])
 
         for account in accounts:
-            s_at = datetime.utcnow()
+            s_at = _utcnow()
             provider = str(account.platform or "").lower().strip()
             from_str, to_str = self._resolve_date_range_for_account(
                 account=account,
@@ -486,7 +490,7 @@ class AdAccountSyncService:
                     error_code, error_category, retryable = self._classify_error(exc)
                     next_retry_at = self._next_retry_at(now=s_at, attempt=attempt) if retryable else None
 
-            f_at = datetime.utcnow()
+            f_at = _utcnow()
             job = self.job_store.create(
                 AdAccountSyncJobOut(
                     id=uuid4(),
@@ -531,7 +535,7 @@ class AdAccountSyncService:
                 if retryable and next_retry_at:
                     retry_scheduled += 1
 
-        finished_at = datetime.utcnow()
+        finished_at = _utcnow()
         return SyncRunResult(
             requested=len(account_ids) if account_ids is not None else len(accounts),
             processed=len(jobs),
@@ -549,3 +553,4 @@ class AdAccountSyncService:
 
     def latest_by_account_ids(self, account_ids: List[UUID]) -> Dict[UUID, AdAccountSyncJobOut]:
         return self.job_store.latest_by_account_ids(account_ids)
+

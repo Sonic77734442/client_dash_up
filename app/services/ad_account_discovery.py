@@ -1,8 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Callable, Dict, List, Optional, Protocol
 from uuid import UUID
 
@@ -162,7 +166,7 @@ class AdAccountDiscoveryService:
             ): a
             for a in self.account_store.list(client_id=client_id, status="all")
         }
-        now_iso = datetime.utcnow().isoformat()
+        now_iso = _utcnow().isoformat()
 
         created = 0
         updated = 0
@@ -353,3 +357,5 @@ class AdAccountDiscoveryService:
             providers_failed=result.providers_failed,
             items=result.items,
         )
+
+

@@ -1,7 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 from typing import Any, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -67,7 +71,7 @@ class SqliteIntegrationCredentialStore:
         )
 
     def upsert(self, payload: IntegrationCredentialCreate) -> IntegrationCredentialOut:
-        now = datetime.utcnow().isoformat()
+        now = _utcnow().isoformat()
         cred_id = str(uuid4())
         provider = _normalize_provider(payload.provider)
         scope_id = str(payload.scope_id) if payload.scope_id else None
@@ -170,7 +174,7 @@ class SqliteIntegrationCredentialStore:
                 raise HTTPException(status_code=404, detail="Integration credential not found")
             if not patch:
                 return self._to_out(existing)
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             data = {
                 "provider": _normalize_provider(patch.get("provider", existing["provider"])),
                 "scope_type": patch.get("scope_type", existing["scope_type"]),
@@ -216,7 +220,7 @@ class SqliteIntegrationCredentialStore:
             row = conn.execute("SELECT * FROM integration_credentials WHERE id=?", (str(credential_id),)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Integration credential not found")
-            now = datetime.utcnow().isoformat()
+            now = _utcnow().isoformat()
             conn.execute(
                 "UPDATE integration_credentials SET status='archived', updated_at=? WHERE id=?",
                 (now, str(credential_id)),
@@ -346,11 +350,11 @@ class InMemoryIntegrationCredentialStore:
                     status="active",
                     created_by=payload.created_by or row.created_by,
                     created_at=row.created_at,
-                    updated_at=datetime.utcnow(),
+                    updated_at=_utcnow(),
                 )
                 self.items[row.id] = updated
                 return updated
-        now = datetime.utcnow()
+        now = _utcnow()
         created = IntegrationCredentialOut(
             id=uuid4(),
             provider=provider,
@@ -404,7 +408,7 @@ class InMemoryIntegrationCredentialStore:
             status=patch.get("status", existing.status),
             created_by=patch.get("created_by", existing.created_by),
             created_at=existing.created_at,
-            updated_at=datetime.utcnow(),
+            updated_at=_utcnow(),
         )
         self.items[credential_id] = updated
         return updated
@@ -438,3 +442,5 @@ class InMemoryIntegrationCredentialStore:
         global_rows = [x for x in rows if x.scope_type == "global"]
         global_rows.sort(key=lambda x: x.updated_at, reverse=True)
         return [*client_rows, *agency_rows, *global_rows]
+
+
