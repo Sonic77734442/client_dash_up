@@ -7,6 +7,17 @@ from fastapi import HTTPException
 
 
 API_VERSION = "v20.0"
+DEFAULT_CONVERSION_ACTION_TYPES = {
+    "purchase",
+    "lead",
+    "complete_registration",
+    "subscribe",
+    "start_trial",
+    "submit_application",
+    "contact",
+    "add_payment_info",
+    "initiate_checkout",
+}
 
 
 def _fallback_accounts() -> List[Dict[str, object]]:
@@ -37,6 +48,43 @@ def _extract_account_row(row: Dict[str, object], source: str) -> Dict[str, objec
         "currency": str(row.get("currency") or "USD"),
         "source": source,
     }
+
+
+def _conversion_action_types() -> set[str]:
+    raw = str(os.getenv("META_CONVERSION_ACTION_TYPES", "") or "").strip()
+    if not raw:
+        return set(DEFAULT_CONVERSION_ACTION_TYPES)
+    parsed = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    return parsed or set(DEFAULT_CONVERSION_ACTION_TYPES)
+
+
+def _sum_actions_conversions(actions: object) -> Optional[float]:
+    if not isinstance(actions, list):
+        return None
+    wanted = _conversion_action_types()
+    total = 0.0
+    matched = False
+    for item in actions:
+        if not isinstance(item, dict):
+            continue
+        action_type = str(item.get("action_type") or "").strip().lower()
+        if not action_type:
+            continue
+        base_type = action_type.split(".")[-1]
+        normalized = base_type
+        if normalized.startswith("fb_pixel_"):
+            normalized = normalized[len("fb_pixel_") :]
+        if action_type not in wanted and base_type not in wanted and normalized not in wanted:
+            continue
+        try:
+            value = float(str(item.get("value") or 0))
+        except Exception:
+            value = 0.0
+        total += value
+        matched = True
+    if not matched:
+        return None
+    return total
 
 
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
@@ -119,14 +167,22 @@ def fetch_insights(
     params = {
         "access_token": token,
         "level": "campaign",
-        "fields": "campaign_id,campaign_name,account_id,account_currency,spend,ctr,cpc,cpm,reach,impressions,clicks",
+        "fields": "campaign_id,campaign_name,account_id,account_currency,spend,ctr,cpc,cpm,reach,impressions,clicks,actions",
         "time_range": json.dumps({"since": date_from, "until": date_to}),
     }
     resp = httpx.get(url, params=params, timeout=20)
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
     payload = resp.json()
-    return payload.get("data", [])
+    rows = payload.get("data", [])
+    if not isinstance(rows, list):
+        return []
+    for row in rows:
+        if isinstance(row, dict):
+            conversions = _sum_actions_conversions(row.get("actions"))
+            if conversions is not None:
+                row["conversions"] = conversions
+    return rows
 
 
 def fetch_daily(
@@ -143,7 +199,7 @@ def fetch_daily(
     params = {
         "access_token": token,
         "level": "account",
-        "fields": "spend,impressions,clicks",
+        "fields": "spend,impressions,clicks,actions",
         "time_increment": 1,
         "time_range": json.dumps({"since": date_from, "until": date_to}),
     }
@@ -151,4 +207,12 @@ def fetch_daily(
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
     payload = resp.json()
-    return payload.get("data", [])
+    rows = payload.get("data", [])
+    if not isinstance(rows, list):
+        return []
+    for row in rows:
+        if isinstance(row, dict):
+            conversions = _sum_actions_conversions(row.get("actions"))
+            if conversions is not None:
+                row["conversions"] = conversions
+    return rows
