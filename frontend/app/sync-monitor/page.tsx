@@ -113,6 +113,26 @@ function defaultSyncRangeLastDays(days: number) {
   return { date_from: fmt(from), date_to: fmt(to) };
 }
 
+function isoDate(d: Date) {
+  return d.toISOString().slice(0, 10);
+}
+
+function monthBatches(fromIso: string, toIso: string) {
+  const out: Array<{ date_from: string; date_to: string }> = [];
+  const from = new Date(`${fromIso}T00:00:00.000Z`);
+  const to = new Date(`${toIso}T00:00:00.000Z`);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return out;
+  let cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
+  while (cur <= to) {
+    const start = new Date(cur);
+    const monthEnd = new Date(Date.UTC(cur.getUTCFullYear(), cur.getUTCMonth() + 1, 0));
+    const end = monthEnd < to ? monthEnd : to;
+    out.push({ date_from: isoDate(start), date_to: isoDate(end) });
+    cur = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate() + 1));
+  }
+  return out;
+}
+
 export default function SyncMonitorPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -138,6 +158,7 @@ export default function SyncMonitorPage() {
   const [connectProviderName, setConnectProviderName] = useState<"google" | "facebook" | null>(null);
   const [connectMode, setConnectMode] = useState<"add" | "overwrite">("add");
   const [overwriteConnectionKey, setOverwriteConnectionKey] = useState("");
+  const [historyProgress, setHistoryProgress] = useState("");
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -352,6 +373,66 @@ export default function SyncMonitorPage() {
     }
   }
 
+  async function runFullHistorySync() {
+    if (currentRole === "client") {
+      push("Sync is available only for agency/admin users", "info");
+      return;
+    }
+    if (!discoverClientId) {
+      push("Select client before full history sync", "info");
+      return;
+    }
+    const raw = window.prompt("Start date for full history sync (YYYY-MM-DD)", "2026-01-01");
+    const from = String(raw || "").trim();
+    if (!from) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      push("Invalid date format. Use YYYY-MM-DD", "error");
+      return;
+    }
+    const to = isoDate(new Date());
+    const batches = monthBatches(from, to);
+    if (!batches.length) {
+      push("Invalid date range", "error");
+      return;
+    }
+    try {
+      setSyncLoading(true);
+      let totalProcessed = 0;
+      let totalSuccess = 0;
+      let totalFailed = 0;
+      let totalSkipped = 0;
+      for (let i = 0; i < batches.length; i += 1) {
+        const b = batches[i];
+        setHistoryProgress(`Full sync ${i + 1}/${batches.length}: ${b.date_from}..${b.date_to}`);
+        const payload: Record<string, unknown> = {
+          force: true,
+          client_id: discoverClientId,
+          date_from: b.date_from,
+          date_to: b.date_to,
+        };
+        const runRes = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        totalProcessed += runRes.processed || 0;
+        totalSuccess += runRes.success || 0;
+        totalFailed += runRes.failed || 0;
+        totalSkipped += runRes.skipped || 0;
+      }
+      push(
+        `Full history sync done: processed ${totalProcessed}, success ${totalSuccess}, failed ${totalFailed}, skipped ${totalSkipped}`,
+        totalFailed > 0 ? "info" : "success"
+      );
+      await loadData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Full history sync failed";
+      push(msg, "error");
+    } finally {
+      setHistoryProgress("");
+      setSyncLoading(false);
+    }
+  }
+
   async function retrySelected() {
     if (!selected?.ad_account_id) {
       push("Select a sync job first", "info");
@@ -464,12 +545,16 @@ export default function SyncMonitorPage() {
                 <button className="ghost-btn" onClick={() => openConnectProvider("google")}>Connect Google</button>
                 <button className="ghost-btn" onClick={() => openConnectProvider("facebook")}>Connect Facebook</button>
                 <button className="primary-btn" onClick={() => void runSync()} disabled={syncLoading}>Sync All</button>
+                <button className="primary-btn" onClick={() => void runFullHistorySync()} disabled={syncLoading}>Full History Sync</button>
               </div>
             </div>
             {currentRole === "client" ? (
               <div className="muted-note" style={{ marginTop: 8 }}>
                 Client role is read-only here. Provider connect/discovery/sync is managed by agency/admin.
               </div>
+            ) : null}
+            {historyProgress ? (
+              <div className="muted-note" style={{ marginTop: 8 }}>{historyProgress}</div>
             ) : null}
             <div className="kpi-grid" style={{ marginTop: 10 }}>
               {(integrations?.providers || []).map((p) => (
