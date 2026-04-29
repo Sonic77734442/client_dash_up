@@ -83,7 +83,10 @@ export default function HomePage() {
   const { executeAction, listActions } = useOperationalActions(session.apiBase, session.token);
 
   const [view, setView] = useState<"dashboard" | "client_ops">("dashboard");
+  const initialRange = dateRange(30);
   const [periodDays, setPeriodDays] = useState(30);
+  const [dateFrom, setDateFrom] = useState(initialRange.from);
+  const [dateTo, setDateTo] = useState(initialRange.to);
   const [clientId, setClientId] = useState("");
   const [platform, setPlatform] = useState<"all" | "meta" | "google" | "tiktok">("all");
 
@@ -126,9 +129,8 @@ export default function HomePage() {
   }, [req]);
 
   const buildOverviewQuery = useCallback(() => {
-    const r = dateRange(periodDays);
-    return getQuery({ date_from: r.from, date_to: r.to, client_id: clientId || undefined });
-  }, [periodDays, clientId]);
+    return getQuery({ date_from: dateFrom, date_to: dateTo, client_id: clientId || undefined });
+  }, [dateFrom, dateTo, clientId]);
 
   const loadOverviewData = useCallback(async () => {
     const query = buildOverviewQuery();
@@ -145,15 +147,14 @@ export default function HomePage() {
   }, [req, buildOverviewQuery, clientId, listActions]);
 
   const loadClientOpsData = useCallback(async () => {
-    const r = dateRange(periodDays);
-    const query = getQuery({ date_from: r.from, date_to: r.to });
+    const query = getQuery({ date_from: dateFrom, date_to: dateTo });
     const [agency, bgs] = await Promise.all([
       req<AgencyOverview>(`/agency/overview${query}`),
-      req<{ items: Budget[] }>(`/budgets${getQuery({ status: "active", date_from: r.from, date_to: r.to })}`),
+      req<{ items: Budget[] }>(`/budgets${getQuery({ status: "active", date_from: dateFrom, date_to: dateTo })}`),
     ]);
     setAgencyOverview(agency);
     setBudgets(bgs.items || []);
-  }, [req, periodDays]);
+  }, [req, dateFrom, dateTo]);
 
   const refresh = useCallback(async () => {
     try {
@@ -195,7 +196,22 @@ useEffect(() => {
     if (currentRole === "agency" && !clientId) return;
     if (!ready || !authResolved || currentRole === "client") return;
     void refresh();
-  }, [ready, authResolved, currentRole, periodDays, clientId, platform, refresh]);
+  }, [ready, authResolved, currentRole, dateFrom, dateTo, clientId, platform, refresh]);
+
+  useEffect(() => {
+    const from = new Date(`${dateFrom}T00:00:00`);
+    const to = new Date(`${dateTo}T00:00:00`);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return;
+    const days = Math.floor((to.getTime() - from.getTime()) / 86400000) + 1;
+    if (days > 0) setPeriodDays(days);
+  }, [dateFrom, dateTo]);
+
+  const applyQuickRange = useCallback((days: number) => {
+    const r = dateRange(days);
+    setDateFrom(r.from);
+    setDateTo(r.to);
+    setPeriodDays(days);
+  }, []);
 
   const groupedTimeline = useMemo(() => {
     if (!overview) return [] as TimelinePoint[];
@@ -439,11 +455,19 @@ useEffect(() => {
           <section className="filters">
             <label>
               Period
-              <select value={String(periodDays)} onChange={(e) => setPeriodDays(Number(e.target.value))}>
-                <option value="7">Last 7 Days</option>
-                <option value="30">Last 30 Days</option>
-                <option value="90">Last 90 Days</option>
-              </select>
+              <div className="chip-row" style={{ marginTop: 6 }}>
+                <button className={`chip-btn ${periodDays === 7 ? "active" : ""}`} onClick={() => applyQuickRange(7)}>7 days</button>
+                <button className={`chip-btn ${periodDays === 15 ? "active" : ""}`} onClick={() => applyQuickRange(15)}>15 days</button>
+                <button className={`chip-btn ${periodDays === 30 ? "active" : ""}`} onClick={() => applyQuickRange(30)}>30 days</button>
+              </div>
+            </label>
+            <label>
+              Date From
+              <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+            </label>
+            <label>
+              Date To
+              <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
             </label>
             <label>
               Client
