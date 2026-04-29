@@ -156,7 +156,7 @@ def fetch_daily(
         date_to,
         "AUCTION_ADVERTISER",
         ["stat_time_day"],
-        ["spend", "impressions", "clicks", "ctr", "cpc", "cpm"],
+        ["spend", "impressions", "clicks", "ctr", "cpc", "cpm", "conversion"],
         config_override=config_override,
     )
     return [
@@ -168,6 +168,7 @@ def fetch_daily(
             "ctr": row.get("ctr"),
             "cpc": row.get("cpc"),
             "cpm": row.get("cpm"),
+            "conversions": row.get("conversion"),
         }
         for row in rows
     ]

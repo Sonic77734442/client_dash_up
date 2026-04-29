@@ -282,7 +282,8 @@ def fetch_daily(
               metrics.ctr,
               metrics.average_cpc,
               metrics.average_cpm,
-              metrics.cost_micros
+              metrics.cost_micros,
+              metrics.conversions
             FROM customer
             WHERE segments.date BETWEEN '{date_from}' AND '{date_to}'
         """,
@@ -294,7 +295,8 @@ def fetch_daily(
               metrics.ctr,
               metrics.average_cpc,
               metrics.average_cpm,
-              metrics.cost_micros
+              metrics.cost_micros,
+              metrics.conversions
             FROM campaign
             WHERE segments.date BETWEEN '{date_from}' AND '{date_to}'
         """,
@@ -315,6 +317,7 @@ def fetch_daily(
                         "cpc": float(metrics.average_cpc or 0) / 1_000_000 if metrics.average_cpc else 0,
                         "cpm": float(metrics.average_cpm or 0) / 1_000_000 if metrics.average_cpm else 0,
                         "spend": float(metrics.cost_micros or 0) / 1_000_000,
+                        "conversions": float(metrics.conversions or 0),
                     }
                 )
             return daily
