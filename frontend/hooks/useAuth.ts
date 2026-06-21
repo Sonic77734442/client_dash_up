@@ -16,10 +16,10 @@ export function useAuth(defaultApiBase: string) {
 
   const refresh = useCallback(async () => {
     const apiBase = resolveApiBase(defaultApiBase);
+    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
 
     try {
-      // Ask backend via cookie auth first; fetchJson retries with localStorage bearer token on 401.
-      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", "");
+      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
       setMe(body);
       setRole(body.session.role || null);
       setAuthenticated(Boolean(body.session.valid));

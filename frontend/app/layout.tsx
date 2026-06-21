@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { AuthGate } from "../components/AuthGate";
+import { ImpersonationBanner } from "../components/ImpersonationBanner";
 import { RuntimeI18n } from "../components/RuntimeI18n";
 import "./globals.css";
 
@@ -13,6 +14,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <RuntimeI18n />
+        <ImpersonationBanner />
         <AuthGate>{children}</AuthGate>
       </body>
     </html>

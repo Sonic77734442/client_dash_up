@@ -110,6 +110,33 @@ body {
   color: #9e2b2b;
 }
 
+.impersonation-banner {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 18px;
+  border-bottom: 1px solid #f0c36a;
+  background: #fff7df;
+  color: #4d3710;
+}
+
+.impersonation-banner > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.impersonation-banner span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .menu {
   display: flex;
   flex-direction: column;

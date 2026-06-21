@@ -24,6 +24,20 @@ type UserItem = {
   status: "active" | "inactive";
 };
 
+type SessionIssueResponse = {
+  token: string;
+  session_id: string;
+  user_id: string;
+  expires_at: string;
+};
+
+const LS_API_BASE = "ops_api_base";
+const LS_SESSION_TOKEN = "ops_session_token";
+const SESSION_UPDATED_EVENT = "ops-session-updated";
+const IMPERSONATION_LABEL = "ops_impersonation_label";
+const IMPERSONATION_RETURN_API_BASE = "ops_impersonation_return_api_base";
+const IMPERSONATION_RETURN_TOKEN = "ops_impersonation_return_token";
+
 function fmtDate(v?: string | null) {
   if (!v) return "--";
   const d = new Date(v);
@@ -336,6 +350,32 @@ export default function PlatformAgenciesPage() {
     }
   }
 
+  async function openAsAgencyUser(userId: string) {
+    const user = usersById.get(userId);
+    if (!selectedAgency || !user) return;
+    if (user.role !== "agency") {
+      push("Select an agency user to open agency workspace", "error");
+      return;
+    }
+    try {
+      const currentToken = session.token || localStorage.getItem(LS_SESSION_TOKEN) || "";
+      const currentApiBase = session.apiBase || localStorage.getItem(LS_API_BASE) || defaultApiBase;
+      const issued = await req<SessionIssueResponse>("/auth/internal/sessions/issue", {
+        method: "POST",
+        body: JSON.stringify({ user_id: userId, ttl_minutes: 1440 }),
+      });
+      localStorage.setItem(IMPERSONATION_RETURN_TOKEN, currentToken);
+      localStorage.setItem(IMPERSONATION_RETURN_API_BASE, currentApiBase);
+      localStorage.setItem(IMPERSONATION_LABEL, `${user.name} / ${selectedAgency.name}`);
+      localStorage.setItem(LS_API_BASE, currentApiBase);
+      localStorage.setItem(LS_SESSION_TOKEN, issued.token);
+      window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+      window.location.href = "/";
+    } catch (err) {
+      push(err instanceof Error ? err.message : "Open agency workspace failed", "error");
+    }
+  }
+
   const adminOnly = ctx && ctx.role !== "admin";
   const canManageMembers = useMemo(() => {
     if (!ctx) return false;
@@ -525,6 +565,13 @@ export default function PlatformAgenciesPage() {
                         <div><strong>{user?.name || m.user_id.slice(0, 8)}</strong></div>
                         <div className="muted">{agencyRoleLabel(m.role)} | {m.status} | {fmtDate(m.updated_at)}</div>
                         <div className="alert-actions" style={{ marginTop: 6 }}>
+                          <button
+                            className="mini-btn"
+                            disabled={adminOnly === true || user?.role !== "agency" || m.status !== "active"}
+                            onClick={() => void openAsAgencyUser(m.user_id)}
+                          >
+                            Open As
+                          </button>
                           <button
                             className="mini-btn"
                             disabled={!canManageMembers || m.status !== "active"}

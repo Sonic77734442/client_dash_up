@@ -6,6 +6,7 @@ import { fetchJson } from "../lib/api";
 import { resolveApiBase } from "../lib/apiBase";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
+const LS_SESSION_TOKEN = "ops_session_token";
 
 export function useSessionContext() {
   const [context, setContext] = useState<SessionContext | null>(null);
@@ -15,7 +16,8 @@ export function useSessionContext() {
     setLoading(true);
     try {
       const apiBase = resolveApiBase(process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000");
-      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", "");
+      const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
+      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
       setContext(body.session || null);
     } catch {
       setContext(null);
