@@ -59,6 +59,7 @@ export default function PlatformAgenciesPage() {
   const [createName, setCreateName] = useState("");
   const [createSlug, setCreateSlug] = useState("");
   const [createPlan, setCreatePlan] = useState("starter");
+  const [createAllowClientInvites, setCreateAllowClientInvites] = useState(true);
 
   const [memberUserId, setMemberUserId] = useState("");
   const [memberRole, setMemberRole] = useState<"owner" | "manager" | "member">("member");
@@ -172,12 +173,14 @@ export default function PlatformAgenciesPage() {
           slug: createSlug.trim() || undefined,
           status: "active",
           plan: createPlan.trim() || "starter",
+          allow_client_invites: createAllowClientInvites,
         }),
       });
       setCreateOpen(false);
       setCreateName("");
       setCreateSlug("");
       setCreatePlan("starter");
+      setCreateAllowClientInvites(true);
       await loadAgencies();
       setSelectedAgencyId(created.id);
       push("Agency created", "success");
@@ -197,6 +200,20 @@ export default function PlatformAgenciesPage() {
       });
       await loadAgencies();
       push(`Agency ${status}`, "success");
+    } catch (err) {
+      push(err instanceof Error ? err.message : "Update agency failed", "error");
+    }
+  }
+
+  async function setClientInvitesAllowed(allow: boolean) {
+    if (!selectedAgency) return;
+    try {
+      await req<AgencyOut>(`/platform/agencies/${selectedAgency.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ allow_client_invites: allow }),
+      });
+      await loadAgencies();
+      push(allow ? "Client invites enabled" : "Client invites disabled", "success");
     } catch (err) {
       push(err instanceof Error ? err.message : "Update agency failed", "error");
     }
@@ -433,6 +450,9 @@ export default function PlatformAgenciesPage() {
                         <span>Slug: {agency.slug}</span>
                         <span>Plan: {agency.plan}</span>
                       </div>
+                      <div className="agency-meta">
+                        <span>Client invites: {agency.allow_client_invites ? "enabled" : "disabled"}</span>
+                      </div>
                       <div className="agency-meta muted">Updated: {fmtDate(agency.updated_at)}</div>
                     </button>
                   );
@@ -450,6 +470,13 @@ export default function PlatformAgenciesPage() {
                 <div className="session-controls">
                   <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canActivate} onClick={() => void setAgencyStatus("active")}>Activate</button>
                   <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canSuspend} onClick={() => void setAgencyStatus("suspended")}>Suspend</button>
+                  <button
+                    className="mini-btn"
+                    disabled={!selectedAgency || adminOnly === true}
+                    onClick={() => void setClientInvitesAllowed(!selectedAgency?.allow_client_invites)}
+                  >
+                    {selectedAgency?.allow_client_invites ? "Disable Client Invites" : "Enable Client Invites"}
+                  </button>
                   <button className="mini-btn" disabled={!selectedAgency || adminOnly === true} onClick={() => void deleteAgency()}>Delete</button>
                 </div>
               </div>
@@ -594,6 +621,16 @@ export default function PlatformAgenciesPage() {
             <label>
               Plan
               <input value={createPlan} onChange={(e) => setCreatePlan(e.target.value)} placeholder="starter" />
+            </label>
+            <label>
+              Client Portal Invites
+              <select
+                value={createAllowClientInvites ? "enabled" : "disabled"}
+                onChange={(e) => setCreateAllowClientInvites(e.target.value === "enabled")}
+              >
+                <option value="enabled">enabled</option>
+                <option value="disabled">disabled</option>
+              </select>
             </label>
           </div>
           <div className="modal-actions" style={{ marginTop: 12 }}>

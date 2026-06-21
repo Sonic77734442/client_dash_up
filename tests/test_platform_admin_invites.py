@@ -104,3 +104,55 @@ def test_invite_accept_conflicts_with_existing_client_role_email():
     denied = client.post("/auth/invites/accept", json={"token": issue.json()["invite_token"]})
     assert denied.status_code == 409
     assert denied.json()["error"]["code"] == "user_role_conflict"
+
+
+def test_agency_client_invites_can_be_disabled_per_agency():
+    reset_state()
+    admin = mk_user("admin3@invite.local", "admin")
+    agency_user = mk_user("agency-client-invites@invite.local", "agency")
+    admin_token = issue_token(admin["id"])
+    agency_token = issue_token(agency_user["id"])
+
+    tenant = mk_client("No Portal Tenant", admin_token)
+    agency_res = client.post(
+        "/platform/agencies",
+        json={
+            "name": "No Portal Agency",
+            "status": "active",
+            "plan": "starter",
+            "allow_client_invites": False,
+        },
+        headers=auth_header(admin_token),
+    )
+    assert agency_res.status_code == 200
+    agency = agency_res.json()
+    assert agency["allow_client_invites"] is False
+
+    member = client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": agency_user["id"], "role": "owner", "status": "active"},
+        headers=auth_header(admin_token),
+    )
+    assert member.status_code == 200
+    bind = client.post(
+        f"/platform/agencies/{agency['id']}/clients",
+        json={"client_id": tenant["id"]},
+        headers=auth_header(admin_token),
+    )
+    assert bind.status_code == 200
+
+    denied = client.post(
+        f"/clients/{tenant['id']}/invites",
+        json={"email": "client@tenant.local", "expires_in_days": 7},
+        headers=auth_header(agency_token),
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "client_invites_disabled"
+
+    enabled = client.patch(
+        f"/platform/agencies/{agency['id']}",
+        json={"allow_client_invites": True},
+        headers=auth_header(admin_token),
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["allow_client_invites"] is True

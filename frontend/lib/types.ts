@@ -290,6 +290,7 @@ export type AgencyOut = {
   status: "active" | "suspended";
   plan: string;
   notes?: string | null;
+  allow_client_invites: boolean;
   created_at: string;
   updated_at: string;
 };

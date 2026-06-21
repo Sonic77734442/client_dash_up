@@ -8,7 +8,7 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import { ClientOut } from "../../lib/types";
+import { AgencyOut, AuthMeResponse, ClientOut } from "../../lib/types";
 
 type ClientStatus = "active" | "inactive" | "archived" | "all";
 
@@ -79,6 +79,7 @@ export default function ClientsPage() {
   const [modalError, setModalError] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<ClientForm>(emptyForm());
+  const [clientInvitesAllowed, setClientInvitesAllowed] = useState(true);
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -86,8 +87,17 @@ export default function ClientsPage() {
   );
 
   const loadClients = useCallback(async () => {
-    const all = await req<{ items: ClientOut[] }>("/clients?status=all");
+    const [all, me] = await Promise.all([
+      req<{ items: ClientOut[] }>("/clients?status=all"),
+      req<AuthMeResponse>("/auth/me"),
+    ]);
     setItems(all.items || []);
+    if (me.session?.role === "agency") {
+      const agencies = await req<{ items: AgencyOut[] }>("/platform/agencies?status=active");
+      setClientInvitesAllowed((agencies.items || []).every((agency) => agency.allow_client_invites !== false));
+    } else {
+      setClientInvitesAllowed(true);
+    }
   }, [req]);
 
   useEffect(() => {
@@ -212,7 +222,7 @@ export default function ClientsPage() {
           method: "POST",
           body: JSON.stringify(payload),
         });
-        const inviteEmail = form.invite_email.trim().toLowerCase();
+        const inviteEmail = clientInvitesAllowed ? form.invite_email.trim().toLowerCase() : "";
         if (inviteEmail) {
           const issued = await req<ClientInviteIssueResponse>(`/clients/${created.id}/invites`, {
             method: "POST",
@@ -422,7 +432,9 @@ export default function ClientsPage() {
                       <td>
                         <div className="alert-actions" style={{ marginTop: 0 }}>
                           <Link className="mini-btn" href={`/client/${c.id}`}>Open Client</Link>
-                          <button className="mini-btn" onClick={() => void copyInviteLink(c)}>Copy Invite Link</button>
+                          {clientInvitesAllowed ? (
+                            <button className="mini-btn" onClick={() => void copyInviteLink(c)}>Copy Invite Link</button>
+                          ) : null}
                           <button className="mini-btn" onClick={() => openEdit(c)}>Edit</button>
                           {c.status === "archived" ? (
                             <button className="mini-btn" onClick={() => void restoreClient(c)}>Restore</button>
@@ -511,7 +523,7 @@ export default function ClientsPage() {
             <textarea value={form.notes} onChange={(e) => setForm((s) => ({ ...s, notes: e.target.value }))} rows={3} style={{ width: "100%" }} />
           </label>
 
-          {!editingId ? (
+          {!editingId && clientInvitesAllowed ? (
             <div className="detail-grid" style={{ marginTop: 10 }}>
               <label>
                 Client login email (optional)

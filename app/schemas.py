@@ -504,6 +504,7 @@ class AgencyCreate(BaseModel):
     status: Literal["active", "suspended"] = "active"
     plan: str = "starter"
     notes: Optional[str] = None
+    allow_client_invites: bool = True
 
 
 class AgencyPatch(BaseModel):
@@ -512,6 +513,7 @@ class AgencyPatch(BaseModel):
     status: Optional[Literal["active", "suspended"]] = None
     plan: Optional[str] = None
     notes: Optional[str] = None
+    allow_client_invites: Optional[bool] = None
 
 
 class AgencyOut(BaseModel):
@@ -521,6 +523,7 @@ class AgencyOut(BaseModel):
     status: Literal["active", "suspended"]
     plan: str
     notes: Optional[str] = None
+    allow_client_invites: bool = True
     created_at: datetime
     updated_at: datetime
 

@@ -91,6 +91,7 @@ class SqlitePlatformAdminStore:
             status=row["status"],
             plan=row["plan"],
             notes=row["notes"],
+            allow_client_invites=bool(row["allow_client_invites"]) if "allow_client_invites" in row.keys() else True,
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -227,10 +228,20 @@ class SqlitePlatformAdminStore:
             try:
                 conn.execute(
                     """
-                    INSERT INTO agencies (id, name, slug, status, plan, notes, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO agencies (id, name, slug, status, plan, notes, allow_client_invites, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (agency_id, payload.name, slug, payload.status, payload.plan, payload.notes, now, now),
+                    (
+                        agency_id,
+                        payload.name,
+                        slug,
+                        payload.status,
+                        payload.plan,
+                        payload.notes,
+                        1 if payload.allow_client_invites else 0,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
             except Exception as exc:
@@ -263,12 +274,17 @@ class SqlitePlatformAdminStore:
                 "status": patch.get("status", existing["status"]),
                 "plan": patch.get("plan", existing["plan"]),
                 "notes": patch.get("notes", existing["notes"]),
+                "allow_client_invites": (
+                    (1 if patch["allow_client_invites"] else 0)
+                    if "allow_client_invites" in patch
+                    else existing["allow_client_invites"]
+                ),
             }
             try:
                 conn.execute(
                     """
                     UPDATE agencies
-                    SET name=?, slug=?, status=?, plan=?, notes=?, updated_at=?
+                    SET name=?, slug=?, status=?, plan=?, notes=?, allow_client_invites=?, updated_at=?
                     WHERE id=?
                     """,
                     (
@@ -277,6 +293,7 @@ class SqlitePlatformAdminStore:
                         data["status"],
                         data["plan"],
                         data["notes"],
+                        data["allow_client_invites"],
                         now,
                         str(agency_id),
                     ),
@@ -739,6 +756,7 @@ class InMemoryPlatformAdminStore:
             status=payload.status,
             plan=payload.plan,
             notes=payload.notes,
+            allow_client_invites=payload.allow_client_invites,
             created_at=now,
             updated_at=now,
         )

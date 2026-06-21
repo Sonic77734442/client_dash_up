@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS agencies (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','suspended')),
   plan TEXT NOT NULL DEFAULT 'starter',
   notes TEXT NULL,
+  allow_client_invites INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -374,6 +375,10 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
     oauth_cols = {row[1] for row in conn.execute("PRAGMA table_info(oauth_states)").fetchall()}
     if oauth_cols and "nonce" not in oauth_cols:
         conn.execute("ALTER TABLE oauth_states ADD COLUMN nonce TEXT NOT NULL DEFAULT ''")
+
+    agency_cols = {row[1] for row in conn.execute("PRAGMA table_info(agencies)").fetchall()}
+    if agency_cols and "allow_client_invites" not in agency_cols:
+        conn.execute("ALTER TABLE agencies ADD COLUMN allow_client_invites INTEGER NOT NULL DEFAULT 1")
 
     sync_cols = {row[1] for row in conn.execute("PRAGMA table_info(ad_account_sync_jobs)").fetchall()}
     if sync_cols and "error_code" not in sync_cols:

@@ -937,6 +937,29 @@ def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
     return out
 
 
+def _ensure_client_invites_allowed_for_agency(ctx: RequestContext, client_id: UUID) -> None:
+    if ctx.role != "agency" or not ctx.user_id:
+        return
+    agency_ids = _agency_scope_ids_for_user(ctx.user_id)
+    for agency_id in agency_ids:
+        agency = _platform_admin_store().get_agency(agency_id)
+        if not agency:
+            continue
+        try:
+            bindings = _platform_admin_store().list_clients(agency_id)
+        except Exception:
+            continue
+        if any(binding.client_id == client_id for binding in bindings) and not agency.allow_client_invites:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "client_invites_disabled",
+                    "message": "Client portal invites are disabled for this agency",
+                    "details": {"agency_id": str(agency_id), "client_id": str(client_id)},
+                },
+            )
+
+
 def _integration_credentials_from_oauth(
     provider: str,
     oauth_tokens: Optional[dict],
@@ -2572,6 +2595,7 @@ def issue_client_invite(client_id: UUID, payload: ClientInviteCreate, ctx: Reque
             detail={"code": "forbidden", "message": "Only admin/agency can issue client invites"},
         )
     ensure_client_access(ctx, client_id)
+    _ensure_client_invites_allowed_for_agency(ctx, client_id)
     return _issue_client_invite(
         client_id=client_id,
         email=payload.email,
@@ -2596,6 +2620,7 @@ def list_client_invites(
             detail={"code": "forbidden", "message": "Only admin/agency can list client invites"},
         )
     ensure_client_access(ctx, client_id)
+    _ensure_client_invites_allowed_for_agency(ctx, client_id)
     return _list_client_invites(client_id=client_id, status=status)
 
 
@@ -2616,6 +2641,7 @@ def resend_client_invite(
             detail={"code": "forbidden", "message": "Only admin/agency can resend client invites"},
         )
     ensure_client_access(ctx, client_id)
+    _ensure_client_invites_allowed_for_agency(ctx, client_id)
     invites = _list_client_invites(client_id=client_id, status="all")
     target = next((x for x in invites if x.id == invite_id), None)
     if not target:
@@ -2645,6 +2671,7 @@ def revoke_client_invite(
             detail={"code": "forbidden", "message": "Only admin/agency can revoke client invites"},
         )
     ensure_client_access(ctx, client_id)
+    _ensure_client_invites_allowed_for_agency(ctx, client_id)
     return _revoke_client_invite(client_id=client_id, invite_id=invite_id)
 
 
