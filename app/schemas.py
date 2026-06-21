@@ -750,6 +750,7 @@ class IntegrationCredentialPublicOut(BaseModel):
     connection_key: str = "default"
     status: Literal["active", "archived"]
     created_by: Optional[UUID] = None
+    connected_account_label: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     credential_keys: List[str] = Field(default_factory=list)

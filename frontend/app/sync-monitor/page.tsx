@@ -78,6 +78,17 @@ function asSyncPlatform(provider: string): "meta" | "google" | "tiktok" | null {
   return null;
 }
 
+function connectionLabel(row: IntegrationConnection) {
+  const label = String(row.connected_account_label || "").trim();
+  if (label) return label;
+  const preview = row.credentials_preview || {};
+  const previewLabel = String(
+    preview.email || preview.account_email || preview.login_email || preview.user_email || ""
+  ).trim();
+  if (previewLabel) return previewLabel;
+  return row.scope_type;
+}
+
 function safeErrorMessage(raw?: string | null) {
   const msg = String(raw || "").toLowerCase();
   if (!msg) return "";
@@ -259,6 +270,14 @@ export default function SyncMonitorPage() {
     }
     return map;
   }, [integrations]);
+  const connectionsByProvider = useMemo(() => {
+    const map = new Map<string, IntegrationConnection[]>();
+    for (const row of connections) {
+      const key = (asSyncPlatform(row.provider) || row.provider || "").toLowerCase();
+      map.set(key, [...(map.get(key) || []), row]);
+    }
+    return map;
+  }, [connections]);
   const selectedProviderState = useMemo(() => {
     if (!selected?.provider) return null;
     return providerMap.get((selected.provider || "").toLowerCase()) || null;
@@ -562,6 +581,12 @@ export default function SyncMonitorPage() {
                   <div className="kpi-title">{providerLabel(p.provider)}</div>
                   <div className="kpi-value" style={{ fontSize: 22 }}>{p.sync_ready ? "READY" : "SETUP"}</div>
                   <div className="muted-note">
+                    Connected: {(connectionsByProvider.get(asSyncPlatform(p.provider) || (p.provider || "").toLowerCase()) || [])
+                      .filter((row) => row.status === "active")
+                      .map(connectionLabel)
+                      .join(", ") || "--"}
+                  </div>
+                  <div className="muted-note">
                     Source: {p.connection_sources?.length ? p.connection_sources.join(", ") : "not configured"}
                   </div>
                   <div className="muted-note">
@@ -682,6 +707,7 @@ export default function SyncMonitorPage() {
                   <tr>
                     <th>Provider</th>
                     <th>Scope</th>
+                    <th>Account</th>
                     <th>Connection Key</th>
                     <th>Status</th>
                     <th>Updated</th>
@@ -693,6 +719,7 @@ export default function SyncMonitorPage() {
                     <tr key={row.id}>
                       <td>{providerLabel(row.provider)}</td>
                       <td>{row.scope_type}</td>
+                      <td>{connectionLabel(row)}</td>
                       <td>{row.connection_key}</td>
                       <td><span className={`badge ${row.status === "active" ? "good" : "warn"}`}>{row.status}</span></td>
                       <td>{fmtDate(row.updated_at)}</td>
@@ -708,7 +735,7 @@ export default function SyncMonitorPage() {
                   ))}
                   {!connections.length ? (
                     <tr>
-                      <td colSpan={6} className="muted-note">No connections visible for current role.</td>
+                      <td colSpan={7} className="muted-note">No connections visible for current role.</td>
                     </tr>
                   ) : null}
                 </tbody>
@@ -798,6 +825,12 @@ export default function SyncMonitorPage() {
                           <div className="detail-item"><div className="detail-k">Sync Ready</div><div className="detail-v">{selectedProviderState.sync_ready ? "Yes" : "No"}</div></div>
                           <div className="detail-item"><div className="detail-k">Auth State</div><div className="detail-v">{authStateLabel(selectedProviderState.auth_state)}</div></div>
                           <div className="detail-item"><div className="detail-k">Linked Users</div><div className="detail-v">{selectedProviderState.identity_linked_users}</div></div>
+                        </div>
+                        <div className="muted-note" style={{ marginTop: 8 }}>
+                          Connected: {(connectionsByProvider.get(asSyncPlatform(selectedProviderState.provider) || (selectedProviderState.provider || "").toLowerCase()) || [])
+                            .filter((row) => row.status === "active")
+                            .map(connectionLabel)
+                            .join(", ") || "--"}
                         </div>
                         <div className="muted-note" style={{ marginTop: 8 }}>
                           Source: {selectedProviderState.connection_sources?.length ? selectedProviderState.connection_sources.join(", ") : "not configured"}

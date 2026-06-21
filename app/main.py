@@ -350,6 +350,24 @@ def _to_public_integration_credential(row: IntegrationCredentialOut) -> Integrat
             preview[k] = _mask_secret_value(v)
         else:
             preview[k] = v
+    connected_label: Optional[str] = None
+    if row.created_by:
+        provider_norm = str(row.provider or "").strip().lower()
+        identities = _auth_store().list_identities(user_id=row.created_by)
+        identity = next(
+            (
+                x
+                for x in identities
+                if str(x.provider or "").strip().lower() in {provider_norm, "google_ads" if provider_norm == "google" else provider_norm}
+            ),
+            None,
+        )
+        if identity and identity.email:
+            connected_label = identity.email
+        else:
+            user = _auth_store().get_user(row.created_by)
+            if user:
+                connected_label = user.email or user.name
     return IntegrationCredentialPublicOut(
         id=row.id,
         provider=row.provider,
@@ -358,6 +376,7 @@ def _to_public_integration_credential(row: IntegrationCredentialOut) -> Integrat
         connection_key=row.connection_key,
         status=row.status,
         created_by=row.created_by,
+        connected_account_label=connected_label,
         created_at=row.created_at,
         updated_at=row.updated_at,
         credential_keys=keys,

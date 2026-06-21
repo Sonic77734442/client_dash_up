@@ -230,6 +230,7 @@ export type IntegrationConnection = {
   connection_key: string;
   status: "active" | "archived";
   created_by?: string | null;
+  connected_account_label?: string | null;
   created_at: string;
   updated_at: string;
   credential_keys: string[];
