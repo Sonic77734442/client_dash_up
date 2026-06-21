@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import logging
 import secrets
 import threading
 import time
@@ -9,7 +10,7 @@ from typing import List, Optional, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -151,7 +152,12 @@ from app.settings import get_settings, load_accounts
 from app.db import sqlite_conn
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+LOGIN_AUTO_SYNC_ENABLED = str(os.getenv("LOGIN_AUTO_SYNC_ENABLED", "true")).strip().lower() not in {"0", "false", "no", "off"}
+LOGIN_AUTO_SYNC_TTL_SECONDS = max(0, int(os.getenv("LOGIN_AUTO_SYNC_TTL_SECONDS", "1800")))
+LOGIN_AUTO_SYNC_LOOKBACK_DAYS = max(1, int(os.getenv("LOGIN_AUTO_SYNC_LOOKBACK_DAYS", "30")))
+
 app = FastAPI(
     title="Envidicy Digital Dashboard Backend",
     version="0.3.0",
@@ -159,6 +165,9 @@ app = FastAPI(
     redoc_url="/redoc" if settings.api_docs_enabled else None,
     openapi_url="/openapi.json" if settings.api_docs_enabled else None,
 )
+
+app.state.login_auto_sync_state = {}
+app.state.login_auto_sync_lock = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -767,6 +776,86 @@ def _audit_log_store() -> AuditLogStore:
 
 def _alert_store() -> AlertStore:
     return app.state.alert_store
+
+
+def _mark_login_auto_sync_state(key: str, **updates: object) -> None:
+    try:
+        with app.state.login_auto_sync_lock:
+            state = app.state.login_auto_sync_state.setdefault(key, {})
+            state.update(updates)
+    except Exception:
+        logger.exception("Failed to update login auto sync state")
+
+
+def _run_login_auto_sync(user_id: UUID, client_ids: List[UUID], state_key: str) -> None:
+    try:
+        allowed_client_ids = set(client_ids)
+        accounts = [
+            account
+            for account in _ad_account_store().list(status="all")
+            if account.client_id in allowed_client_ids and account.status != "archived"
+        ]
+        if not accounts:
+            _mark_login_auto_sync_state(state_key, status="done", finished_at=time.time(), processed=0)
+            return
+
+        sync_to = date.today()
+        sync_from = sync_to - timedelta(days=LOGIN_AUTO_SYNC_LOOKBACK_DAYS - 1)
+        result = _ad_account_sync_service().run_sync(
+            account_ids=[account.id for account in accounts],
+            date_from=sync_from,
+            date_to=sync_to,
+            created_by=user_id,
+            user_id=user_id,
+            force=False,
+        )
+        _process_sync_alerts(
+            jobs=result.jobs,
+            account_client_by_id={account.id: account.client_id for account in accounts},
+        )
+        _mark_login_auto_sync_state(
+            state_key,
+            status="done",
+            finished_at=time.time(),
+            processed=result.processed,
+            success=result.success,
+            failed=result.failed,
+            skipped=result.skipped,
+        )
+        logger.info(
+            "Login auto sync finished for agency user %s: processed=%s success=%s failed=%s skipped=%s",
+            user_id,
+            result.processed,
+            result.success,
+            result.failed,
+            result.skipped,
+        )
+    except Exception as exc:
+        _mark_login_auto_sync_state(state_key, status="error", finished_at=time.time(), error=str(exc))
+        logger.exception("Login auto sync failed for agency user %s", user_id)
+
+
+def _schedule_login_auto_sync(background_tasks: Optional[BackgroundTasks], session: SessionContextResponse) -> None:
+    if not LOGIN_AUTO_SYNC_ENABLED or background_tasks is None:
+        return
+    if not session.valid or session.role != "agency" or not session.user_id or not session.accessible_client_ids:
+        return
+
+    user_id = session.user_id
+    client_ids = sorted(set(session.accessible_client_ids), key=lambda value: str(value))
+    state_key = f"{user_id}:{','.join(str(client_id) for client_id in client_ids)}"
+    now_ts = time.time()
+    with app.state.login_auto_sync_lock:
+        previous = app.state.login_auto_sync_state.get(state_key)
+        if previous and now_ts - float(previous.get("scheduled_at") or 0) < LOGIN_AUTO_SYNC_TTL_SECONDS:
+            return
+        app.state.login_auto_sync_state[state_key] = {
+            "status": "scheduled",
+            "scheduled_at": now_ts,
+            "client_count": len(client_ids),
+        }
+
+    background_tasks.add_task(_run_login_auto_sync, user_id, client_ids, state_key)
 
 
 def _rate_limiter() -> InMemoryRateLimiter:
@@ -1779,10 +1868,14 @@ def auth_list_access(
 )
 def auth_issue_session(
     payload: SessionIssueRequest,
+    background_tasks: BackgroundTasks,
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
-    return _auth_store().issue_session(payload)
+    issued = _auth_store().issue_session(payload)
+    session_ctx = _auth_facade().get_session_context(issued.token)
+    _schedule_login_auto_sync(background_tasks, session_ctx)
+    return issued
 
 
 @app.post(
@@ -1868,7 +1961,7 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     summary="Password login",
     description="Authenticates user by email/password and issues backend session cookie.",
 )
-def auth_password_login(payload: AuthPasswordLoginRequest):
+def auth_password_login(payload: AuthPasswordLoginRequest, background_tasks: BackgroundTasks):
     user = _auth_store().authenticate_password(payload.email, payload.password)
     if not user:
         raise HTTPException(
@@ -1885,8 +1978,9 @@ def auth_password_login(payload: AuthPasswordLoginRequest):
     session_ctx = _auth_facade().get_session_context(issued.token)
     if not session_ctx.valid:
         raise HTTPException(status_code=500, detail="Session context failed")
+    _schedule_login_auto_sync(background_tasks, session_ctx)
     body = AuthMeResponse(user=user, session=session_ctx)
-    response = JSONResponse(content=body.model_dump(mode="json"))
+    response = JSONResponse(content=body.model_dump(mode="json"), background=background_tasks)
     max_age = max(60, int((issued.expires_at - _utcnow()).total_seconds()))
     response.set_cookie(
         key=settings.auth_cookie_name,
@@ -2029,6 +2123,7 @@ def auth_oauth_start(
 def auth_oauth_callback(
     request: Request,
     provider: str,
+    background_tasks: BackgroundTasks,
     code: Optional[str] = None,
     state: Optional[str] = None,
     error: Optional[str] = None,
@@ -2101,12 +2196,14 @@ def auth_oauth_callback(
         oauth_tokens=identity.oauth_tokens,
         cfg=cfg,
     )
+    session_ctx = _auth_facade().get_session_context(resolved.session.token)
+    _schedule_login_auto_sync(background_tasks, session_ctx)
 
     base = settings.frontend_base_url.rstrip("/")
     next_encoded = quote(redirect_next or "/", safe="/?=&")
     token_fragment = quote(resolved.session.token, safe="")
     redirect_url = f"{base}/login/success?next={next_encoded}#token={token_fragment}"
-    response = RedirectResponse(url=redirect_url, status_code=302)
+    response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
     max_age = (
         max(60, int((resolved.session.expires_at - _utcnow()).total_seconds()))
         if resolved.session and resolved.session.expires_at
