@@ -2,6 +2,42 @@
 
 import { Client, ClientOpsRow, OperationalAction } from "../../lib/types";
 
+const actionLabels: Record<string, string> = {
+  scale: "Масштабирование",
+  cap: "Ограничение расхода",
+  pause: "Приостановка",
+  review: "Проверка",
+};
+
+const statusLabels: Record<string, string> = {
+  queued: "В очереди",
+  pending: "Ожидает",
+  running: "В работе",
+  applied: "Применено",
+  completed: "Выполнено",
+  succeeded: "Выполнено",
+  success: "Выполнено",
+  failed: "Ошибка",
+  cancelled: "Отменено",
+};
+
+const paceLabels: Record<ClientOpsRow["pace"], string> = {
+  critical: "Критический",
+  warning: "Требует внимания",
+  stable: "В норме",
+  no_budget: "Нет бюджета",
+};
+
+function actionLabel(value: string | null | undefined) {
+  const key = String(value || "").trim().toLowerCase();
+  return actionLabels[key] || value || "Действие";
+}
+
+function statusLabel(value: string | null | undefined) {
+  const key = String(value || "").trim().toLowerCase();
+  return statusLabels[key] || value || "Статус не указан";
+}
+
 type ClientOperationsViewProps = {
   clientOpsRows: ClientOpsRow[];
   filteredClientOpsRows: ClientOpsRow[];
@@ -62,12 +98,16 @@ export function ClientOperationsView({
     <>
       <section className="clientops-kpi-row">
         {[
-          { label: "Active Clients", value: String(activeClients), note: "+ this period" },
-          { label: "Total Spend", value: fmtMoney(totalSpend), note: "portfolio total" },
-          { label: "Clients At Risk", value: String(atRisk), note: "requires review", risk: true },
-          { label: "Avg Pace Delta", value: `${paceDelta >= 0 ? "+" : ""}${paceDelta.toFixed(1)}%`, note: "vs target usage 80%" },
+          { label: "Клиенты в выборке", value: String(activeClients), note: "текущий срез портфеля" },
+          { label: "Общий расход", value: fmtMoney(totalSpend), note: "по выбранным клиентам" },
+          { label: "Требуют внимания", value: String(atRisk), note: "риск 70 и выше" },
+          {
+            label: "Отклонение темпа",
+            value: `${paceDelta >= 0 ? "+" : ""}${paceDelta.toFixed(1)}%`,
+            note: "от целевого освоения 80%",
+          },
         ].map((c) => (
-          <article key={c.label} className={`clientops-kpi-card ${c.risk ? "risk" : ""}`}>
+          <article key={c.label} className="clientops-kpi-card">
             <div className="clientops-kpi-label">{c.label}</div>
             <div className="clientops-kpi-value">{c.value}</div>
             <div className="clientops-kpi-note">{c.note}</div>
@@ -77,20 +117,25 @@ export function ClientOperationsView({
 
       <section className="clientops-controls panel">
         <div className="clientops-controls-row">
-          <input className="clientops-search" placeholder="Search clients, owners, or IDs..." value={clientOpsSearch} onChange={(e) => setClientOpsSearch(e.target.value)} />
+          <input
+            className="clientops-search"
+            placeholder="Найти клиента, ответственного или код"
+            value={clientOpsSearch}
+            onChange={(e) => setClientOpsSearch(e.target.value)}
+          />
           <div className="density-toggle">
-            <button className={`density-btn ${density === "comfortable" ? "active" : ""}`} onClick={() => setDensity("comfortable")}>Comfortable</button>
-            <button className={`density-btn ${density === "compact" ? "active" : ""}`} onClick={() => setDensity("compact")}>Compact</button>
+            <button className={`density-btn ${density === "comfortable" ? "active" : ""}`} onClick={() => setDensity("comfortable")}>Обычная</button>
+            <button className={`density-btn ${density === "compact" ? "active" : ""}`} onClick={() => setDensity("compact")}>Компактная</button>
           </div>
-          <button className="ghost-btn" onClick={() => setPage(1)}>Apply Filters</button>
+          <button className="ghost-btn" onClick={() => setPage(1)}>Применить</button>
         </div>
         <div className="chip-row">
           {[
-            ["all", "All Clients"],
-            ["at_risk", "Only At Risk"],
-            ["overspending", "Overspending"],
-            ["no_budget", "No Budget"],
-            ["has_alerts", "Has Alerts"],
+            ["all", "Все клиенты"],
+            ["at_risk", "В зоне риска"],
+            ["overspending", "Перерасход"],
+            ["no_budget", "Без бюджета"],
+            ["has_alerts", "С предупреждениями"],
           ].map(([k, label]) => (
             <button key={k} className={`chip-btn ${clientOpsChip === k ? "active" : ""}`} onClick={() => { setClientOpsChip(k as typeof clientOpsChip); setPage(1); }}>
               {label}
@@ -101,20 +146,28 @@ export function ClientOperationsView({
 
       <section className="clientops-grid">
         <article className="panel clientops-table-panel">
+          <div className="panel-head">
+            <div>
+              <h3>Портфель клиентов</h3>
+              <div className="panel-subtitle">Расход, бюджет, темп и уровень риска в одном списке</div>
+            </div>
+            <div className="muted-note">{filteredClientOpsRows.length} клиентов</div>
+          </div>
           <table className={`clientops-table ${density === "compact" ? "compact-density" : ""}`}>
             <thead>
               <tr>
                 {[
-                  ["name", "Client"],
-                  ["spend", "Spend"],
-                  ["budget", "Budget"],
-                  ["usage", "Usage %"],
-                  ["pace", "Pace"],
-                  ["riskScore", "Risk Score"],
+                  ["name", "Клиент"],
+                  ["spend", "Расход"],
+                  ["budget", "Бюджет"],
+                  ["usage", "Освоение"],
+                  ["pace", "Темп"],
+                  ["riskScore", "Риск"],
                 ].map(([k, label]) => (
                   <th
                     key={k}
                     className={`sortable ${sortBy === k ? "active" : ""}`}
+                    aria-sort={sortBy === k ? (sortDir === "asc" ? "ascending" : "descending") : "none"}
                     onClick={() => {
                       if (sortBy === k) setSortDir(sortDir === "asc" ? "desc" : "asc");
                       else {
@@ -123,12 +176,12 @@ export function ClientOperationsView({
                       }
                     }}
                   >
-                    {label}
+                    {label}{sortBy === k ? <span aria-hidden="true"> {sortDir === "asc" ? "↑" : "↓"}</span> : null}
                   </th>
                 ))}
-                <th>Last Action</th>
-                <th>Owner</th>
-                <th>Actions</th>
+                <th>Последнее действие</th>
+                <th>Ответственный</th>
+                <th>Действия</th>
               </tr>
             </thead>
             <tbody>
@@ -136,13 +189,15 @@ export function ClientOperationsView({
                 const usage = r.usage == null ? null : Math.max(0, Math.min(130, r.usage));
                 const usageTone = usage == null ? "low" : usage >= 90 ? "high" : usage >= 70 ? "mid" : "low";
                 const riskTone = r.riskScore >= 80 ? "high" : r.riskScore >= 60 ? "medium" : "low";
-                const lastActionText = r.lastAction ? `${String(r.lastAction.action || "").toUpperCase()} ${String(r.lastAction.status || "")}` : "—";
+                const lastActionText = r.lastAction
+                  ? `${actionLabel(r.lastAction.action)} · ${statusLabel(r.lastAction.status)}`
+                  : "—";
                 return (
                   <tr key={r.id}>
                     <td>
                       <div className="client-cell">
                         <div className="client-name">{r.name}</div>
-                        <div className="client-id">ID: {r.id.slice(0, 8)}</div>
+                        <div className="client-id">Код: {r.id.slice(0, 8)}</div>
                       </div>
                     </td>
                     <td>{fmtMoney(r.spend)}</td>
@@ -151,11 +206,11 @@ export function ClientOperationsView({
                       <div className={`usage-bar ${usageTone}`}><div style={{ width: `${usage == null ? 0 : Math.min(100, usage)}%` }}></div></div>
                       {usage == null ? "—" : `${usage.toFixed(1)}%`}
                     </td>
-                    <td><span className={`badge ${r.pace === "critical" ? "bad" : r.pace === "warning" ? "warn" : "good"}`}>{r.pace.toUpperCase()}</span></td>
+                    <td><span className={`badge ${r.pace === "critical" ? "bad" : r.pace === "warning" || r.pace === "no_budget" ? "warn" : "good"}`}>{paceLabels[r.pace]}</span></td>
                     <td><span className={`risk-score ${riskTone}`}>{String(r.riskScore).padStart(2, "0")}</span></td>
                     <td>{lastActionText}</td>
                     <td><span className="owner-pill">{r.owner}</span></td>
-                    <td><button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>OPEN CLIENT</button></td>
+                    <td><button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>Открыть</button></td>
                   </tr>
                 );
               })}
@@ -167,7 +222,7 @@ export function ClientOperationsView({
               {(() => {
                 const start = filteredClientOpsRows.length ? (page - 1) * pageSize + 1 : 0;
                 const end = Math.min(page * pageSize, filteredClientOpsRows.length);
-                return `Showing ${start}-${end} of ${filteredClientOpsRows.length} clients`;
+                return `Показано ${start}–${end} из ${filteredClientOpsRows.length}`;
               })()}
             </div>
             <div className="pager">
@@ -184,40 +239,45 @@ export function ClientOperationsView({
 
         <div className="side-stack">
           <article className="panel">
-            <h3>Urgent Alerts</h3>
-            {filteredClientOpsRows.filter((x) => x.riskScore >= 70).slice(0, 3).map((r, idx) => (
-              <div key={r.id} className={`alert-card ${idx === 0 ? "high" : ""}`}>
-                <div className={`alert-priority ${idx === 0 ? "high" : ""}`}>{idx === 0 ? "HIGH PRIORITY" : "MED PRIORITY"}</div>
-                <div className="insight-title" style={{ marginTop: 8 }}>{r.name} needs review</div>
-                <div className="insight-text">Spend {fmtMoney(r.spend)} vs budget {r.budget ? fmtMoney(r.budget) : "—"}.</div>
-                <div className="alert-actions">
-                  <button className="mini-btn" onClick={() => void onAlertAction(r, "cap")}>CAP</button>
-                  <button className="mini-btn" onClick={() => void onAlertAction(r, "review")}>REVIEW</button>
-                  <button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>OPEN CLIENT</button>
+            <h3>Требуют внимания</h3>
+            <div className="panel-subtitle">Сначала клиенты с наибольшим операционным риском</div>
+            {filteredClientOpsRows.filter((x) => x.riskScore >= 70).slice(0, 3).map((r) => {
+              const highPriority = r.riskScore >= 80;
+              return (
+                <div key={r.id} className={`alert-card ${highPriority ? "high" : ""}`}>
+                  <div className={`alert-priority ${highPriority ? "high" : ""}`}>{highPriority ? "Высокий приоритет" : "Средний приоритет"}</div>
+                  <div className="insight-title" style={{ marginTop: 8 }}>{r.name}: нужна проверка</div>
+                  <div className="insight-text">Расход {fmtMoney(r.spend)} · бюджет {r.budget ? fmtMoney(r.budget) : "не задан"}.</div>
+                  <div className="alert-actions">
+                    <button className="mini-btn" onClick={() => void onAlertAction(r, "cap")}>Ограничить</button>
+                    <button className="mini-btn" onClick={() => void onAlertAction(r, "review")}>Проверить</button>
+                    <button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>Открыть</button>
+                  </div>
                 </div>
-              </div>
-            ))}
-            {!filteredClientOpsRows.some((x) => x.riskScore >= 70) ? <div className="muted-note">No urgent alerts in current scope.</div> : null}
+              );
+            })}
+            {!filteredClientOpsRows.some((x) => x.riskScore >= 70) ? <div className="muted-note">В текущей выборке нет срочных отклонений.</div> : null}
           </article>
           <article className="panel">
-            <h3>Recent Activity</h3>
+            <h3>Последние действия</h3>
+            <div className="panel-subtitle">Операции агентства по клиентам</div>
             {!recentActions.length ? (
-              <div className="muted-note">No activity yet.</div>
+              <div className="muted-note">Действий пока нет.</div>
             ) : (
               recentActions.slice(0, 6).map((x) => {
                 const d = new Date(x.created_at);
-                const ts = Number.isNaN(d.getTime()) ? x.created_at : d.toLocaleString();
-                const action = String(x.action || "").toUpperCase();
+                const ts = Number.isNaN(d.getTime()) ? x.created_at : d.toLocaleString("ru-RU");
+                const action = actionLabel(x.action);
                 const client = clients.find((c) => c.id === x.client_id);
                 return (
                   <div key={x.id} className="activity-item">
-                    <div className="activity-title">{action} {client ? `for ${client.name}` : ""}</div>
-                    <div className="activity-meta">{x.status?.toUpperCase()} • {ts}</div>
+                    <div className="activity-title">{action}{client ? ` · ${client.name}` : ""}</div>
+                    <div className="activity-meta">{statusLabel(x.status)} · {ts}</div>
                     <div className="activity-action">
                       {x.client_id ? (
-                        <button className="mini-btn open-client-btn" onClick={() => onOpenClient(x.client_id || "")}>OPEN CLIENT</button>
+                        <button className="mini-btn open-client-btn" onClick={() => onOpenClient(x.client_id || "")}>Открыть</button>
                       ) : (
-                        <button className="mini-btn" disabled>NO CLIENT CONTEXT</button>
+                        <button className="mini-btn" disabled>Нет привязки к клиенту</button>
                       )}
                     </div>
                   </div>

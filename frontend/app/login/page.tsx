@@ -37,7 +37,7 @@ export default function LoginPage() {
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const t = token.trim();
     if (!base || !t) {
-      setError("API base and session token are required");
+      setError("Укажите адрес API и токен сессии");
       return;
     }
 
@@ -48,7 +48,7 @@ export default function LoginPage() {
         headers: { Authorization: `Bearer ${t}` },
       });
       if (!res.ok) {
-        setError("Invalid session token");
+        setError("Токен сессии недействителен");
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
@@ -56,7 +56,7 @@ export default function LoginPage() {
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {
-      setError("Login failed");
+      setError("Не удалось войти");
     } finally {
       setLoading(false);
     }
@@ -65,11 +65,11 @@ export default function LoginPage() {
   async function acceptInvite() {
     const base = normalizeApiBase(apiBase, defaultApiBase);
     if (!base || !inviteToken) {
-      setError("Invite token is missing");
+      setError("В приглашении отсутствует токен");
       return;
     }
     if (invitePassword.trim().length < 8) {
-      setError("Password must be at least 8 characters");
+      setError("Пароль должен содержать не менее 8 символов");
       return;
     }
     setLoading(true);
@@ -83,7 +83,7 @@ export default function LoginPage() {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError((body && body.error && body.error.message) || "Invite accept failed");
+        setError((body && body.error && body.error.message) || "Не удалось принять приглашение");
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
@@ -96,7 +96,7 @@ export default function LoginPage() {
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {
-      setError("Invite accept failed");
+      setError("Не удалось принять приглашение");
     } finally {
       setLoading(false);
     }
@@ -106,7 +106,7 @@ export default function LoginPage() {
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const em = email.trim().toLowerCase();
     if (!base || !em || password.length < 8) {
-      setError("Email and password (min 8 chars) are required");
+      setError("Введите email и пароль не короче 8 символов");
       return;
     }
     setLoading(true);
@@ -120,7 +120,7 @@ export default function LoginPage() {
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError((body && body.error && body.error.message) || "Email/password login failed");
+        setError((body && body.error && body.error.message) || "Неверный email или пароль");
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
@@ -128,7 +128,7 @@ export default function LoginPage() {
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {
-      setError("Email/password login failed");
+      setError("Не удалось войти по email и паролю");
     } finally {
       setLoading(false);
     }
@@ -137,83 +137,83 @@ export default function LoginPage() {
   return (
     <main className="login-shell">
       <section className="login-card">
-        <h1>Sign In</h1>
+        <h1>Вход</h1>
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
           <select
             className="locale-switch"
             value={locale}
             onChange={(e) => setLocale(e.target.value as Locale)}
-            aria-label="Language"
-            title="Language"
+            aria-label="Язык"
+            title="Язык"
           >
             <option value="en">EN</option>
             <option value="ru">RU</option>
           </select>
         </div>
-        <p className="panel-subtitle">Sign in using your connected provider.</p>
+        <p className="panel-subtitle">Войдите удобным для вас способом.</p>
 
         {tokenLoginEnabled ? (
           <>
-            <div className="login-divider">Internal token login</div>
+            <div className="login-divider">Вход по внутреннему токену</div>
             <label>
-              API base
+              Адрес API
               <input value={apiBase} onChange={(e) => setApiBase(e.target.value)} placeholder="http://127.0.0.1:8000" />
             </label>
 
             <label>
-              Session token
+              Токен сессии
               <input
                 type="password"
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
-                placeholder="Paste session token"
+                placeholder="Вставьте токен сессии"
               />
             </label>
 
             <button className="primary-btn" onClick={() => void signInWithToken()} disabled={loading}>
-              {loading ? "Signing in..." : "Sign In"}
+              {loading ? "Входим…" : "Войти"}
             </button>
           </>
         ) : null}
 
-        <div className="login-divider">Email and password</div>
+        <div className="login-divider">Email и пароль</div>
         <label>
           Email
           <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
         </label>
         <label>
-          Password
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" />
+          Пароль
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Минимум 8 символов" />
         </label>
         <button className="primary-btn" onClick={() => void signInWithPassword()} disabled={loading}>
-          {loading ? "Signing in..." : "Sign In with Password"}
+          {loading ? "Входим…" : "Войти по паролю"}
         </button>
 
         <div className={`warning ${error ? "" : "hidden"}`}>{error}</div>
 
         {inviteToken ? (
           <>
-            <div className="login-divider">Agency invite</div>
+            <div className="login-divider">Приглашение в агентство</div>
             <label>
-              Your name (optional)
-              <input value={inviteName} onChange={(e) => setInviteName(e.target.value)} placeholder="John Doe" />
+              Ваше имя (необязательно)
+              <input value={inviteName} onChange={(e) => setInviteName(e.target.value)} placeholder="Иван Иванов" />
             </label>
             <label>
-              Set password
+              Придумайте пароль
               <input
                 type="password"
                 value={invitePassword}
                 onChange={(e) => setInvitePassword(e.target.value)}
-                placeholder="At least 8 characters"
+                placeholder="Минимум 8 символов"
               />
             </label>
             <button className="primary-btn" onClick={() => void acceptInvite()} disabled={loading}>
-              {loading ? "Accepting..." : "Accept Invite"}
+              {loading ? "Принимаем…" : "Принять приглашение"}
             </button>
           </>
         ) : null}
 
-        <div className="login-divider">OAuth providers</div>
+        <div className="login-divider">Вход через сервис</div>
         <div className="login-oauth-row">
           <button
             className="ghost-btn"
@@ -225,7 +225,7 @@ export default function LoginPage() {
               window.location.href = `${base}/auth/facebook/start?next=/`;
             }}
           >
-            Continue with Facebook
+            Продолжить через Facebook
           </button>
           <button
             className="ghost-btn"
@@ -237,7 +237,7 @@ export default function LoginPage() {
               window.location.href = `${base}/auth/google/start?next=/`;
             }}
           >
-            Continue with Google
+            Продолжить через Google
           </button>
         </div>
       </section>

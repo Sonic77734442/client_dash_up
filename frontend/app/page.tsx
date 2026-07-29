@@ -29,11 +29,11 @@ import {
 const TIMELINE_FUTURE_DAYS = 2;
 
 function fmtMoney(v: number | null | undefined) {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(v || 0);
+  return new Intl.NumberFormat("ru-RU", { style: "currency", currency: "KZT", maximumFractionDigits: 0 }).format(v || 0);
 }
 
 function fmtNum(v: number | null | undefined) {
-  return new Intl.NumberFormat("en-US").format(v || 0);
+  return new Intl.NumberFormat("ru-RU").format(v || 0);
 }
 
 function dateRange(periodDays: number) {
@@ -101,6 +101,7 @@ export default function HomePage() {
   const [warning, setWarning] = useState("");
   const [authResolved, setAuthResolved] = useState(false);
   const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
+  const [adminMetricsMode, setAdminMetricsMode] = useState(false);
 
   const [clientOpsSearch, setClientOpsSearch] = useState("");
   const [clientOpsChip, setClientOpsChip] = useState<"all" | "at_risk" | "overspending" | "no_budget" | "has_alerts">("all");
@@ -166,11 +167,19 @@ export default function HomePage() {
   }, [loadOverviewData, loadClientOpsData]);
 
   useEffect(() => {
+    setAdminMetricsMode(new URLSearchParams(window.location.search).get("admin_metrics") === "1");
+  }, []);
+
+  useEffect(() => {
     if (!ready) return;
     void resolveAuth()
       .then((role) => {
         if (role === "client") {
           router.replace("/portal");
+          return;
+        }
+        if (role === "admin" && new URLSearchParams(window.location.search).get("admin_metrics") !== "1") {
+          router.replace("/platform");
           return;
         }
         void loadClients();
@@ -408,71 +417,109 @@ useEffect(() => {
     [executeAction, listActions, clientId, push]
   );
 
-  const asOfText = overview ? `As of ${overview.range.as_of_date} • ${overview.range.timezone_policy}` : "As of --";
+  const runAccountAction = useCallback(
+    async (accountId: string, label: string) => {
+      const action: "cap" | "scale" | "review" =
+        label.toLocaleLowerCase("ru").includes("масштаб")
+          ? "scale"
+          : label.toLocaleLowerCase("ru").includes("огранич")
+          ? "cap"
+          : "review";
+      await executeAction({
+        action,
+        scope: "account",
+        scope_id: accountId,
+        title: label,
+        reason: "Действие создано из центра эффективности после проверки показателей аккаунта.",
+        metrics: {},
+        client_id: clientId || undefined,
+        account_id: accountId,
+      });
+      const acts = await listActions({ clientId: clientId || undefined });
+      setRecentActions(Array.isArray(acts) ? acts : []);
+      push(`Действие «${label}» добавлено в работу`, "success");
+    },
+    [clientId, executeAction, listActions, push]
+  );
+
+  const asOfText = overview ? `Данные на ${overview.range.as_of_date} • ${overview.range.timezone_policy}` : "Данные обновляются";
 
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="dashboard" subtitle="Operations Center" />
+        <AppSidebar active="dashboard" subtitle="Рабочее пространство агентства" />
 
         <main className="content">
-          <header className="topbar">
+          {currentRole === "admin" && adminMetricsMode ? (
+            <div className="admin-observer-banner">
+              <div>
+                <strong>Режим наблюдателя администратора</strong>
+                <span> Вы просматриваете рекламные показатели с глобальным доступом.</span>
+              </div>
+              <Link className="ghost-btn" href="/platform">Вернуться в админку</Link>
+            </div>
+          ) : null}
+          <header className="topbar role-page-topbar">
             <div className="topbar-left">
-              <div className="topbar-title">Editorial Rigor</div>
               <AppTopTabs active="dashboard" />
-              <div className="chip-row" style={{ marginTop: 8 }}>
-                <button className={`chip-btn ${view === "dashboard" ? "active" : ""}`} onClick={() => setView("dashboard")}>Overview Mode</button>
-                <button className={`chip-btn ${view === "client_ops" ? "active" : ""}`} onClick={() => setView("client_ops")}>Client Ops Mode</button>
+              <div className="topbar-title">Центр эффективности</div>
+              <div className="panel-subtitle">Показатели, отклонения и решения по всем клиентам агентства</div>
+              <div className="chip-row" style={{ marginTop: 6 }}>
+                <button className={`chip-btn ${view === "dashboard" ? "active" : ""}`} onClick={() => setView("dashboard")}>Обзор показателей</button>
+                <button className={`chip-btn ${view === "client_ops" ? "active" : ""}`} onClick={() => setView("client_ops")}>Портфель клиентов</button>
               </div>
             </div>
             {tokenLoginEnabled ? (
-              <div className="session-controls">
-                <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base (/api/backend)" />
-                <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
-                <button
-                  className="ghost-btn"
-                  onClick={async () => {
-                    const apiBase = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
-                    const token = session.token.trim();
-                    const next = { apiBase, token };
-                    persist(next);
-                    setSession(next);
-                    try {
-                      await loadClients();
-                      await refresh();
-                    } catch (err) {
-                      setWarning(err instanceof Error ? err.message : "Save failed");
-                    }
-                  }}
-                  disabled={!ready}
-                >
-                  Save
-                </button>
-              </div>
+              <details className="debug-session">
+                <summary>Подключение</summary>
+                <div className="debug-session-popover">
+                  <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API адрес" />
+                  <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Токен сессии" />
+                  <button
+                    className="ghost-btn"
+                    onClick={async () => {
+                      const apiBase = session.apiBase.trim().replace(/\/$/, "") || defaultApiBase;
+                      const token = session.token.trim();
+                      const next = { apiBase, token };
+                      persist(next);
+                      setSession(next);
+                      try {
+                        await loadClients();
+                        await refresh();
+                      } catch (err) {
+                        setWarning(err instanceof Error ? err.message : "Не удалось сохранить подключение");
+                      }
+                    }}
+                    disabled={!ready}
+                  >
+                    Сохранить
+                  </button>
+                </div>
+              </details>
             ) : null}
           </header>
 
           <section className="filters">
             <label>
-              Period
+              Период
               <div className="chip-row" style={{ marginTop: 6 }}>
-                <button className={`chip-btn ${periodDays === 7 ? "active" : ""}`} onClick={() => applyQuickRange(7)}>7 days</button>
-                <button className={`chip-btn ${periodDays === 15 ? "active" : ""}`} onClick={() => applyQuickRange(15)}>15 days</button>
-                <button className={`chip-btn ${periodDays === 30 ? "active" : ""}`} onClick={() => applyQuickRange(30)}>30 days</button>
+                <button className={`chip-btn ${periodDays === 7 ? "active" : ""}`} onClick={() => applyQuickRange(7)}>7 дней</button>
+                <button className={`chip-btn ${periodDays === 15 ? "active" : ""}`} onClick={() => applyQuickRange(15)}>15 дней</button>
+                <button className={`chip-btn ${periodDays === 30 ? "active" : ""}`} onClick={() => applyQuickRange(30)}>30 дней</button>
               </div>
             </label>
             <label>
-              Date From
+              Дата с
               <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
             </label>
             <label>
-              Date To
+              Дата по
               <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
             </label>
             <label>
-              Client
+              Клиент
               <select value={clientId} onChange={(e) => setClientId(e.target.value)}>
-                <option value="">All Clients</option>
+                <option value="">Все клиенты</option>
                 {clients.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
@@ -481,9 +528,9 @@ useEffect(() => {
               </select>
             </label>
             <label>
-              Platform
+              Платформа
               <select value={platform} onChange={(e) => setPlatform(e.target.value as "all" | "meta" | "google" | "tiktok")}>
-                <option value="all">All Platforms</option>
+                <option value="all">Все платформы</option>
                 <option value="meta">Meta</option>
                 <option value="google">Google</option>
                 <option value="tiktok">TikTok</option>
@@ -491,7 +538,7 @@ useEffect(() => {
             </label>
             <div className="asof">{asOfText}</div>
             <button className="ghost-btn" onClick={() => void refresh()}>
-              Apply Filters
+              Применить
             </button>
           </section>
 
@@ -512,7 +559,7 @@ useEffect(() => {
               fmtNum={fmtNum}
               paceClass={paceClass}
               onInsightAction={runInsightAction}
-              onRiskActionDraft={(accountId, label) => push(`Action draft: ${label} for account ${accountId}`, "info")}
+              onRiskActionDraft={runAccountAction}
             />
           ) : (
             <ClientOperationsView

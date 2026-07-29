@@ -284,6 +284,27 @@ export type AuthMeResponse = {
   session: SessionContext;
 };
 
+export type UserClientAccessOut = {
+  id: string;
+  user_id: string;
+  client_id: string;
+  role: "agency" | "client";
+  created_at: string;
+  updated_at: string;
+};
+
+export type AuditLogOut = {
+  id: number;
+  event_type: string;
+  resource_type: string;
+  resource_id?: string | null;
+  actor_user_id?: string | null;
+  actor_role?: string | null;
+  tenant_client_id?: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+};
+
 export type AgencyOut = {
   id: string;
   name: string;

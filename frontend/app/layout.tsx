@@ -5,13 +5,13 @@ import { RuntimeI18n } from "../components/RuntimeI18n";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Ops Center Dashboard",
-  description: "Envidicy dashboard frontend",
+  title: "Client Dash Up",
+  description: "Операционный центр эффективности рекламы",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="ru">
       <body>
         <RuntimeI18n />
         <ImpersonationBanner />

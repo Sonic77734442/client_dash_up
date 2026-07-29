@@ -74,6 +74,10 @@ export function RuntimeI18n() {
         const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
         let node = walker.nextNode();
         while (node) {
+          if (node.parentElement?.closest("[data-i18n-skip]")) {
+            node = walker.nextNode();
+            continue;
+          }
           const parentTag = (node.parentElement?.tagName || "").toUpperCase();
           if (parentTag === "SCRIPT" || parentTag === "STYLE" || parentTag === "NOSCRIPT") {
             node = walker.nextNode();
@@ -87,6 +91,7 @@ export function RuntimeI18n() {
 
         const elements = root.querySelectorAll<HTMLElement>("*");
         for (const el of elements) {
+          if (el.closest("[data-i18n-skip]")) continue;
           for (const attr of ATTRS) {
             const current = el.getAttribute(attr);
             if (!current) continue;
