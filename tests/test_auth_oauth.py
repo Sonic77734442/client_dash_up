@@ -2,7 +2,7 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import _oauth_provider_config_or_400, app
 from app.services.oauth import ExternalIdentityPayload
 
 
@@ -73,6 +73,26 @@ def test_oauth_start_redirects_to_provider_url_with_state():
     parsed = urlparse(location)
     qs = parse_qs(parsed.query)
     assert qs.get("state")
+
+
+def test_oauth_redirect_uri_environment_override(monkeypatch):
+    reset_state()
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "google-client",
+            "client_secret": "google-secret",
+            "redirect_uri": "https://api.example/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    expected = "https://dashboard.example/api/backend/auth/google/callback"
+    monkeypatch.setenv("GOOGLE_REDIRECT_URI", expected)
+    resolved = _oauth_provider_config_or_400("google")
+    assert resolved.redirect_uri == expected
 
 
 def test_oauth_callback_issues_internal_session_and_redirects_frontend():

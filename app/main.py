@@ -1020,11 +1020,25 @@ def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
                 "message": f"OAuth provider '{provider}' is not configured or disabled",
             },
         )
+    redirect_env_name = {
+        "google": "GOOGLE_REDIRECT_URI",
+        "facebook": "FACEBOOK_REDIRECT_URI",
+    }.get(provider)
+    redirect_uri = (os.getenv(redirect_env_name, "").strip() if redirect_env_name else "") or cfg.redirect_uri
+    parsed_redirect = urlsplit(redirect_uri)
+    if parsed_redirect.scheme not in {"http", "https"} or not parsed_redirect.netloc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "provider_redirect_invalid",
+                "message": f"OAuth provider '{provider}' has an invalid redirect URI",
+            },
+        )
     return OAuthProviderConfig(
         provider=cfg.provider,
         client_id=cfg.client_id,
         client_secret=cfg.client_secret,
-        redirect_uri=cfg.redirect_uri,
+        redirect_uri=redirect_uri,
         enabled=cfg.enabled,
     )
 
