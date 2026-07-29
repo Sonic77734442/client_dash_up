@@ -9,7 +9,7 @@ const PUBLIC_PATHS = new Set(["/login", "/login/success"]);
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { ready, authenticated, role } = useAuth(defaultApiBase);
 
   const currentPath = pathname || "";

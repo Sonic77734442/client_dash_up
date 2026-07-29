@@ -1,0 +1,34 @@
+# Local environments and caches
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and local runtime configuration
+.env
+.env.*
+!.env.example
+!.env.prod.example
+accounts.json
+
+# Runtime data, credentials, logs, and backups
+storage/
+backups/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+frontend/*.tsbuildinfo
+
+# Test and tool output
+playwright-report/
+test-results/
+coverage/

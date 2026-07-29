@@ -4,19 +4,19 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
 import { Locale } from "../../lib/i18n";
-import { normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
+import { DEFAULT_API_BASE, normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
+import { clearSessionToken, setSessionToken } from "../../lib/sessionToken";
 
 const LS_API_BASE = "ops_api_base";
-const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export default function LoginPage() {
   const router = useRouter();
   const search = useSearchParams();
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
-  const [apiBase, setApiBase] = useState(normalizeApiBase(defaultApiBase, "http://localhost:8000"));
+  const [apiBase, setApiBase] = useState(normalizeApiBase(defaultApiBase, DEFAULT_API_BASE));
   const [token, setToken] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -52,7 +52,7 @@ export default function LoginPage() {
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
-      localStorage.setItem(LS_SESSION_TOKEN, t);
+      setSessionToken(t);
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {
@@ -89,9 +89,9 @@ export default function LoginPage() {
       localStorage.setItem(LS_API_BASE, base);
       const issuedToken = String((body as { session?: { token?: string } })?.session?.token || "").trim();
       if (issuedToken) {
-        localStorage.setItem(LS_SESSION_TOKEN, issuedToken);
+        setSessionToken(issuedToken);
       } else {
-        localStorage.removeItem(LS_SESSION_TOKEN);
+        clearSessionToken();
       }
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
@@ -124,7 +124,7 @@ export default function LoginPage() {
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
-      localStorage.removeItem(LS_SESSION_TOKEN);
+      clearSessionToken();
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.replace("/");
     } catch {
@@ -220,7 +220,7 @@ export default function LoginPage() {
             onClick={() => {
               const base = normalizeApiBase(apiBase, defaultApiBase);
               localStorage.setItem(LS_API_BASE, base);
-              localStorage.removeItem(LS_SESSION_TOKEN);
+              clearSessionToken();
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
               window.location.href = `${base}/auth/facebook/start?next=/`;
             }}
@@ -232,7 +232,7 @@ export default function LoginPage() {
             onClick={() => {
               const base = normalizeApiBase(apiBase, defaultApiBase);
               localStorage.setItem(LS_API_BASE, base);
-              localStorage.removeItem(LS_SESSION_TOKEN);
+              clearSessionToken();
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
               window.location.href = `${base}/auth/google/start?next=/`;
             }}

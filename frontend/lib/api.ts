@@ -1,3 +1,5 @@
+import { getSessionToken } from "./sessionToken";
+
 export type ApiErrorEnvelope = {
   error?: {
     code?: string;
@@ -55,29 +57,21 @@ function readCookie(name: string): string {
 
 const CSRF_COOKIE_NAME = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
 const CSRF_HEADER_NAME = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
-const CSRF_STORAGE_KEY = "ops_csrf_token";
 
 let csrfMemoryToken = "";
 
 function readStoredCsrfToken(): string {
-  if (typeof window === "undefined") return "";
-  if (csrfMemoryToken) return csrfMemoryToken;
-  const stored = (localStorage.getItem(CSRF_STORAGE_KEY) || "").trim();
-  if (stored) csrfMemoryToken = stored;
-  return stored;
+  return csrfMemoryToken;
 }
 
 function storeCsrfToken(token: string): void {
   const value = (token || "").trim();
-  if (!value || typeof window === "undefined") return;
+  if (!value) return;
   csrfMemoryToken = value;
-  localStorage.setItem(CSRF_STORAGE_KEY, value);
 }
 
 function clearStoredCsrfToken(): void {
   csrfMemoryToken = "";
-  if (typeof window === "undefined") return;
-  localStorage.removeItem(CSRF_STORAGE_KEY);
 }
 
 async function resolveCsrfToken(baseUrl: string): Promise<string> {
@@ -89,7 +83,7 @@ async function resolveCsrfToken(baseUrl: string): Promise<string> {
   const fromStorage = readStoredCsrfToken();
   if (fromStorage) return fromStorage;
 
-  // Cross-domain SPA cannot read API-domain cookies; ask API for CSRF token explicitly.
+  // Recover a fresh token when the readable same-origin CSRF cookie is not available yet.
   const res = await fetch(`${baseUrl}/auth/csrf`, {
     method: "GET",
     credentials: "include",
@@ -117,7 +111,7 @@ export async function fetchJson<T>(
   const resolvedToken = (token || "").trim();
   const fallbackToken =
     typeof window !== "undefined"
-      ? (localStorage.getItem("ops_session_token") || "").trim()
+      ? getSessionToken()
       : "";
 
   async function requestOnce(forceRefreshCsrf: boolean): Promise<{ res: Response; body: unknown }> {

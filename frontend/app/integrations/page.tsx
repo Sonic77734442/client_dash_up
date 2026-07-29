@@ -42,7 +42,7 @@ function authStateLabel(state?: string | null) {
 }
 
 export default function IntegrationsPage() {
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();

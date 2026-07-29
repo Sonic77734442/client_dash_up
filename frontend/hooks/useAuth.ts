@@ -4,8 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse } from "../lib/types";
 import { fetchJson } from "../lib/api";
 import { resolveApiBase } from "../lib/apiBase";
+import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
 
-const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export function useAuth(defaultApiBase: string) {
@@ -16,7 +16,7 @@ export function useAuth(defaultApiBase: string) {
 
   const refresh = useCallback(async () => {
     const apiBase = resolveApiBase(defaultApiBase);
-    const token = localStorage.getItem(LS_SESSION_TOKEN) || "";
+    const token = getSessionToken();
 
     try {
       const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
@@ -41,7 +41,7 @@ export function useAuth(defaultApiBase: string) {
     } catch {
       // noop
     }
-    localStorage.removeItem(LS_SESSION_TOKEN);
+    clearSessionToken();
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
     setAuthenticated(false);
     setRole(null);

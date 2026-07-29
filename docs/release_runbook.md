@@ -119,3 +119,28 @@ Capture:
 ## Notes
 - Keep migrations forward-only in normal release path.
 - Avoid hotfix SQL on production without adding matching migration file.
+# Same-origin authentication gate
+
+Before promoting the frontend, configure Vercel with:
+
+- `NEXT_PUBLIC_API_BASE=/api/backend`
+- `API_UPSTREAM_BASE=https://client-dash-up.onrender.com`
+- `NEXT_PUBLIC_ENABLE_TOKEN_LOGIN=false`
+
+Configure the backend with `FRONTEND_BASE_URL=https://client-dash-up.vercel.app`,
+`AUTH_COOKIE_SECURE=true`, and `AUTH_COOKIE_SAMESITE=lax`.
+
+Register the following exact OAuth callback URLs in Google/Facebook and in the
+backend provider configuration:
+
+- `https://client-dash-up.vercel.app/api/backend/auth/google/callback`
+- `https://client-dash-up.vercel.app/api/backend/auth/facebook/callback`
+
+Release verification:
+
+1. `GET /api/backend/healthz` returns `200`.
+2. Password login returns two separate `Set-Cookie` headers for `ops_session`
+   and `ops_csrf`.
+3. `GET /api/backend/auth/me` succeeds after login without a bearer token.
+4. Google and Facebook return through the Vercel callback URLs.
+5. Logout invalidates the session and clears both cookies.

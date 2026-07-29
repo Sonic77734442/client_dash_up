@@ -24,7 +24,7 @@ function dateRange(periodDays: number) {
 }
 
 export default function ClientDetailsPage({ clientId }: { clientId: string }) {
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { session, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
   const { executeAction, listActions } = useOperationalActions(session.apiBase, session.token);

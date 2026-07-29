@@ -23,7 +23,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://127.0.0.1:8000}
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-/api/backend}
+    environment:
+      API_UPSTREAM_BASE: http://api:8000
     restart: unless-stopped
     ports:
       - "${WEB_BIND_PORT:-5173}:5173"

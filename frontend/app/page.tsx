@@ -75,7 +75,7 @@ function paceClass(status: string) {
 }
 
 export default function HomePage() {
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const router = useRouter();
@@ -427,7 +427,7 @@ useEffect(() => {
             </div>
             {tokenLoginEnabled ? (
               <div className="session-controls">
-                <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base (http://localhost:8000)" />
+                <input type="text" value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base (/api/backend)" />
                 <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
                 <button
                   className="ghost-btn"

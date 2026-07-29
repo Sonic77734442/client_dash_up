@@ -1,5 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
+const pythonBin = process.env.PYTHON_BIN || "python";
+
 export default defineConfig({
   testDir: "./tests/smoke",
   workers: 1,
@@ -7,15 +9,19 @@ export default defineConfig({
   retries: 0,
   webServer: [
     {
-      command:
-        'cmd.exe /c "set ENABLE_TEST_ENDPOINTS=true&& set APP_ENV=development&& set AUTH_RATE_LIMIT_ENABLED=false&& .venv312\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000"',
+      command: `${pythonBin} -m uvicorn app.main:app --host 127.0.0.1 --port 8000`,
       cwd: "..",
+      env: {
+        ENABLE_TEST_ENDPOINTS: "true",
+        APP_ENV: "development",
+        AUTH_RATE_LIMIT_ENABLED: "false",
+      },
       url: "http://127.0.0.1:8000/health",
       timeout: 120_000,
       reuseExistingServer: true,
     },
     {
-      command: "cmd.exe /c npm run dev",
+      command: "npm run dev",
       url: "http://127.0.0.1:5173",
       timeout: 120_000,
       reuseExistingServer: true,

@@ -1,12 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
 import { ToastHost } from "../../../components/ToastHost";
 import { useSession } from "../../../hooks/useSession";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson } from "../../../lib/api";
+import {
+  getSessionToken,
+  setImpersonationReturnSession,
+  setSessionToken,
+} from "../../../lib/sessionToken";
 import {
   AgencyInviteIssueResponse,
   AgencyInviteOut,
@@ -32,11 +38,7 @@ type SessionIssueResponse = {
 };
 
 const LS_API_BASE = "ops_api_base";
-const LS_SESSION_TOKEN = "ops_session_token";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
-const IMPERSONATION_LABEL = "ops_impersonation_label";
-const IMPERSONATION_RETURN_API_BASE = "ops_impersonation_return_api_base";
-const IMPERSONATION_RETURN_TOKEN = "ops_impersonation_return_token";
 
 function fmtDate(v?: string | null) {
   if (!v) return "--";
@@ -52,7 +54,8 @@ function agencyRoleLabel(v: "owner" | "manager" | "member") {
 }
 
 export default function PlatformAgenciesPage() {
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const router = useRouter();
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const { toasts, push } = useToast();
@@ -358,19 +361,17 @@ export default function PlatformAgenciesPage() {
       return;
     }
     try {
-      const currentToken = session.token || localStorage.getItem(LS_SESSION_TOKEN) || "";
+      const currentToken = session.token || getSessionToken();
       const currentApiBase = session.apiBase || localStorage.getItem(LS_API_BASE) || defaultApiBase;
       const issued = await req<SessionIssueResponse>("/auth/internal/sessions/issue", {
         method: "POST",
         body: JSON.stringify({ user_id: userId, ttl_minutes: 1440 }),
       });
-      localStorage.setItem(IMPERSONATION_RETURN_TOKEN, currentToken);
-      localStorage.setItem(IMPERSONATION_RETURN_API_BASE, currentApiBase);
-      localStorage.setItem(IMPERSONATION_LABEL, `${user.name} / ${selectedAgency.name}`);
+      setImpersonationReturnSession(currentToken, currentApiBase, `${user.name} / ${selectedAgency.name}`);
       localStorage.setItem(LS_API_BASE, currentApiBase);
-      localStorage.setItem(LS_SESSION_TOKEN, issued.token);
+      setSessionToken(issued.token);
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-      window.location.href = "/";
+      router.push("/");
     } catch (err) {
       push(err instanceof Error ? err.message : "Open agency workspace failed", "error");
     }

@@ -49,7 +49,6 @@ export async function attachSession(page: Page, context: BrowserContext, token: 
   ]);
   await page.addInitScript((apiBase: string) => {
     localStorage.setItem("ops_api_base", apiBase);
-    localStorage.removeItem("ops_session_token");
   }, API_BASE);
 }
 

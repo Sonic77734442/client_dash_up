@@ -5,6 +5,7 @@ import { useSessionContext } from "../hooks/useSessionContext";
 import { useLocale } from "../hooks/useLocale";
 import { t } from "../lib/i18n";
 import { resolveApiBase } from "../lib/apiBase";
+import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
 
 type SidebarSection =
   | "dashboard"
@@ -43,13 +44,13 @@ export function AppSidebar({
   const { context } = useSessionContext();
   const { locale } = useLocale();
   const showPlatformAdmin = Boolean(context?.valid) && context?.role === "admin";
-  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
 
   async function handleLogout() {
     try {
       const apiBase = resolveApiBase(defaultApiBase);
-      const token = tokenLoginEnabled ? (localStorage.getItem("ops_session_token") || "") : "";
+      const token = tokenLoginEnabled ? getSessionToken() : "";
       const headers: HeadersInit = {};
       if (token) headers.Authorization = `Bearer ${token}`;
       const csrfHeaderName = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
@@ -64,7 +65,7 @@ export function AppSidebar({
     } catch {
       // noop
     } finally {
-      localStorage.removeItem("ops_session_token");
+      clearSessionToken();
       localStorage.removeItem("ops_api_base");
       window.dispatchEvent(new Event("ops-session-updated"));
       window.location.replace("/login");
