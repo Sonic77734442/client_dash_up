@@ -60,7 +60,7 @@ function authStateLabel(state?: string | null) {
 
 function providerLabel(v: string) {
   const p = (v || "").toLowerCase();
-  if (p === "meta" || p === "facebook") return "Meta";
+  if (p === "meta" || p === "facebook") return "Meta Ads";
   if (p === "google" || p === "google_ads") return "Google Ads";
   if (p === "tiktok" || p === "tt") return "TikTok";
   return v;
@@ -353,7 +353,7 @@ export default function SyncMonitorPage() {
     const p = (row.provider || "").toLowerCase().trim();
     const providerName = p === "google" ? "google" : (p === "meta" || p === "facebook" ? "facebook" : null);
     if (!providerName) {
-      push("Переподключение через интерфейс доступно для Google Ads и Meta", "info");
+      push("Переподключение через интерфейс доступно для Google Ads и Meta Ads", "info");
       return;
     }
     setConnectProviderName(providerName);
@@ -611,7 +611,7 @@ export default function SyncMonitorPage() {
               <div>
                 <h3 style={{ margin: 0 }}>1. Подключите рекламную платформу</h3>
                 <div className="panel-subtitle">
-                  Авторизуйтесь в Google или Meta один раз. Пароли и токены в интерфейсе вводить не нужно.
+                  Предоставьте доступ к рекламным кабинетам Google Ads или Meta Ads. Это не вход в платформу.
                 </div>
               </div>
               <div className="data-connection-actions">
@@ -634,7 +634,7 @@ export default function SyncMonitorPage() {
                   Найти аккаунты
                 </button>
                 <button className="primary-btn" onClick={() => openConnectProvider("google")}>Подключить Google Ads</button>
-                <button className="primary-btn" onClick={() => openConnectProvider("facebook")}>Подключить Meta</button>
+                <button className="primary-btn" onClick={() => openConnectProvider("facebook")}>Подключить Meta Ads</button>
               </div>
             </div>
             {currentRole === "client" ? (
@@ -667,7 +667,7 @@ export default function SyncMonitorPage() {
                         </button>
                       ) : asSyncPlatform(p.provider) === "meta" ? (
                         <button className="primary-btn" onClick={() => openConnectProvider("facebook")}>
-                          Подключить Meta
+                          Подключить Meta Ads
                         </button>
                       ) : (
                         <button

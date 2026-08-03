@@ -129,7 +129,9 @@ Backend for digital analytics with normalized spend, manual budgets, and unified
 - OAuth provider entrypoints:
   - `GET /auth/facebook/start` -> `GET /auth/facebook/callback`
   - `GET /auth/google/start` -> `GET /auth/google/callback`
-  - callback resolves internal user via `auth_identities`, then issues backend-owned session token
+  - `intent=login` resolves an internal user via `auth_identities`; `intent=connect` requires an existing admin/agency session and stores integration credentials without creating an auth identity
+  - Facebook platform login uses the separate `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`, and `FACEBOOK_AUTH_REDIRECT_URI` app credentials
+  - Meta Ads connection uses `FACEBOOK_CLIENT_ID`, `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and `FACEBOOK_LOGIN_CONFIG_ID`
   - callback sets `ops_session` httpOnly cookie and redirects to frontend login-success route
   - start/callback flow uses state + nonce cookie validation (double-submit) to harden CSRF protection
   - external auth does not grant authorization; tenant access still comes from role + `user_client_access`

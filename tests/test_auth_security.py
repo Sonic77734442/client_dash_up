@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app
+from app.schemas import UserCreate
 from app.services.oauth import ExternalIdentityPayload
 
 
@@ -34,8 +35,18 @@ def reset_state():
     client.cookies.clear()
 
 
-def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt():
+def set_facebook_auth_env(monkeypatch):
+    monkeypatch.setenv("FACEBOOK_AUTH_CLIENT_ID", "facebook-auth-client")
+    monkeypatch.setenv("FACEBOOK_AUTH_CLIENT_SECRET", "facebook-auth-secret")
+    monkeypatch.setenv(
+        "FACEBOOK_AUTH_REDIRECT_URI",
+        "http://127.0.0.1:8000/auth/facebook/callback",
+    )
+
+
+def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt(monkeypatch):
     reset_state()
+    set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
     cfg = client.post(
@@ -49,6 +60,14 @@ def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt():
         },
     )
     assert cfg.status_code == 200
+    app.state.auth_store.create_user(
+        UserCreate(
+            email="oauth.security@example.com",
+            name="Approved OAuth Security",
+            role="client",
+            status="active",
+        )
+    )
 
     start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
     assert start.status_code == 302
@@ -70,8 +89,9 @@ def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt():
     assert out.status_code == 200
 
 
-def test_cookie_session_can_fetch_csrf_token_via_endpoint():
+def test_cookie_session_can_fetch_csrf_token_via_endpoint(monkeypatch):
     reset_state()
+    set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
     cfg = client.post(
@@ -85,6 +105,14 @@ def test_cookie_session_can_fetch_csrf_token_via_endpoint():
         },
     )
     assert cfg.status_code == 200
+    app.state.auth_store.create_user(
+        UserCreate(
+            email="oauth.security@example.com",
+            name="Approved OAuth Security",
+            role="client",
+            status="active",
+        )
+    )
 
     start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
     assert start.status_code == 302

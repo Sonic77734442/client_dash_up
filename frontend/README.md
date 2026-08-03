@@ -62,6 +62,21 @@ provider configuration must point to the Vercel proxy:
 - Google: `https://client-dash-up.vercel.app/api/backend/auth/google/callback`
 - Facebook: `https://client-dash-up.vercel.app/api/backend/auth/facebook/callback`
 
+Facebook uses two intentionally separate OAuth configurations even though the
+callback path is the same:
+
+- **Войти через Facebook** (`intent=login`) only signs the user into the
+  platform. It uses `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`,
+  and `FACEBOOK_AUTH_REDIRECT_URI`; it does not connect advertising accounts.
+- **Подключить Meta Ads** (`intent=connect`) is available after login for an
+  administrator or agency user. It uses `FACEBOOK_CLIENT_ID`,
+  `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and
+  `FACEBOOK_LOGIN_CONFIG_ID` to grant access to advertising accounts.
+
+Register the callback URL in both Facebook apps/configurations. Platform login
+does not grant tenant access automatically: the user's role and client access
+must still be approved by an administrator.
+
 This makes the backend's `ops_session` and `ops_csrf` cookies first-party
 cookies on the frontend origin. Do not expose `API_UPSTREAM_BASE` through a
 `NEXT_PUBLIC_*` variable.

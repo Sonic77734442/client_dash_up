@@ -156,6 +156,15 @@ export default function LoginPage() {
     }
   }
 
+  function startOAuthLogin(provider: "facebook" | "google") {
+    const base = normalizeApiBase(apiBase, defaultApiBase);
+    localStorage.setItem(LS_API_BASE, base);
+    clearSessionToken();
+    window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+    const params = new URLSearchParams({ next: requestedNext, intent: "login" });
+    window.location.href = `${base}/auth/${provider}/start?${params.toString()}`;
+  }
+
   return (
     <main className="login-shell">
       <section className="login-card">
@@ -237,20 +246,24 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        <div className="login-divider">Вход через Google</div>
+        <div className="login-divider">Вход через сервис</div>
+        <p className="panel-subtitle">
+          Только вход в платформу. Рекламные кабинеты подключаются после входа в разделе «Данные и подключения».
+        </p>
         <div className="login-oauth-row">
           <button
             className="ghost-btn"
-            onClick={() => {
-              const base = normalizeApiBase(apiBase, defaultApiBase);
-              localStorage.setItem(LS_API_BASE, base);
-              clearSessionToken();
-              window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-              const params = new URLSearchParams({ next: requestedNext, intent: "login" });
-              window.location.href = `${base}/auth/google/start?${params.toString()}`;
-            }}
+            onClick={() => startOAuthLogin("facebook")}
+            disabled={loading}
           >
-            Продолжить через Google
+            Войти через Facebook
+          </button>
+          <button
+            className="ghost-btn"
+            onClick={() => startOAuthLogin("google")}
+            disabled={loading}
+          >
+            Войти через Google
           </button>
         </div>
       </section>

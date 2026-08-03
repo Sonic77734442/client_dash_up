@@ -146,14 +146,16 @@ class FacebookOAuthAdapter:
     provider = "facebook"
 
     def build_authorize_url(self, cfg: OAuthProviderConfig, state: str) -> str:
-        if cfg.intent != "connect":
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "facebook_login_not_supported",
-                    "message": "Facebook is configured only for connecting advertising data",
-                },
-            )
+        if cfg.intent == "login":
+            params = {
+                "client_id": cfg.client_id,
+                "redirect_uri": cfg.redirect_uri,
+                "state": state,
+                "scope": "public_profile,email",
+                "response_type": "code",
+            }
+            return f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
+
         if not cfg.config_id:
             raise HTTPException(
                 status_code=400,
@@ -192,7 +194,8 @@ class FacebookOAuthAdapter:
 
             profile_resp = client.get(
                 f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/me",
-                params={"fields": "id,name", "access_token": token},
+                params={"fields": "id,name,email" if cfg.intent == "login" else "id,name"},
+                headers={"Authorization": f"Bearer {token}"},
             )
             if profile_resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="Facebook profile fetch failed")

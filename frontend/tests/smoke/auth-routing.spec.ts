@@ -130,10 +130,45 @@ test("provider config parser accepts the API envelope and rejects malformed payl
 test("OAuth errors are mapped to safe Russian messages", () => {
   expect(oauthErrorMessage("access_denied")).toBe("Вы отменили предоставление доступа.");
   expect(oauthErrorMessage("user_denied")).toBe("Вы отменили предоставление доступа.");
+  expect(oauthErrorMessage("access_not_granted")).toBe(
+    "Администратор ещё не предоставил вам доступ к платформе. Обратитесь к администратору.",
+  );
+  expect(oauthErrorMessage("access_pending")).toBe(
+    "Ваша учётная запись пока не активна. Дождитесь подтверждения администратора.",
+  );
+  expect(oauthErrorMessage("account_link_required")).toBe(
+    "Вход через Facebook пока не связан с вашей учётной записью. Обратитесь к администратору.",
+  );
+  expect(oauthErrorMessage("facebook_auth_not_configured")).toBe(
+    "Вход через Facebook сейчас недоступен. Используйте другой способ входа или обратитесь к администратору.",
+  );
   expect(oauthErrorMessage("provider secret text")).toBe(
     "Не удалось завершить вход через сервис. Попробуйте ещё раз.",
   );
   expect(oauthErrorMessage("")).toBe("");
+});
+
+test("Facebook button starts a platform login flow, not an ads connection", async ({ page }) => {
+  await page.goto("/login");
+
+  const facebookLogin = page.getByRole("button", { name: "Войти через Facebook" });
+  await expect(facebookLogin).toBeVisible();
+  await expect(page.getByText(/Только вход в платформу/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Подключить Meta Ads" })).toHaveCount(0);
+
+  await page.route("**/auth/facebook/start?**", async (route) => {
+    await route.fulfill({ status: 200, contentType: "text/html", body: "ok" });
+  });
+  const requestPromise = page.waitForRequest((request) =>
+    request.url().includes("/auth/facebook/start?"),
+  );
+  await facebookLogin.click();
+  const oauthRequest = await requestPromise;
+  const oauthUrl = new URL(oauthRequest.url());
+
+  expect(oauthUrl.pathname).toMatch(/\/auth\/facebook\/start$/);
+  expect(oauthUrl.searchParams.get("intent")).toBe("login");
+  expect(oauthUrl.searchParams.get("next")).toBe("/");
 });
 
 test("unauthenticated deep link is restored after an agency session appears", async ({ page, context, request }) => {

@@ -4,7 +4,9 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import app.services.oauth as oauth_module
 from app.main import _oauth_provider_config_or_400, app
+from app.schemas import UserCreate
 from app.services.oauth import (
     ExternalIdentityPayload,
     FacebookOAuthAdapter,
@@ -20,6 +22,25 @@ def reset_state():
     assert client.post("/_testing/use-inmemory-stores").status_code == 200
     client.headers.pop("Authorization", None)
     client.cookies.clear()
+
+
+def set_facebook_auth_env(monkeypatch):
+    monkeypatch.setenv("FACEBOOK_AUTH_CLIENT_ID", "facebook-auth-client")
+    monkeypatch.setenv("FACEBOOK_AUTH_CLIENT_SECRET", "facebook-auth-secret")
+    monkeypatch.setenv(
+        "FACEBOOK_AUTH_REDIRECT_URI",
+        "https://dashboard.example/api/backend/auth/facebook/callback",
+    )
+
+
+def set_facebook_connect_env(monkeypatch):
+    monkeypatch.setenv("FACEBOOK_CLIENT_ID", "facebook-business-client")
+    monkeypatch.setenv("FACEBOOK_CLIENT_SECRET", "facebook-business-secret")
+    monkeypatch.setenv(
+        "FACEBOOK_REDIRECT_URI",
+        "https://dashboard.example/api/backend/auth/facebook/callback",
+    )
+    monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "business-config-id")
 
 
 class FakeProviderAdapter:
@@ -57,8 +78,9 @@ class FakeGoogleAdapter:
         )
 
 
-def test_oauth_start_redirects_to_provider_url_with_state():
+def test_oauth_start_redirects_to_provider_url_with_state(monkeypatch):
     reset_state()
+    set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
     cfg = client.post(
@@ -95,34 +117,52 @@ def test_oauth_redirect_uri_environment_override(monkeypatch):
         },
     )
     assert cfg.status_code == 200
-
     expected = "https://dashboard.example/api/backend/auth/google/callback"
     monkeypatch.setenv("GOOGLE_REDIRECT_URI", expected)
     resolved = _oauth_provider_config_or_400("google")
     assert resolved.redirect_uri == expected
 
 
-def test_facebook_business_login_config_id_environment_override(monkeypatch):
+def test_facebook_oauth_uses_separate_environment_credentials(monkeypatch):
     reset_state()
-    cfg = client.post(
-        "/auth/provider-configs",
-        json={
-            "provider": "facebook",
-            "client_id": "facebook-client",
-            "client_secret": "facebook-secret",
-            "redirect_uri": "https://dashboard.example/api/backend/auth/facebook/callback",
-            "enabled": True,
-        },
-    )
-    assert cfg.status_code == 200
+    set_facebook_auth_env(monkeypatch)
+    set_facebook_connect_env(monkeypatch)
 
-    monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "business-config-id")
-    resolved = _oauth_provider_config_or_400("facebook")
-    assert resolved.config_id == "business-config-id"
+    login = _oauth_provider_config_or_400("facebook", intent="login")
+    connect = _oauth_provider_config_or_400("facebook", intent="connect")
+
+    assert login.client_id == "facebook-auth-client"
+    assert login.client_secret == "facebook-auth-secret"
+    assert login.redirect_uri == "https://dashboard.example/api/backend/auth/facebook/callback"
+    assert login.config_id is None
+    assert login.intent == "login"
+
+    assert connect.client_id == "facebook-business-client"
+    assert connect.client_secret == "facebook-business-secret"
+    assert connect.redirect_uri == "https://dashboard.example/api/backend/auth/facebook/callback"
+    assert connect.config_id == "business-config-id"
+    assert connect.intent == "connect"
 
 
-def test_oauth_callback_issues_internal_session_and_redirects_frontend():
+def test_facebook_login_requires_separate_auth_environment(monkeypatch):
     reset_state()
+    for key in (
+        "FACEBOOK_AUTH_CLIENT_ID",
+        "FACEBOOK_AUTH_CLIENT_SECRET",
+        "FACEBOOK_AUTH_REDIRECT_URI",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        _oauth_provider_config_or_400("facebook", intent="login")
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "facebook_auth_not_configured"
+
+
+def test_oauth_callback_issues_internal_session_and_redirects_frontend(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
     cfg = client.post(
@@ -136,6 +176,14 @@ def test_oauth_callback_issues_internal_session_and_redirects_frontend():
         },
     )
     assert cfg.status_code == 200
+    approved_user = app.state.auth_store.create_user(
+        UserCreate(
+            email="oauth.user@example.com",
+            name="Approved OAuth User",
+            role="client",
+            status="active",
+        )
+    )
 
     start = client.get("/auth/facebook/start?next=/platform/agencies", follow_redirects=False)
     assert start.status_code == 302
@@ -159,12 +207,14 @@ def test_oauth_callback_issues_internal_session_and_redirects_frontend():
     me = client.get("/auth/me")
     assert me.status_code == 200
     body = me.json()
+    assert body["user"]["id"] == str(approved_user.id)
     assert body["user"]["email"] == "oauth.user@example.com"
     assert body["session"]["valid"] is True
 
 
-def test_oauth_callback_rejects_invalid_state():
+def test_oauth_callback_rejects_invalid_state(monkeypatch):
     reset_state()
+    set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
 
     cfg = client.post(
@@ -188,7 +238,7 @@ def test_oauth_callback_rejects_invalid_state():
     assert parse_qs(urlparse(bad.headers["location"]).query)["oauth_error"] == ["provider_error"]
 
 
-def test_oauth_connect_flow_links_to_current_agency_user_and_saves_agency_credentials():
+def test_oauth_connect_flow_keeps_current_agency_user_and_saves_agency_credentials():
     reset_state()
     app.state.oauth_adapters = {"google": FakeGoogleAdapter()}
 
@@ -248,11 +298,10 @@ def test_oauth_connect_flow_links_to_current_agency_user_and_saves_agency_creden
     callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
     assert callback.status_code == 302
 
-    # Identity must be linked to existing agency user, not a new user.
+    # Connect authorization is integration-only and must not create an auth identity.
     identities = app.state.auth_store.list_identities()
     google_identity = next((x for x in identities if x.provider == "google" and x.provider_user_id == "google-user-123"), None)
-    assert google_identity is not None
-    assert str(google_identity.user_id) == agency_user.json()["id"]
+    assert google_identity is None
 
     # Credentials must be auto-saved in agency scope.
     creds = app.state.integration_credential_store.list(status="all", provider="google")
@@ -482,12 +531,16 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
     assert google_connect["access_type"] == ["offline"]
 
     facebook_base = {**base, "provider": "facebook", "config_id": "business-config-id"}
-    with pytest.raises(HTTPException) as facebook_login_error:
-        FacebookOAuthAdapter().build_authorize_url(
-            OAuthProviderConfig(**facebook_base, intent="login"),
-            "state",
-        )
-    assert facebook_login_error.value.detail["code"] == "facebook_login_not_supported"
+    facebook_login_url = FacebookOAuthAdapter().build_authorize_url(
+        OAuthProviderConfig(**facebook_base, intent="login"),
+        "state",
+    )
+    facebook_login = parse_qs(urlparse(facebook_login_url).query)
+    assert urlparse(facebook_login_url).path == "/v26.0/dialog/oauth"
+    assert set(facebook_login["scope"][0].split(",")) == {"public_profile", "email"}
+    assert facebook_login["response_type"] == ["code"]
+    assert "config_id" not in facebook_login
+    assert "override_default_response_type" not in facebook_login
 
     facebook_connect_url = FacebookOAuthAdapter().build_authorize_url(
         OAuthProviderConfig(**facebook_base, intent="connect"),
@@ -506,6 +559,133 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
             "state",
         )
     assert missing_config_error.value.detail["code"] == "facebook_business_config_required"
+
+
+def test_facebook_login_fetches_email_profile_field(monkeypatch):
+    calls = []
+
+    class StubResponse:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class StubClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def get(self, url, params, headers=None):
+            calls.append((url, params, headers))
+            if url.endswith("/oauth/access_token"):
+                return StubResponse({"access_token": "token", "token_type": "bearer"})
+            return StubResponse({"id": "fb-user", "name": "FB User", "email": "fb@example.com"})
+
+    monkeypatch.setattr(oauth_module.httpx, "Client", lambda timeout: StubClient())
+    cfg = OAuthProviderConfig(
+        provider="facebook",
+        client_id="facebook-auth-client",
+        client_secret="facebook-auth-secret",
+        redirect_uri="https://dashboard.example/api/backend/auth/facebook/callback",
+        enabled=True,
+        intent="login",
+    )
+
+    identity = FacebookOAuthAdapter().fetch_identity(cfg, "code")
+
+    assert calls[0][1]["client_id"] == "facebook-auth-client"
+    assert calls[0][1]["client_secret"] == "facebook-auth-secret"
+    assert calls[1][1]["fields"] == "id,name,email"
+    assert calls[1][2] == {"Authorization": "Bearer token"}
+    assert "access_token" not in calls[1][1]
+    assert identity.email == "fb@example.com"
+
+
+def test_facebook_connect_callback_reuses_business_credentials_from_state(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    set_facebook_connect_env(monkeypatch)
+    seen = []
+
+    class TrackingFacebookAdapter(FakeProviderAdapter):
+        def build_authorize_url(self, cfg, state: str) -> str:
+            seen.append(("start", cfg.intent, cfg.client_id, cfg.client_secret, cfg.config_id))
+            return f"https://provider.example/auth?state={state}&client_id={cfg.client_id}"
+
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            seen.append(("callback", cfg.intent, cfg.client_id, cfg.client_secret, cfg.config_id))
+            return super().fetch_identity(cfg, code)
+
+    app.state.oauth_adapters = {"facebook": TrackingFacebookAdapter()}
+    admin = client.post(
+        "/auth/internal/users",
+        json={"email": "admin@facebook.test", "name": "Admin", "role": "admin", "status": "active"},
+    )
+    assert admin.status_code == 200
+    session = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": admin.json()["id"], "ttl_minutes": 60},
+    )
+    assert session.status_code == 200
+    client.cookies.set("ops_session", session.json()["token"])
+
+    start = client.get("/auth/facebook/start?next=/sync-monitor&intent=connect", follow_redirects=False)
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+
+    expected = ("connect", "facebook-business-client", "facebook-business-secret", "business-config-id")
+    assert seen[0][1:] == expected
+    assert seen[1][1:] == expected
+    assert app.state.auth_store.list_identities() == []
+    assert client.cookies.get("ops_session") == session.json()["token"]
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+def test_facebook_login_denies_unknown_user_without_creating_account(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
+
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["access_not_granted"]
+    assert app.state.auth_store.list_users() == []
+    assert app.state.auth_store.list_identities() == []
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+def test_facebook_login_links_inactive_approved_user_but_does_not_issue_session(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
+    pending_user = app.state.auth_store.create_user(
+        UserCreate(
+            email="oauth.user@example.com",
+            name="Pending OAuth User",
+            role="client",
+            status="inactive",
+        )
+    )
+
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["access_pending"]
+    identities = app.state.auth_store.list_identities()
+    assert len(identities) == 1
+    assert identities[0].user_id == pending_user.id
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
 
 
 def test_oauth_login_does_not_create_integration_credentials_even_when_provider_returns_tokens():
@@ -546,11 +726,15 @@ def test_oauth_connect_requires_an_existing_session_and_provider_denial_redirect
     assert cfg.status_code == 200
 
     start = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
-    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-    callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
-    assert callback.status_code == 302
-    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["session_required"]
+    assert start.status_code == 401
+    assert start.json()["error"]["code"] == "session_required"
 
-    denied = client.get("/auth/google/callback?error=access_denied", follow_redirects=False)
+    login_start = client.get("/auth/google/start?next=/&intent=login", follow_redirects=False)
+    state = parse_qs(urlparse(login_start.headers["location"]).query)["state"][0]
+    denied = client.get(f"/auth/google/callback?error=access_denied&state={state}", follow_redirects=False)
     assert denied.status_code == 302
     assert parse_qs(urlparse(denied.headers["location"]).query)["oauth_error"] == ["access_denied"]
+
+    missing_state = client.get("/auth/google/callback?error=access_denied", follow_redirects=False)
+    assert missing_state.status_code == 302
+    assert parse_qs(urlparse(missing_state.headers["location"]).query)["oauth_error"] == ["provider_error"]

@@ -1019,9 +1019,10 @@ def _process_discovery_alerts(
             _alert_store().resolve_by_fingerprint(f"discovery-failed:{provider}:{target_client_id}")
 
 
-def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
+def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OAuthProviderConfig:
     cfg = next((x for x in _auth_store().list_provider_configs() if x.provider == provider), None)
-    if not cfg or not cfg.enabled:
+    normalized_intent = (intent or "login").strip().lower()
+    if cfg and not cfg.enabled and not (provider == "facebook" and normalized_intent == "login"):
         raise HTTPException(
             status_code=400,
             detail={
@@ -1029,11 +1030,57 @@ def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
                 "message": f"OAuth provider '{provider}' is not configured or disabled",
             },
         )
-    redirect_env_name = {
-        "google": "GOOGLE_REDIRECT_URI",
-        "facebook": "FACEBOOK_REDIRECT_URI",
-    }.get(provider)
-    redirect_uri = (os.getenv(redirect_env_name, "").strip() if redirect_env_name else "") or cfg.redirect_uri
+
+    if provider == "facebook" and normalized_intent == "login":
+        auth_env = {
+            "client_id": os.getenv("FACEBOOK_AUTH_CLIENT_ID", "").strip(),
+            "client_secret": os.getenv("FACEBOOK_AUTH_CLIENT_SECRET", "").strip(),
+            "redirect_uri": os.getenv("FACEBOOK_AUTH_REDIRECT_URI", "").strip(),
+        }
+        missing = [key for key, value in auth_env.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_auth_not_configured",
+                    "message": (
+                        "Facebook platform login requires FACEBOOK_AUTH_CLIENT_ID, "
+                        "FACEBOOK_AUTH_CLIENT_SECRET, and FACEBOOK_AUTH_REDIRECT_URI"
+                    ),
+                },
+            )
+        client_id = auth_env["client_id"]
+        client_secret = auth_env["client_secret"]
+        redirect_uri = auth_env["redirect_uri"]
+        config_id = None
+    else:
+        if not cfg and provider != "facebook":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "provider_not_configured",
+                    "message": f"OAuth provider '{provider}' is not configured or disabled",
+                },
+            )
+        if provider == "facebook":
+            client_id = os.getenv("FACEBOOK_CLIENT_ID", "").strip() or (cfg.client_id if cfg else "")
+            client_secret = os.getenv("FACEBOOK_CLIENT_SECRET", "").strip() or (cfg.client_secret if cfg else "")
+            redirect_uri = os.getenv("FACEBOOK_REDIRECT_URI", "").strip() or (cfg.redirect_uri if cfg else "")
+            config_id = os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip() or None
+            if not client_id or not client_secret or not redirect_uri:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "provider_not_configured",
+                        "message": "Meta Ads OAuth credentials are not configured",
+                    },
+                )
+        else:
+            client_id = cfg.client_id
+            client_secret = cfg.client_secret
+            redirect_env_name = {"google": "GOOGLE_REDIRECT_URI"}.get(provider)
+            redirect_uri = (os.getenv(redirect_env_name, "").strip() if redirect_env_name else "") or cfg.redirect_uri
+            config_id = None
     parsed_redirect = urlsplit(redirect_uri)
     if parsed_redirect.scheme not in {"http", "https"} or not parsed_redirect.netloc:
         raise HTTPException(
@@ -1044,14 +1091,13 @@ def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
             },
         )
     return OAuthProviderConfig(
-        provider=cfg.provider,
-        client_id=cfg.client_id,
-        client_secret=cfg.client_secret,
+        provider=provider,
+        client_id=client_id,
+        client_secret=client_secret,
         redirect_uri=redirect_uri,
-        enabled=cfg.enabled,
-        config_id=(os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip() or None)
-        if provider == "facebook"
-        else None,
+        enabled=cfg.enabled if cfg else True,
+        intent=normalized_intent,
+        config_id=config_id,
     )
 
 
@@ -1456,7 +1502,20 @@ def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, str, Optio
 
 def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
     normalized = str(error_code or "").strip().lower()
-    safe_code = normalized if normalized in {"access_denied", "user_denied", "session_required"} else "provider_error"
+    safe_code = (
+        normalized
+        if normalized
+        in {
+            "access_denied",
+            "user_denied",
+            "session_required",
+            "access_not_granted",
+            "access_pending",
+            "account_link_required",
+            "facebook_auth_not_configured",
+        }
+        else "provider_error"
+    )
     base = settings.frontend_base_url.rstrip("/")
     response = RedirectResponse(
         url=f"{base}/login?{urlencode({'oauth_error': safe_code})}",
@@ -2157,6 +2216,7 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
     description="Starts OAuth authorization redirect for configured provider.",
 )
 def auth_oauth_start(
+    request: Request,
     provider: str,
     next_path: Optional[str] = Query(default="/", alias="next"),
     intent: str = Query(default="login", pattern="^(login|connect)$"),
@@ -2167,8 +2227,25 @@ def auth_oauth_start(
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
-    cfg = _oauth_provider_config_or_400(provider)
-    cfg.intent = intent
+    if intent == "connect":
+        current_token = _get_session_token(
+            request.headers.get("Authorization"),
+            request.headers.get("X-Session-Token"),
+            request.cookies.get(settings.auth_cookie_name),
+            required=False,
+        )
+        current_ctx = _auth_facade().get_session_context(current_token) if current_token else None
+        if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "session_required", "message": "Sign in before connecting an advertising account"},
+            )
+        if current_ctx.role not in {"admin", "agency"}:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "provider_connect_forbidden", "message": "This role cannot connect advertising accounts"},
+            )
+    cfg = _oauth_provider_config_or_400(provider, intent=intent)
     normalized_next = _with_oauth_connect_options(
         _normalize_next_path(next_path),
         intent=intent,
@@ -2216,9 +2293,7 @@ def auth_oauth_callback(
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
-    if error:
-        return _oauth_error_redirect(error)
-    if not code or not state:
+    if not state:
         return _oauth_error_redirect("provider_error")
     nonce = request.cookies.get(settings.oauth_nonce_cookie_name)
     if not nonce:
@@ -2231,8 +2306,11 @@ def auth_oauth_callback(
     redirect_next, oauth_intent, connect_mode, requested_connection_key = _extract_oauth_connect_options(
         consumed.next_path or "/"
     )
-    cfg = _oauth_provider_config_or_400(provider)
-    cfg.intent = oauth_intent
+    if error:
+        return _oauth_error_redirect(error)
+    if not code:
+        return _oauth_error_redirect("provider_error")
+    cfg = _oauth_provider_config_or_400(provider, intent=oauth_intent)
     try:
         identity = adapter.fetch_identity(cfg, code)
     except Exception:
@@ -2255,18 +2333,45 @@ def auth_oauth_callback(
             return _oauth_error_redirect("session_required")
         if current_user.role not in {"admin", "agency"}:
             return _oauth_error_redirect("provider_error")
-        linked = _auth_store().link_identity(
-            AuthIdentityLink(
-                user_id=current_user.id,
-                provider=provider,
-                provider_user_id=identity.provider_user_id,
-                email=identity.email,
-                email_verified=identity.email_verified,
-                raw_profile=identity.raw_profile,
-            )
+        _auto_upsert_integration_credentials(
+            provider=provider,
+            user=current_user,
+            provider_user_id=identity.provider_user_id,
+            connect_mode=connect_mode,
+            requested_connection_key=requested_connection_key,
+            oauth_tokens=identity.oauth_tokens,
+            cfg=cfg,
         )
-        issued = _auth_facade().issue_session(current_user.id, ttl_minutes=settings.oauth_session_ttl_minutes)
-        resolved = ExternalIdentityResolveResponse(user=current_user, identity=linked, session=issued)
+        _schedule_login_auto_sync(background_tasks, current_ctx)
+
+        base = settings.frontend_base_url.rstrip("/")
+        redirect_url = f"{base}/login/success?{urlencode({'next': redirect_next or '/'})}"
+        response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
+        response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
+        return response
+
+    if provider == "facebook":
+        linked_identity = _auth_store().find_identity(provider, identity.provider_user_id)
+        login_user = _auth_store().get_user(linked_identity.user_id) if linked_identity else None
+        if not login_user and identity.email:
+            login_user = _auth_store().find_user_by_email(identity.email)
+        if not login_user:
+            return _oauth_error_redirect("access_not_granted")
+        if not linked_identity:
+            linked_identity = _auth_store().link_identity(
+                AuthIdentityLink(
+                    user_id=login_user.id,
+                    provider=provider,
+                    provider_user_id=identity.provider_user_id,
+                    email=identity.email,
+                    email_verified=identity.email_verified,
+                    raw_profile=identity.raw_profile,
+                )
+            )
+        if login_user.status != "active":
+            return _oauth_error_redirect("access_pending")
+        oauth_user = login_user
+        oauth_session = _auth_facade().issue_session(login_user.id, ttl_minutes=settings.oauth_session_ttl_minutes)
     else:
         resolved = _auth_facade().resolve_or_create_from_external_identity(
             ExternalIdentityResolveRequest(
@@ -2281,34 +2386,23 @@ def auth_oauth_callback(
                 session_ttl_minutes=settings.oauth_session_ttl_minutes,
             )
         )
-    if not resolved.session:
+        oauth_user = resolved.user
+        oauth_session = resolved.session
+    if not oauth_session:
         raise HTTPException(status_code=500, detail="OAuth session was not issued")
-
-    if oauth_intent == "connect":
-        _auto_upsert_integration_credentials(
-            provider=provider,
-            user=resolved.user,
-            provider_user_id=identity.provider_user_id,
-            connect_mode=connect_mode,
-            requested_connection_key=requested_connection_key,
-            oauth_tokens=identity.oauth_tokens,
-            cfg=cfg,
-        )
-        session_ctx = _auth_facade().get_session_context(resolved.session.token)
-        _schedule_login_auto_sync(background_tasks, session_ctx)
 
     base = settings.frontend_base_url.rstrip("/")
     redirect_url = f"{base}/login/success?{urlencode({'next': redirect_next or '/'})}"
     response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
     max_age = (
-        max(60, int((resolved.session.expires_at - _utcnow()).total_seconds()))
-        if resolved.session and resolved.session.expires_at
+        max(60, int((oauth_session.expires_at - _utcnow()).total_seconds()))
+        if oauth_session.expires_at
         else 86400
     )
     # For local dev we keep secure=False; move to secure cookie in production HTTPS.
     response.set_cookie(
         key=settings.auth_cookie_name,
-        value=resolved.session.token,
+        value=oauth_session.token,
         httponly=True,
         samesite=_cookie_samesite_value(),
         secure=settings.auth_cookie_secure,
