@@ -68,14 +68,17 @@ callback path is the same:
 - **Войти через Facebook** (`intent=login`) only signs the user into the
   platform. It uses `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`,
   and `FACEBOOK_AUTH_REDIRECT_URI`; it does not connect advertising accounts.
+  On the first successful login, the backend automatically creates an active
+  client user and client workspace, then opens the client portal immediately.
 - **Подключить Meta Ads** (`intent=connect`) is available after login for an
   administrator or agency user. It uses `FACEBOOK_CLIENT_ID`,
   `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and
   `FACEBOOK_LOGIN_CONFIG_ID` to grant access to advertising accounts.
 
-Register the callback URL in both Facebook apps/configurations. Platform login
-does not grant tenant access automatically: the user's role and client access
-must still be approved by an administrator.
+Register the callback URL in both Facebook apps/configurations. A normal new
+Facebook user does not wait for administrator approval. The automatically
+created account is limited to the client portal; agency/admin roles and access
+to additional client workspaces remain administrator-managed.
 
 This makes the backend's `ops_session` and `ops_csrf` cookies first-party
 cookies on the frontend origin. Do not expose `API_UPSTREAM_BASE` through a

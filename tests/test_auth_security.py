@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app
-from app.schemas import UserCreate
+from app.schemas import AuthIdentityLink, UserCreate
 from app.services.oauth import ExternalIdentityPayload
 
 
@@ -60,12 +60,22 @@ def test_cookie_session_requires_csrf_header_for_refresh_but_logout_is_exempt(mo
         },
     )
     assert cfg.status_code == 200
-    app.state.auth_store.create_user(
+    approved_user = app.state.auth_store.create_user(
         UserCreate(
             email="oauth.security@example.com",
             name="Approved OAuth Security",
             role="client",
             status="active",
+        )
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=approved_user.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:fb-user-security",
+            email="oauth.security@example.com",
+            email_verified=True,
+            raw_profile={"id": "fb-user-security", "email": "oauth.security@example.com"},
         )
     )
 
@@ -105,12 +115,22 @@ def test_cookie_session_can_fetch_csrf_token_via_endpoint(monkeypatch):
         },
     )
     assert cfg.status_code == 200
-    app.state.auth_store.create_user(
+    approved_user = app.state.auth_store.create_user(
         UserCreate(
             email="oauth.security@example.com",
             name="Approved OAuth Security",
             role="client",
             status="active",
+        )
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=approved_user.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:fb-user-security",
+            email="oauth.security@example.com",
+            email_verified=True,
+            raw_profile={"id": "fb-user-security", "email": "oauth.security@example.com"},
         )
     )
 

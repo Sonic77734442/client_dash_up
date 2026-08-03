@@ -131,13 +131,13 @@ test("OAuth errors are mapped to safe Russian messages", () => {
   expect(oauthErrorMessage("access_denied")).toBe("Вы отменили предоставление доступа.");
   expect(oauthErrorMessage("user_denied")).toBe("Вы отменили предоставление доступа.");
   expect(oauthErrorMessage("access_not_granted")).toBe(
-    "Администратор ещё не предоставил вам доступ к платформе. Обратитесь к администратору.",
+    "Не удалось автоматически создать клиентский кабинет. Попробуйте войти ещё раз или используйте другой способ входа.",
   );
   expect(oauthErrorMessage("access_pending")).toBe(
-    "Ваша учётная запись пока не активна. Дождитесь подтверждения администратора.",
+    "Доступ к этой учётной записи отключён или приостановлен. Обратитесь к администратору платформы.",
   );
   expect(oauthErrorMessage("account_link_required")).toBe(
-    "Вход через Facebook пока не связан с вашей учётной записью. Обратитесь к администратору.",
+    "Не удалось безопасно связать Facebook с учётной записью. Войдите другим способом или обратитесь к администратору платформы.",
   );
   expect(oauthErrorMessage("facebook_auth_not_configured")).toBe(
     "Вход через Facebook сейчас недоступен. Используйте другой способ входа или обратитесь к администратору.",
@@ -153,7 +153,11 @@ test("Facebook button starts a platform login flow, not an ads connection", asyn
 
   const facebookLogin = page.getByRole("button", { name: "Войти через Facebook" });
   await expect(facebookLogin).toBeVisible();
-  await expect(page.getByText(/Только вход в платформу/)).toBeVisible();
+  await expect(
+    page.getByText(/Первый вход через Facebook сразу создаст ваш клиентский кабинет/),
+  ).toBeVisible();
+  await expect(page.getByText(/без ожидания подтверждения/)).toBeVisible();
+  await expect(page.getByText(/Facebook и Google здесь используются только для входа/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Подключить Meta Ads" })).toHaveCount(0);
 
   await page.route("**/auth/facebook/start?**", async (route) => {

@@ -147,6 +147,7 @@ from app.services.platform_admin import (
 )
 from app.services.rate_limit import InMemoryRateLimiter
 from app.services.oauth import (
+    ExternalIdentityPayload,
     FacebookOAuthAdapter,
     GoogleOAuthAdapter,
     InMemoryOAuthStateStore,
@@ -1525,6 +1526,92 @@ def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
     return response
 
 
+def _normalized_oauth_email(value: Optional[str]) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    return normalized or None
+
+
+def _find_user_by_normalized_email(value: Optional[str]) -> Optional[UserOut]:
+    normalized = _normalized_oauth_email(value)
+    if not normalized:
+        return None
+    return next(
+        (
+            user
+            for user in _auth_store().list_users()
+            if _normalized_oauth_email(user.email) == normalized
+        ),
+        None,
+    )
+
+
+def _facebook_login_subject(cfg: OAuthProviderConfig, identity: ExternalIdentityPayload) -> str:
+    return f"{cfg.client_id}:{identity.provider_user_id}"
+
+
+def _auto_provision_facebook_client(
+    identity: ExternalIdentityPayload,
+    *,
+    login_subject: str,
+    contact_email: Optional[str],
+) -> UserOut:
+    display_name = str(identity.name or contact_email or "Facebook user").strip() or "Facebook user"
+    canonical_email = contact_email if identity.email_verified is True else None
+    created_user: Optional[UserOut] = None
+    created_client: Optional[ClientOut] = None
+    try:
+        created_user = _auth_store().create_user(
+            UserCreate(
+                email=canonical_email,
+                name=display_name,
+                role="client",
+                status="active",
+            )
+        )
+        created_client = _client_store().create(
+            ClientCreate(
+                name=display_name,
+                status="active",
+                default_currency="USD",
+                notes="Auto-provisioned via Facebook Login",
+            )
+        )
+        _auth_store().assign_client_access(
+            UserClientAccessCreate(
+                user_id=created_user.id,
+                client_id=created_client.id,
+                role="client",
+            )
+        )
+        _auth_store().link_identity(
+            AuthIdentityLink(
+                user_id=created_user.id,
+                provider="facebook",
+                provider_user_id=login_subject,
+                email=contact_email,
+                email_verified=identity.email_verified,
+                raw_profile=identity.raw_profile,
+            )
+        )
+        return created_user
+    except Exception:
+        if created_user:
+            try:
+                _auth_store().delete_user(created_user.id)
+            except Exception:
+                logger.exception("Failed to roll back Facebook auto-provisioned user")
+        if created_client:
+            try:
+                _client_store().archive(created_client.id)
+            except Exception:
+                logger.exception("Failed to roll back Facebook auto-provisioned client workspace")
+        concurrent_identity = _auth_store().find_identity("facebook", login_subject)
+        concurrent_user = _auth_store().get_user(concurrent_identity.user_id) if concurrent_identity else None
+        if concurrent_user:
+            return concurrent_user
+        raise
+
+
 def _cookie_samesite_value() -> str:
     val = (settings.auth_cookie_samesite or "lax").lower().strip()
     if val not in {"lax", "strict", "none"}:
@@ -2351,23 +2438,26 @@ def auth_oauth_callback(
         return response
 
     if provider == "facebook":
-        linked_identity = _auth_store().find_identity(provider, identity.provider_user_id)
+        login_subject = _facebook_login_subject(cfg, identity)
+        contact_email = _normalized_oauth_email(identity.email)
+        linked_identity = _auth_store().find_identity(provider, login_subject)
         login_user = _auth_store().get_user(linked_identity.user_id) if linked_identity else None
-        if not login_user and identity.email:
-            login_user = _auth_store().find_user_by_email(identity.email)
-        if not login_user:
-            return _oauth_error_redirect("access_not_granted")
         if not linked_identity:
-            linked_identity = _auth_store().link_identity(
-                AuthIdentityLink(
-                    user_id=login_user.id,
-                    provider=provider,
-                    provider_user_id=identity.provider_user_id,
-                    email=identity.email,
-                    email_verified=identity.email_verified,
-                    raw_profile=identity.raw_profile,
+            if _find_user_by_normalized_email(contact_email):
+                return _oauth_error_redirect("account_link_required")
+            try:
+                login_user = _auto_provision_facebook_client(
+                    identity,
+                    login_subject=login_subject,
+                    contact_email=contact_email,
                 )
-            )
+            except HTTPException:
+                if _find_user_by_normalized_email(contact_email):
+                    return _oauth_error_redirect("account_link_required")
+                return _oauth_error_redirect("provider_error")
+            linked_identity = _auth_store().find_identity(provider, login_subject)
+        if not login_user or not linked_identity:
+            return _oauth_error_redirect("provider_error")
         if login_user.status != "active":
             return _oauth_error_redirect("access_pending")
         oauth_user = login_user

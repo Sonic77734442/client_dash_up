@@ -1,4 +1,5 @@
 from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -6,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import app.services.oauth as oauth_module
 from app.main import _oauth_provider_config_or_400, app
-from app.schemas import UserCreate
+from app.schemas import AuthIdentityLink, ClientCreate, UserCreate
 from app.services.oauth import (
     ExternalIdentityPayload,
     FacebookOAuthAdapter,
@@ -182,6 +183,16 @@ def test_oauth_callback_issues_internal_session_and_redirects_frontend(monkeypat
             name="Approved OAuth User",
             role="client",
             status="active",
+        )
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=approved_user.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:fb-user-123",
+            email="oauth.user@example.com",
+            email_verified=True,
+            raw_profile={"id": "fb-user-123", "email": "oauth.user@example.com"},
         )
     )
 
@@ -647,23 +658,81 @@ def test_facebook_connect_callback_reuses_business_credentials_from_state(monkey
     assert "ops_session=" not in callback.headers.get("set-cookie", "")
 
 
-def test_facebook_login_denies_unknown_user_without_creating_account(monkeypatch):
+def test_facebook_login_auto_provisions_isolated_client_workspace(monkeypatch):
     reset_state()
     set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
+    foreign_client = app.state.client_store.create(
+        ClientCreate(name="Foreign tenant", status="active", default_currency="USD")
+    )
 
     start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
     state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
     callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
 
     assert callback.status_code == 302
-    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["access_not_granted"]
-    assert app.state.auth_store.list_users() == []
-    assert app.state.auth_store.list_identities() == []
-    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+    assert urlparse(callback.headers["location"]).path == "/login/success"
+    assert "ops_session=" in callback.headers.get("set-cookie", "")
+
+    me = client.get("/auth/me")
+    assert me.status_code == 200
+    me_body = me.json()
+    assert me_body["user"]["role"] == "client"
+    assert me_body["user"]["status"] == "active"
+    assert me_body["session"]["global_access"] is False
+    assert me_body["session"]["access_scope"] == "assigned"
+    assert len(me_body["session"]["accessible_client_ids"]) == 1
+    own_client_id = me_body["session"]["accessible_client_ids"][0]
+    assert own_client_id != str(foreign_client.id)
+
+    access_rows = app.state.auth_store.list_client_access(user_id=UUID(me_body["user"]["id"]))
+    assert len(access_rows) == 1
+    assert str(access_rows[0].client_id) == own_client_id
+    assert access_rows[0].role == "client"
+    identities = app.state.auth_store.list_identities(user_id=UUID(me_body["user"]["id"]))
+    assert len(identities) == 1
+    assert identities[0].provider == "facebook"
+    assert identities[0].provider_user_id == "facebook-auth-client:fb-user-123"
+
+    visible_clients = client.get("/clients")
+    assert visible_clients.status_code == 200
+    assert visible_clients.json()["count"] == 1
+    assert visible_clients.json()["items"][0]["id"] == own_client_id
+    assert client.get(f"/clients/{foreign_client.id}").status_code == 403
+
+    accounts = client.get(f"/ad-accounts?client_id={own_client_id}")
+    assert accounts.status_code == 200
+    assert accounts.json()["count"] == 0
+    budgets = client.get(f"/budgets?client_id={own_client_id}")
+    assert budgets.status_code == 200
+    assert budgets.json()["count"] == 0
+
+    csrf = client.cookies.get("ops_csrf")
+    create_another = client.post(
+        "/clients",
+        json={"name": "Escalation attempt"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert create_another.status_code == 403
+    assert create_another.json()["error"]["code"] == "forbidden"
+
+    users_before = len(app.state.auth_store.list_users())
+    clients_before = len(app.state.client_store.list(status="all"))
+    access_before = len(app.state.auth_store.list_client_access())
+    repeat_start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    repeat_state = parse_qs(urlparse(repeat_start.headers["location"]).query)["state"][0]
+    repeat_callback = client.get(
+        f"/auth/facebook/callback?code=ok-code&state={repeat_state}",
+        follow_redirects=False,
+    )
+    assert repeat_callback.status_code == 302
+    assert urlparse(repeat_callback.headers["location"]).path == "/login/success"
+    assert len(app.state.auth_store.list_users()) == users_before
+    assert len(app.state.client_store.list(status="all")) == clients_before
+    assert len(app.state.auth_store.list_client_access()) == access_before
 
 
-def test_facebook_login_links_inactive_approved_user_but_does_not_issue_session(monkeypatch):
+def test_facebook_login_rejects_linked_inactive_user_without_issuing_session(monkeypatch):
     reset_state()
     set_facebook_auth_env(monkeypatch)
     app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
@@ -673,6 +742,16 @@ def test_facebook_login_links_inactive_approved_user_but_does_not_issue_session(
             name="Pending OAuth User",
             role="client",
             status="inactive",
+        )
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=pending_user.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:fb-user-123",
+            email="oauth.user@example.com",
+            email_verified=True,
+            raw_profile={"id": "fb-user-123", "email": "oauth.user@example.com"},
         )
     )
 
@@ -686,6 +765,188 @@ def test_facebook_login_links_inactive_approved_user_but_does_not_issue_session(
     assert len(identities) == 1
     assert identities[0].user_id == pending_user.id
     assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+@pytest.mark.parametrize(
+    ("role", "status"),
+    [
+        ("admin", "active"),
+        ("admin", "inactive"),
+        ("agency", "active"),
+        ("agency", "inactive"),
+        ("client", "active"),
+        ("client", "inactive"),
+    ],
+)
+def test_facebook_unlinked_email_collision_requires_explicit_account_link(monkeypatch, role, status):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeProviderAdapter()}
+    existing_user = app.state.auth_store.create_user(
+        UserCreate(
+            email="oauth.user@example.com",
+            name="Existing User",
+            role=role,
+            status=status,
+        )
+    )
+
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state_value = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state_value}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["account_link_required"]
+    assert app.state.auth_store.get_user(existing_user.id).role == role
+    assert app.state.auth_store.get_user(existing_user.id).status == status
+    assert app.state.auth_store.list_identities(user_id=existing_user.id) == []
+    assert app.state.auth_store.list_client_access(user_id=existing_user.id) == []
+    assert app.state.client_store.list(status="all") == []
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+def test_facebook_login_without_email_still_gets_isolated_client_workspace(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+
+    class FacebookWithoutEmailAdapter(FakeProviderAdapter):
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            assert code == "ok-code"
+            return ExternalIdentityPayload(
+                provider_user_id="fb-user-without-email",
+                email=None,
+                email_verified=None,
+                name="No Email User",
+                raw_profile={"id": "fb-user-without-email", "name": "No Email User"},
+            )
+
+    app.state.oauth_adapters = {"facebook": FacebookWithoutEmailAdapter()}
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state_value = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state_value}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert urlparse(callback.headers["location"]).path == "/login/success"
+    me = client.get("/auth/me")
+    assert me.status_code == 200
+    body = me.json()
+    assert body["user"]["email"] is None
+    assert body["user"]["role"] == "client"
+    assert body["session"]["global_access"] is False
+    assert len(body["session"]["accessible_client_ids"]) == 1
+
+
+def test_facebook_unverified_email_is_contact_only_not_canonical_user_email(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+
+    class FacebookUnverifiedEmailAdapter(FakeProviderAdapter):
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            assert code == "ok-code"
+            return ExternalIdentityPayload(
+                provider_user_id="fb-user-unverified-email",
+                email="  Pending.Contact@Example.COM  ",
+                email_verified=None,
+                name="Pending Contact",
+                raw_profile={"id": "fb-user-unverified-email", "email": "  Pending.Contact@Example.COM  "},
+            )
+
+    app.state.oauth_adapters = {"facebook": FacebookUnverifiedEmailAdapter()}
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state_value = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state_value}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    me = client.get("/auth/me").json()
+    assert me["user"]["email"] is None
+    identities = app.state.auth_store.list_identities(user_id=UUID(me["user"]["id"]))
+    assert len(identities) == 1
+    assert identities[0].email == "pending.contact@example.com"
+    assert identities[0].email_verified is None
+
+
+def test_facebook_email_collision_normalizes_case_and_whitespace(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+
+    class FacebookSpacedEmailAdapter(FakeProviderAdapter):
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            assert code == "ok-code"
+            return ExternalIdentityPayload(
+                provider_user_id="fb-user-spaced-email",
+                email="  existing.user@example.com  ",
+                email_verified=None,
+                name="Collision User",
+                raw_profile={"id": "fb-user-spaced-email"},
+            )
+
+    app.state.oauth_adapters = {"facebook": FacebookSpacedEmailAdapter()}
+    existing = app.state.auth_store.create_user(
+        UserCreate(
+            email=" Existing.User@Example.COM ",
+            name="Existing User",
+            role="client",
+            status="active",
+        )
+    )
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state_value = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state_value}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["account_link_required"]
+    assert app.state.auth_store.list_identities(user_id=existing.id) == []
+    assert app.state.client_store.list(status="all") == []
+
+
+def test_facebook_linked_subject_ignores_changed_profile_email(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+
+    class FacebookChangedEmailAdapter(FakeProviderAdapter):
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            assert code == "ok-code"
+            return ExternalIdentityPayload(
+                provider_user_id="fb-user-123",
+                email="changed.profile@example.com",
+                email_verified=True,
+                name="Changed Profile",
+                raw_profile={"id": "fb-user-123", "email": "changed.profile@example.com"},
+            )
+
+    app.state.oauth_adapters = {"facebook": FacebookChangedEmailAdapter()}
+    linked_user = app.state.auth_store.create_user(
+        UserCreate(
+            email="original.user@example.com",
+            name="Original User",
+            role="client",
+            status="active",
+        )
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=linked_user.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:fb-user-123",
+            email="original.user@example.com",
+            email_verified=True,
+            raw_profile={"id": "fb-user-123", "email": "original.user@example.com"},
+        )
+    )
+
+    start = client.get("/auth/facebook/start?next=/", follow_redirects=False)
+    state_value = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state_value}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    me = client.get("/auth/me").json()
+    assert me["user"]["id"] == str(linked_user.id)
+    assert me["user"]["email"] == "original.user@example.com"
+    assert len(app.state.auth_store.list_users()) == 1
+    assert app.state.client_store.list(status="all") == []
+    identities = app.state.auth_store.list_identities(user_id=linked_user.id)
+    assert len(identities) == 1
+    assert identities[0].email == "original.user@example.com"
 
 
 def test_oauth_login_does_not_create_integration_credentials_even_when_provider_returns_tokens():
