@@ -237,21 +237,8 @@ export default function LoginPage() {
           </>
         ) : null}
 
-        <div className="login-divider">Вход через сервис</div>
+        <div className="login-divider">Вход через Google</div>
         <div className="login-oauth-row">
-          <button
-            className="ghost-btn"
-            onClick={() => {
-              const base = normalizeApiBase(apiBase, defaultApiBase);
-              localStorage.setItem(LS_API_BASE, base);
-              clearSessionToken();
-              window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-              const params = new URLSearchParams({ next: requestedNext, intent: "login" });
-              window.location.href = `${base}/auth/facebook/start?${params.toString()}`;
-            }}
-          >
-            Продолжить через Facebook
-          </button>
           <button
             className="ghost-btn"
             onClick={() => {

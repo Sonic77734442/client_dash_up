@@ -1,5 +1,7 @@
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import _oauth_provider_config_or_400, app
@@ -98,6 +100,25 @@ def test_oauth_redirect_uri_environment_override(monkeypatch):
     monkeypatch.setenv("GOOGLE_REDIRECT_URI", expected)
     resolved = _oauth_provider_config_or_400("google")
     assert resolved.redirect_uri == expected
+
+
+def test_facebook_business_login_config_id_environment_override(monkeypatch):
+    reset_state()
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "facebook",
+            "client_id": "facebook-client",
+            "client_secret": "facebook-secret",
+            "redirect_uri": "https://dashboard.example/api/backend/auth/facebook/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "business-config-id")
+    resolved = _oauth_provider_config_or_400("facebook")
+    assert resolved.config_id == "business-config-id"
 
 
 def test_oauth_callback_issues_internal_session_and_redirects_frontend():
@@ -460,25 +481,31 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
     assert "access_type" not in google_login
     assert google_connect["access_type"] == ["offline"]
 
-    facebook_base = {**base, "provider": "facebook"}
-    facebook_login_url = FacebookOAuthAdapter().build_authorize_url(
-        OAuthProviderConfig(**facebook_base, intent="login"),
-        "state",
-    )
+    facebook_base = {**base, "provider": "facebook", "config_id": "business-config-id"}
+    with pytest.raises(HTTPException) as facebook_login_error:
+        FacebookOAuthAdapter().build_authorize_url(
+            OAuthProviderConfig(**facebook_base, intent="login"),
+            "state",
+        )
+    assert facebook_login_error.value.detail["code"] == "facebook_login_not_supported"
+
     facebook_connect_url = FacebookOAuthAdapter().build_authorize_url(
         OAuthProviderConfig(**facebook_base, intent="connect"),
         "state",
     )
-    facebook_login = parse_qs(urlparse(facebook_login_url).query)
     facebook_connect = parse_qs(urlparse(facebook_connect_url).query)
-    assert urlparse(facebook_login_url).path == "/v25.0/dialog/oauth"
-    assert urlparse(facebook_connect_url).path == "/v25.0/dialog/oauth"
-    facebook_login_scopes = set(facebook_login["scope"][0].split(","))
-    facebook_connect_scopes = set(facebook_connect["scope"][0].split(","))
-    assert facebook_login_scopes == {"public_profile"}
-    assert facebook_connect_scopes == {"public_profile", "ads_read", "business_management"}
-    assert "email" not in facebook_login_scopes
-    assert "email" not in facebook_connect_scopes
+    assert urlparse(facebook_connect_url).path == "/v26.0/dialog/oauth"
+    assert facebook_connect["config_id"] == ["business-config-id"]
+    assert facebook_connect["response_type"] == ["code"]
+    assert facebook_connect["override_default_response_type"] == ["true"]
+    assert "scope" not in facebook_connect
+
+    with pytest.raises(HTTPException) as missing_config_error:
+        FacebookOAuthAdapter().build_authorize_url(
+            OAuthProviderConfig(**{**facebook_base, "config_id": None}, intent="connect"),
+            "state",
+        )
+    assert missing_config_error.value.detail["code"] == "facebook_business_config_required"
 
 
 def test_oauth_login_does_not_create_integration_credentials_even_when_provider_returns_tokens():

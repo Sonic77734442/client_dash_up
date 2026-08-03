@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from app.db import init_sqlite, sqlite_conn
 
 
-META_GRAPH_API_VERSION = "v25.0"
+META_GRAPH_API_VERSION = "v26.0"
 
 
 @dataclass
@@ -27,6 +27,7 @@ class OAuthProviderConfig:
     redirect_uri: str
     enabled: bool
     intent: str = "login"
+    config_id: Optional[str] = None
 
 
 @dataclass
@@ -145,17 +146,29 @@ class FacebookOAuthAdapter:
     provider = "facebook"
 
     def build_authorize_url(self, cfg: OAuthProviderConfig, state: str) -> str:
-        connect_intent = cfg.intent == "connect"
+        if cfg.intent != "connect":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_login_not_supported",
+                    "message": "Facebook is configured only for connecting advertising data",
+                },
+            )
+        if not cfg.config_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_business_config_required",
+                    "message": "FACEBOOK_LOGIN_CONFIG_ID is required for Facebook Login for Business",
+                },
+            )
         params = {
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "state": state,
-            "scope": (
-                "public_profile,ads_read,business_management"
-                if connect_intent
-                else "public_profile"
-            ),
+            "config_id": cfg.config_id,
             "response_type": "code",
+            "override_default_response_type": "true",
         }
         return f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
 

@@ -1049,6 +1049,9 @@ def _oauth_provider_config_or_400(provider: str) -> OAuthProviderConfig:
         client_secret=cfg.client_secret,
         redirect_uri=redirect_uri,
         enabled=cfg.enabled,
+        config_id=(os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip() or None)
+        if provider == "facebook"
+        else None,
     )
 
 
