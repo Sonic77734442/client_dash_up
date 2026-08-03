@@ -16,6 +16,9 @@ from fastapi import HTTPException
 from app.db import init_sqlite, sqlite_conn
 
 
+META_GRAPH_API_VERSION = "v25.0"
+
+
 @dataclass
 class OAuthProviderConfig:
     provider: str
@@ -148,18 +151,18 @@ class FacebookOAuthAdapter:
             "redirect_uri": cfg.redirect_uri,
             "state": state,
             "scope": (
-                "public_profile,email,ads_read,business_management"
+                "public_profile,ads_read,business_management"
                 if connect_intent
-                else "public_profile,email"
+                else "public_profile"
             ),
             "response_type": "code",
         }
-        return f"https://www.facebook.com/v19.0/dialog/oauth?{urlencode(params)}"
+        return f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
 
     def fetch_identity(self, cfg: OAuthProviderConfig, code: str) -> ExternalIdentityPayload:
         with httpx.Client(timeout=20.0) as client:
             token_resp = client.get(
-                "https://graph.facebook.com/v19.0/oauth/access_token",
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/oauth/access_token",
                 params={
                     "client_id": cfg.client_id,
                     "client_secret": cfg.client_secret,
@@ -175,8 +178,8 @@ class FacebookOAuthAdapter:
                 raise HTTPException(status_code=400, detail="Facebook access token missing")
 
             profile_resp = client.get(
-                "https://graph.facebook.com/me",
-                params={"fields": "id,name,email", "access_token": token},
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/me",
+                params={"fields": "id,name", "access_token": token},
             )
             if profile_resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="Facebook profile fetch failed")

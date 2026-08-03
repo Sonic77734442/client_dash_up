@@ -461,24 +461,24 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
     assert google_connect["access_type"] == ["offline"]
 
     facebook_base = {**base, "provider": "facebook"}
-    facebook_login = parse_qs(
-        urlparse(
-            FacebookOAuthAdapter().build_authorize_url(
-                OAuthProviderConfig(**facebook_base, intent="login"),
-                "state",
-            )
-        ).query
+    facebook_login_url = FacebookOAuthAdapter().build_authorize_url(
+        OAuthProviderConfig(**facebook_base, intent="login"),
+        "state",
     )
-    facebook_connect = parse_qs(
-        urlparse(
-            FacebookOAuthAdapter().build_authorize_url(
-                OAuthProviderConfig(**facebook_base, intent="connect"),
-                "state",
-            )
-        ).query
+    facebook_connect_url = FacebookOAuthAdapter().build_authorize_url(
+        OAuthProviderConfig(**facebook_base, intent="connect"),
+        "state",
     )
-    assert "ads_read" not in facebook_login["scope"][0]
-    assert "ads_read" in facebook_connect["scope"][0]
+    facebook_login = parse_qs(urlparse(facebook_login_url).query)
+    facebook_connect = parse_qs(urlparse(facebook_connect_url).query)
+    assert urlparse(facebook_login_url).path == "/v25.0/dialog/oauth"
+    assert urlparse(facebook_connect_url).path == "/v25.0/dialog/oauth"
+    facebook_login_scopes = set(facebook_login["scope"][0].split(","))
+    facebook_connect_scopes = set(facebook_connect["scope"][0].split(","))
+    assert facebook_login_scopes == {"public_profile"}
+    assert facebook_connect_scopes == {"public_profile", "ads_read", "business_management"}
+    assert "email" not in facebook_login_scopes
+    assert "email" not in facebook_connect_scopes
 
 
 def test_oauth_login_does_not_create_integration_credentials_even_when_provider_returns_tokens():
