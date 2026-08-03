@@ -3,7 +3,12 @@ from urllib.parse import parse_qs, urlparse
 from fastapi.testclient import TestClient
 
 from app.main import _oauth_provider_config_or_400, app
-from app.services.oauth import ExternalIdentityPayload
+from app.services.oauth import (
+    ExternalIdentityPayload,
+    FacebookOAuthAdapter,
+    GoogleOAuthAdapter,
+    OAuthProviderConfig,
+)
 
 
 client = TestClient(app)
@@ -124,8 +129,7 @@ def test_oauth_callback_issues_internal_session_and_redirects_frontend():
     params = parse_qs(parsed.query)
     next_path = params.get("next", [""])[0]
     assert next_path == "/platform/agencies"
-    fragment = parse_qs(parsed.fragment)
-    assert fragment.get("token", [""])[0] != ""
+    assert parsed.fragment == ""
 
     set_cookie = callback.headers.get("set-cookie", "")
     assert "ops_session=" in set_cookie
@@ -159,7 +163,8 @@ def test_oauth_callback_rejects_invalid_state():
     assert start.status_code == 302
 
     bad = client.get("/auth/facebook/callback?code=ok-code&state=bad", follow_redirects=False)
-    assert bad.status_code == 400
+    assert bad.status_code == 302
+    assert parse_qs(urlparse(bad.headers["location"]).query)["oauth_error"] == ["provider_error"]
 
 
 def test_oauth_connect_flow_links_to_current_agency_user_and_saves_agency_credentials():
@@ -215,7 +220,7 @@ def test_oauth_connect_flow_links_to_current_agency_user_and_saves_agency_creden
     ).json()["token"]
     client.cookies.set("ops_session", agency_token)
 
-    start = client.get("/auth/google/start?next=/sync-monitor", follow_redirects=False)
+    start = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
     assert start.status_code == 302
     state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
 
@@ -314,13 +319,13 @@ def test_oauth_connect_flow_adds_second_google_connection_for_same_agency():
     ).json()["token"]
     client.cookies.set("ops_session", agency_token)
 
-    start1 = client.get("/auth/google/start?next=/sync-monitor", follow_redirects=False)
+    start1 = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
     assert start1.status_code == 302
     state1 = parse_qs(urlparse(start1.headers["location"]).query)["state"][0]
     callback1 = client.get(f"/auth/google/callback?code=ok-code-1&state={state1}", follow_redirects=False)
     assert callback1.status_code == 302
 
-    start2 = client.get("/auth/google/start?next=/sync-monitor", follow_redirects=False)
+    start2 = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
     assert start2.status_code == 302
     state2 = parse_qs(urlparse(start2.headers["location"]).query)["state"][0]
     callback2 = client.get(f"/auth/google/callback?code=ok-code-2&state={state2}", follow_redirects=False)
@@ -415,7 +420,7 @@ def test_oauth_connect_flow_overwrite_mode_uses_explicit_connection_key():
     client.cookies.set("ops_session", agency_token)
 
     start = client.get(
-        "/auth/google/start?next=/sync-monitor&connect_mode=overwrite&connection_key=google:mcc-777",
+        "/auth/google/start?next=/sync-monitor&intent=connect&connect_mode=overwrite&connection_key=google:mcc-777",
         follow_redirects=False,
     )
     assert start.status_code == 302
@@ -433,3 +438,92 @@ def test_oauth_connect_flow_overwrite_mode_uses_explicit_connection_key():
     parsed = urlparse(cb_loc)
     next_path = parse_qs(parsed.query).get("next", [""])[0]
     assert next_path == "/sync-monitor"
+
+
+def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
+    base = {
+        "provider": "google",
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "redirect_uri": "https://example.test/callback",
+        "enabled": True,
+    }
+
+    google_login = parse_qs(
+        urlparse(GoogleOAuthAdapter().build_authorize_url(OAuthProviderConfig(**base, intent="login"), "state")).query
+    )
+    google_connect = parse_qs(
+        urlparse(GoogleOAuthAdapter().build_authorize_url(OAuthProviderConfig(**base, intent="connect"), "state")).query
+    )
+    assert "adwords" not in google_login["scope"][0]
+    assert "adwords" in google_connect["scope"][0]
+    assert "access_type" not in google_login
+    assert google_connect["access_type"] == ["offline"]
+
+    facebook_base = {**base, "provider": "facebook"}
+    facebook_login = parse_qs(
+        urlparse(
+            FacebookOAuthAdapter().build_authorize_url(
+                OAuthProviderConfig(**facebook_base, intent="login"),
+                "state",
+            )
+        ).query
+    )
+    facebook_connect = parse_qs(
+        urlparse(
+            FacebookOAuthAdapter().build_authorize_url(
+                OAuthProviderConfig(**facebook_base, intent="connect"),
+                "state",
+            )
+        ).query
+    )
+    assert "ads_read" not in facebook_login["scope"][0]
+    assert "ads_read" in facebook_connect["scope"][0]
+
+
+def test_oauth_login_does_not_create_integration_credentials_even_when_provider_returns_tokens():
+    reset_state()
+    app.state.oauth_adapters = {"google": FakeGoogleAdapter()}
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "g-client",
+            "client_secret": "g-secret",
+            "redirect_uri": "http://127.0.0.1:8000/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    start = client.get("/auth/google/start?next=/&intent=login", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+    assert app.state.integration_credential_store.list(status="all") == []
+
+
+def test_oauth_connect_requires_an_existing_session_and_provider_denial_redirects_safely():
+    reset_state()
+    app.state.oauth_adapters = {"google": FakeGoogleAdapter()}
+    cfg = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "g-client",
+            "client_secret": "g-secret",
+            "redirect_uri": "http://127.0.0.1:8000/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert cfg.status_code == 200
+
+    start = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["session_required"]
+
+    denied = client.get("/auth/google/callback?error=access_denied", follow_redirects=False)
+    assert denied.status_code == 302
+    assert parse_qs(urlparse(denied.headers["location"]).query)["oauth_error"] == ["access_denied"]

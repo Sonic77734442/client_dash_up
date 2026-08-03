@@ -53,6 +53,7 @@ def _provider_auth_state(
     cfg: Optional[AuthProviderConfigOut],
     *,
     identity_linked_users: int = 0,
+    stored_credentials: int = 0,
 ) -> tuple[str, str, List[str], List[str], bool, str]:
     sources: List[str] = []
     missing: List[str] = []
@@ -65,20 +66,22 @@ def _provider_auth_state(
         sources.append("provider_config")
     if identity_linked_users > 0:
         sources.append("identity_link")
+    if stored_credentials > 0:
+        sources.append("stored_credentials")
 
     p = provider.lower().strip()
     if p == "meta":
         has_env = bool(os.getenv("META_ACCESS_TOKEN", "").strip())
         if has_env:
             sources.append("env_credentials")
-        else:
+        elif stored_credentials == 0:
             missing.append("META_ACCESS_TOKEN")
-        if has_env or identity_linked_users > 0:
+        if has_env or stored_credentials > 0:
             sync_ready = True
-            readiness_reason = "Ready via configured token or linked OAuth identity"
+            readiness_reason = "Ready via configured provider credentials"
         return (
             "configured" if sync_ready else "missing",
-            "Token configured" if has_env else "META access token not set",
+            "Token configured" if sync_ready else "META access token not set",
             sources,
             missing,
             sync_ready,
@@ -95,14 +98,14 @@ def _provider_auth_state(
         has_env = not missing_env
         if has_env:
             sources.append("env_credentials")
-        else:
+        elif stored_credentials == 0:
             missing.extend(missing_env)
-        if has_env or identity_linked_users > 0:
+        if has_env or stored_credentials > 0:
             sync_ready = True
-            readiness_reason = "Ready via configured credentials or linked Google identity"
+            readiness_reason = "Ready via configured Google Ads credentials"
         return (
             "configured" if sync_ready else "missing",
-            "OAuth credentials configured" if has_env else "Google Ads credentials are incomplete",
+            "OAuth credentials configured" if sync_ready else "Google Ads credentials are incomplete",
             sources,
             missing,
             sync_ready,
@@ -114,6 +117,9 @@ def _provider_auth_state(
             sources.append("env_credentials")
             sync_ready = True
             readiness_reason = "Ready via configured token"
+        elif stored_credentials > 0:
+            sync_ready = True
+            readiness_reason = "Ready via configured provider credentials"
         else:
             missing.append("TIKTOK_ACCESS_TOKEN")
         return (
@@ -169,15 +175,22 @@ def build_integrations_overview(
     sync_jobs: List[AdAccountSyncJobOut],
     provider_configs: List[AuthProviderConfigOut],
     identities: Optional[List[AuthIdentityOut]] = None,
+    ready_credentials_by_provider: Optional[Dict[str, int]] = None,
 ) -> IntegrationsOverviewResponse:
     identities = identities or []
+    ready_credentials_by_provider = ready_credentials_by_provider or {}
     providers_in_data = {a.platform for a in accounts if a.platform}
     providers_in_cfg = {c.provider for c in provider_configs if c.provider}
     providers_in_identities = {_normalize_provider_name(i.provider) for i in identities if i.provider}
+    providers_in_credentials = {
+        _normalize_provider_name(provider)
+        for provider, count in ready_credentials_by_provider.items()
+        if provider and count > 0
+    }
     providers = sorted(
         {
             _normalize_provider_name(p)
-            for p in providers_in_data.union(providers_in_cfg).union(providers_in_identities)
+            for p in providers_in_data.union(providers_in_cfg).union(providers_in_identities).union(providers_in_credentials)
             if p
         }
     )
@@ -220,6 +233,7 @@ def build_integrations_overview(
             provider,
             cfg_map.get(provider),
             identity_linked_users=identity_count_by_provider.get(provider, 0),
+            stored_credentials=ready_credentials_by_provider.get(provider, 0),
         )
         status, status_reason = _derive_status(
             auth_state=auth_state,

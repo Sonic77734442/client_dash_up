@@ -7,7 +7,27 @@ import { ToastHost } from "../../../components/ToastHost";
 import { useSession } from "../../../hooks/useSession";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson } from "../../../lib/api";
+import {
+  hasOptionalStringFields,
+  hasStringFields,
+  normalizeListPayload,
+} from "../../../lib/listPayload";
 import { AuthUser, ClientOut, UserClientAccessOut } from "../../../lib/types";
+
+function isAuthUserItem(value: unknown): value is AuthUser {
+  return (
+    hasStringFields(value, ["id", "name", "role", "status"]) &&
+    hasOptionalStringFields(value, ["email"])
+  );
+}
+
+function isClientItem(value: unknown): value is ClientOut {
+  return hasStringFields(value, ["id", "name"]);
+}
+
+function isAccessItem(value: unknown): value is UserClientAccessOut {
+  return hasStringFields(value, ["id", "user_id", "client_id", "role", "updated_at"]);
+}
 
 export default function PlatformAccessMapPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
@@ -30,15 +50,19 @@ export default function PlatformAccessMapPage() {
   const loadData = useCallback(async () => {
     try {
       const [userRows, clientRows, accessRows] = await Promise.all([
-        req<{ items: AuthUser[] }>("/auth/internal/users"),
-        req<{ items: ClientOut[] }>("/clients?status=all"),
-        req<{ items: UserClientAccessOut[] }>("/auth/internal/access"),
+        req<unknown>("/auth/internal/users"),
+        req<unknown>("/clients?status=all"),
+        req<unknown>("/auth/internal/access"),
       ]);
-      setUsers(userRows.items || []);
-      setClients(clientRows.items || []);
-      setAccess(accessRows.items || []);
-      setUserId((current) => current || userRows.items?.find((item) => item.role !== "admin")?.id || "");
-      setClientId((current) => current || clientRows.items?.[0]?.id || "");
+      const nextUsers = normalizeListPayload(userRows, isAuthUserItem, "пользователей");
+      const nextClients = normalizeListPayload(clientRows, isClientItem, "клиентов");
+      const nextAccess = normalizeListPayload(accessRows, isAccessItem, "назначений доступа");
+
+      setUsers(nextUsers);
+      setClients(nextClients);
+      setAccess(nextAccess);
+      setUserId((current) => current || nextUsers.find((item) => item.role !== "admin")?.id || "");
+      setClientId((current) => current || nextClients[0]?.id || "");
       setWarning("");
     } catch (error) {
       setWarning(error instanceof Error ? error.message : "Не удалось загрузить карту доступов");

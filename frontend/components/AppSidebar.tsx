@@ -136,8 +136,12 @@ function menuForRole(role: Role): NavGroup[] {
       {
         label: "Платформа",
         items: [
-          { href: "/integrations", label: "Данные и подключения", icon: "database" },
-          { href: "/sync-monitor", label: "Синхронизация", icon: "sync" },
+          {
+            href: "/integrations",
+            label: "Источники рекламы",
+            icon: "database",
+            match: ["/accounts", "/sync-monitor"],
+          },
           { href: "/platform/audit", label: "Журнал действий", icon: "audit" },
           { href: "/platform/settings", label: "Настройки", icon: "settings" },
         ],
@@ -177,18 +181,21 @@ function menuForRole(role: Role): NavGroup[] {
       ],
     },
     {
-      label: "Данные",
+      label: "Реклама и данные",
       items: [
-        { href: "/accounts", label: "Рекламные аккаунты", icon: "accounts" },
+        {
+          href: "/integrations",
+          label: "Источники рекламы",
+          icon: "database",
+          match: ["/accounts", "/sync-monitor"],
+        },
         { href: "/traffic", label: "Лиды и трафик", icon: "leads" },
-        { href: "/integrations", label: "Подключения", icon: "database" },
       ],
     },
     {
       label: "Агентство",
       items: [
         { href: "/budgets", label: "Бюджеты", icon: "budgets" },
-        { href: "/sync-monitor", label: "Синхронизация", icon: "sync" },
         { href: "/agency/team", label: "Команда и доступы", icon: "team" },
       ],
     },

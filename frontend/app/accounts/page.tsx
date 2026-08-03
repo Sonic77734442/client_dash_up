@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
+import { DataSourcesNav } from "../../components/DataSourcesNav";
 import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
@@ -20,7 +21,7 @@ function fmtDate(v?: string | null) {
   if (!v) return "--";
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return "--";
-  return d.toLocaleString();
+  return d.toLocaleString("ru-RU");
 }
 
 function initials(name: string) {
@@ -37,6 +38,23 @@ function accountSyncStatus(a: AdAccount): "synced" | "unmapped" | "error" {
   if (status === "error") return "error";
   if (!a.client_id) return "unmapped";
   return "synced";
+}
+
+function accountStatusLabel(status: ReturnType<typeof accountSyncStatus>) {
+  if (status === "synced") return "Готов";
+  if (status === "unmapped") return "Без клиента";
+  return "Ошибка";
+}
+
+function requireItems<T>(payload: unknown, label: string): T[] {
+  if (!payload || typeof payload !== "object") {
+    throw new Error(`${label}: сервис вернул некорректный ответ`);
+  }
+  const items = (payload as { items?: unknown }).items;
+  if (!Array.isArray(items)) {
+    throw new Error(`${label}: сервис вернул некорректный список`);
+  }
+  return items as T[];
 }
 
 function sanitizedMetadataForActivation(source?: Record<string, unknown> | null) {
@@ -87,14 +105,16 @@ export default function AccountsPage() {
       req<{ items: ClientOut[] }>("/clients?status=all"),
       req<{ items: AdAccountSyncJob[] }>("/ad-accounts/sync/jobs?status=all&limit=200"),
     ]);
-    setAccounts(acc.items || []);
-    setClients(cls.items || []);
-    setSyncJobs(jobs.items || []);
+    setAccounts(requireItems<AdAccount>(acc, "Рекламные аккаунты"));
+    setClients(requireItems<ClientOut>(cls, "Клиенты"));
+    setSyncJobs(requireItems<AdAccountSyncJob>(jobs, "История обновлений"));
   }, [req]);
 
   useEffect(() => {
     if (!ready) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load accounts"));
+    void loadData().catch((err) =>
+      setWarning(err instanceof Error ? err.message : "Не удалось загрузить рекламные аккаунты")
+    );
   }, [ready, loadData]);
 
   const clientNameMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
@@ -157,7 +177,7 @@ export default function AccountsPage() {
   function openMapping(ids?: string[]) {
     const targetIds = ids && ids.length ? ids : selectedIds;
     if (!targetIds.length && !selectedId) {
-      push("Select account(s) first", "info");
+      push("Сначала выберите рекламный аккаунт", "info");
       return;
     }
     setMapError("");
@@ -168,11 +188,27 @@ export default function AccountsPage() {
   async function applyMapping() {
     const targetIds = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
     if (!targetIds.length) {
-      setMapError("No accounts selected.");
+      setMapError("Не выбраны рекламные аккаунты.");
       return;
     }
     if (!mappingForm.client_id) {
-      setMapError("Select client.");
+      setMapError("Выберите клиента.");
+      return;
+    }
+    const targetClient = clients.find((client) => client.id === mappingForm.client_id);
+    const targetCurrency = String(targetClient?.default_currency || "USD").toUpperCase();
+    const incompatible = targetIds
+      .map((id) => accounts.find((account) => account.id === id))
+      .filter(
+        (account): account is AdAccount =>
+          Boolean(account) && String(account.currency || "USD").toUpperCase() !== targetCurrency,
+      );
+    if (incompatible.length) {
+      setMapError(
+        `Валюта клиента ${targetCurrency}, а у выбранных аккаунтов: ${[
+          ...new Set(incompatible.map((account) => String(account.currency || "USD").toUpperCase())),
+        ].join(", ")}. Сначала выберите клиента с той же валютой.`,
+      );
       return;
     }
     try {
@@ -189,12 +225,12 @@ export default function AccountsPage() {
           return req<AdAccount>(`/ad-accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
         })
       );
-      push(`Mapped ${targetIds.length} account(s)`, "success");
+      push(`Аккаунтов привязано: ${targetIds.length}`, "success");
       setMapOpen(false);
       setSelectedIds([]);
       await loadData();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Mapping failed";
+      const msg = err instanceof Error ? err.message : "Не удалось назначить клиента";
       setMapError(msg);
       push(msg, "error");
     } finally {
@@ -205,17 +241,17 @@ export default function AccountsPage() {
   async function bulkArchive() {
     const targetIds = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
     if (!targetIds.length) {
-      push("Select account(s) first", "info");
+      push("Сначала выберите рекламный аккаунт", "info");
       return;
     }
-    if (!window.confirm(`Archive ${targetIds.length} account(s)?`)) return;
+    if (!window.confirm(`Архивировать выбранные аккаунты: ${targetIds.length}?`)) return;
     try {
       await Promise.all(targetIds.map((id) => req<{ status: string }>(`/ad-accounts/${id}`, { method: "DELETE" })));
-      push(`Archived ${targetIds.length} account(s)`, "success");
+      push(`Аккаунтов архивировано: ${targetIds.length}`, "success");
       setSelectedIds([]);
       await loadData();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Archive failed";
+      const msg = err instanceof Error ? err.message : "Не удалось архивировать аккаунты";
       setWarning(msg);
       push(msg, "error");
     }
@@ -231,9 +267,9 @@ export default function AccountsPage() {
   async function syncAll() {
     try {
       await runSync();
-      push("Sync completed", "success");
+      push("Данные обновлены", "success");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Sync failed";
+      const msg = err instanceof Error ? err.message : "Не удалось обновить данные";
       push(msg, "error");
     }
   }
@@ -241,14 +277,14 @@ export default function AccountsPage() {
   async function retrySyncSelected() {
     const targetIds = selectedIds.length ? selectedIds : selectedId ? [selectedId] : [];
     if (!targetIds.length) {
-      push("Select account(s) first", "info");
+      push("Сначала выберите рекламный аккаунт", "info");
       return;
     }
     try {
       await runSync(targetIds);
-      push(`Sync completed for ${targetIds.length} account(s)`, "success");
+      push(`Аккаунтов обновлено: ${targetIds.length}`, "success");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Sync failed";
+      const msg = err instanceof Error ? err.message : "Не удалось обновить данные";
       push(msg, "error");
     }
   }
@@ -256,13 +292,16 @@ export default function AccountsPage() {
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="accounts" subtitle="Operations Center" />
+        <AppSidebar active="accounts" />
 
         <main className="content">
-          <header className="topbar">
+          <header className="topbar role-page-topbar">
             <div className="topbar-left">
-              <AppTopTabs active="accounts" />
-              <div className="topbar-title">Ad Accounts Registry</div>
+              <AppTopTabs active="accounts" sectionLabel="Источники рекламы" />
+              <div className="topbar-title">Рекламные аккаунты</div>
+              <div className="panel-subtitle">
+                Все кабинеты из подключённых платформ и их привязка к клиентам
+              </div>
             </div>
             <div className="session-controls">
               {tokenLoginEnabled ? (
@@ -286,58 +325,60 @@ export default function AccountsPage() {
                       persist(next);
                       setSession(next);
                       await loadData();
-                      push("Session saved", "success");
+                      push("Сессия сохранена", "success");
                     }}
                     disabled={!ready}
                   >
-                    Save
+                    Сохранить
                   </button>
                 </>
               ) : null}
-              <button className="primary-btn" onClick={() => void syncAll()}>Sync All</button>
+              <button className="primary-btn" onClick={() => void syncAll()}>Обновить данные</button>
             </div>
           </header>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
 
+          <DataSourcesNav active="accounts" />
+
           <section className="kpi-grid" style={{ marginTop: 12 }}>
-            <article className="kpi-card"><div className="kpi-title">Total Accounts</div><div className="kpi-value">{kpis.total}</div></article>
-            <article className="kpi-card good"><div className="kpi-title">Mapped</div><div className="kpi-value">{kpis.mapped}</div></article>
-            <article className="kpi-card warn"><div className="kpi-title">Unmapped</div><div className="kpi-value">{kpis.unmapped}</div></article>
-            <article className="kpi-card bad"><div className="kpi-title">Sync Errors</div><div className="kpi-value">{kpis.errors}</div></article>
+            <article className="kpi-card"><div className="kpi-title">Всего аккаунтов</div><div className="kpi-value">{kpis.total}</div></article>
+            <article className="kpi-card good"><div className="kpi-title">Привязаны к клиентам</div><div className="kpi-value">{kpis.mapped}</div></article>
+            <article className="kpi-card warn"><div className="kpi-title">Без клиента</div><div className="kpi-value">{kpis.unmapped}</div></article>
+            <article className="kpi-card bad"><div className="kpi-title">Ошибки обновления</div><div className="kpi-value">{kpis.errors}</div></article>
           </section>
 
           <section className="accounts-grid">
             <article className="panel accounts-main">
               <div className="chip-row" style={{ marginTop: 0 }}>
-                <button className={`chip-btn ${chip === "all" ? "active" : ""}`} onClick={() => setChip("all")}>All</button>
-                <button className={`chip-btn ${chip === "unmapped" ? "active" : ""}`} onClick={() => setChip("unmapped")}>Unmapped</button>
-                <button className={`chip-btn ${chip === "errors" ? "active" : ""}`} onClick={() => setChip("errors")}>Errors</button>
+                <button className={`chip-btn ${chip === "all" ? "active" : ""}`} onClick={() => setChip("all")}>Все</button>
+                <button className={`chip-btn ${chip === "unmapped" ? "active" : ""}`} onClick={() => setChip("unmapped")}>Без клиента</button>
+                <button className={`chip-btn ${chip === "errors" ? "active" : ""}`} onClick={() => setChip("errors")}>С ошибками</button>
                 <label>
-                  Platform
+                  Платформа
                   <select value={platform} onChange={(e) => setPlatform(e.target.value)}>
                     {platformOptions.map((p) => (
-                      <option key={p} value={p}>{p === "all" ? "All" : p}</option>
+                      <option key={p} value={p}>{p === "all" ? "Все" : p}</option>
                     ))}
                   </select>
                 </label>
                 <label>
-                  Client
+                  Клиент
                   <select value={clientId} onChange={(e) => setClientId(e.target.value)}>
-                    <option value="all">All</option>
+                    <option value="all">Все</option>
                     {clients.map((c) => (
                       <option key={c.id} value={c.id}>{c.name}</option>
                     ))}
                   </select>
                 </label>
-                <input className="clientops-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search ID or Name" />
+                <input className="clientops-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Найти по названию или ID" />
               </div>
 
               <div className="alert-actions" style={{ marginTop: 10 }}>
-                <span className="muted-note" style={{ alignSelf: "center", marginRight: 8 }}>Bulk Actions:</span>
-                <button className="mini-btn" disabled={!selectedCount} onClick={() => openMapping()}>Assign</button>
-                <button className="mini-btn" disabled={!selectedCount} onClick={() => void bulkArchive()}>Archive</button>
-                <button className="mini-btn" disabled={!selectedCount} onClick={() => void retrySyncSelected()}>Retry</button>
+                <span className="muted-note" style={{ alignSelf: "center", marginRight: 8 }}>Для выбранных:</span>
+                <button className="mini-btn" disabled={!selectedCount} onClick={() => openMapping()}>Назначить клиента</button>
+                <button className="mini-btn" disabled={!selectedCount} onClick={() => void bulkArchive()}>Архивировать</button>
+                <button className="mini-btn" disabled={!selectedCount} onClick={() => void retrySyncSelected()}>Повторить обновление</button>
               </div>
 
               <div className="budgets-table-wrap" style={{ marginTop: 10 }}>
@@ -345,12 +386,12 @@ export default function AccountsPage() {
                   <thead>
                     <tr>
                       <th><input type="checkbox" checked={rows.length > 0 && rows.every((r) => selectedIds.includes(r.id))} onChange={toggleAllCurrent} /></th>
-                      <th>Platform</th>
-                      <th>Account Name</th>
-                      <th>External ID</th>
-                      <th>Last Sync</th>
-                      <th>Client Mapping</th>
-                      <th>Status</th>
+                      <th>Платформа</th>
+                      <th>Аккаунт</th>
+                      <th>ID в платформе</th>
+                      <th>Последнее обновление</th>
+                      <th>Клиент</th>
+                      <th>Состояние</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -371,12 +412,19 @@ export default function AccountsPage() {
                           <td>{clientNameMap.get(r.client_id) || "--"}</td>
                           <td>
                             <span className={`badge ${syncStatus === "synced" ? "good" : syncStatus === "error" ? "bad" : "warn"}`}>
-                              {syncStatus.toUpperCase()}
+                              {accountStatusLabel(syncStatus)}
                             </span>
                           </td>
                         </tr>
                       );
                     })}
+                    {!rows.length ? (
+                      <tr>
+                        <td colSpan={7} className="muted-note">
+                          По выбранным фильтрам аккаунтов нет.
+                        </td>
+                      </tr>
+                    ) : null}
                   </tbody>
                 </table>
               </div>
@@ -384,41 +432,46 @@ export default function AccountsPage() {
 
             <aside className="panel accounts-detail">
               {!selected ? (
-                <div className="muted-note">Select account to inspect details.</div>
+                <div className="data-empty-state compact">
+                  <strong>Выберите рекламный аккаунт</strong>
+                  <span>Здесь появятся его клиент, состояние обновления и доступные действия.</span>
+                </div>
               ) : (
                 <>
                   <div className="budgets-detail-head">
                     <div>
-                      <h3 style={{ margin: 0 }}>Account Detail</h3>
+                      <h3 style={{ margin: 0 }}>Карточка аккаунта</h3>
                       <div className="panel-subtitle">{selected.external_account_id}</div>
                     </div>
                   </div>
 
                   <div className="panel" style={{ marginTop: 10 }}>
-                    <div className="kpi-title">Mapping Health</div>
+                    <div className="kpi-title">Привязка к клиенту</div>
                     <div className="budgets-money-line">
-                      <strong>{selected.client_id ? "92%" : "12%"}</strong>
-                      <span>{selected.client_id ? "High confidence" : "Low"}</span>
+                      <strong>{selected.client_id ? "Готово" : "Не назначен"}</strong>
+                      <span>{selected.client_id ? "Аккаунт участвует в отчётах клиента" : "Нужно выбрать клиента"}</span>
                     </div>
-                    <div className="insight-text">Client mapping: {clientNameMap.get(selected.client_id) || "Manual mapping required"}</div>
+                    <div className="insight-text">
+                      Клиент: {clientNameMap.get(selected.client_id) || "требуется назначение"}
+                    </div>
                   </div>
 
                   <div className="panel" style={{ marginTop: 10 }}>
-                    <div className="kpi-title">Sync Intelligence</div>
+                    <div className="kpi-title">Обновление данных</div>
                     <div className="detail-grid">
-                      <div className="detail-item"><div className="detail-k">Last Attempt</div><div className="detail-v">{fmtDate(selected.last_sync_at || selected.updated_at)}</div></div>
-                      <div className="detail-item"><div className="detail-k">Status</div><div className="detail-v">{accountSyncStatus(selected)}</div></div>
+                      <div className="detail-item"><div className="detail-k">Последняя попытка</div><div className="detail-v">{fmtDate(selected.last_sync_at || selected.updated_at)}</div></div>
+                      <div className="detail-item"><div className="detail-k">Состояние</div><div className="detail-v">{accountStatusLabel(accountSyncStatus(selected))}</div></div>
                     </div>
                     {selected.sync_error ? (
                       <div className="alert-card high" style={{ marginTop: 10 }}>
-                        <div className="alert-priority high">SYNC ERROR</div>
+                        <div className="alert-priority high">ОШИБКА ОБНОВЛЕНИЯ</div>
                         <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>
                           {selected.sync_error}
                         </div>
                       </div>
                     ) : null}
                     <div style={{ marginTop: 10 }}>
-                      <div className="kpi-title">Recent Activity</div>
+                      <div className="kpi-title">Последние обновления</div>
                       <ul style={{ margin: "8px 0 0", paddingLeft: 16 }}>
                         {syncJobs
                           .filter((j) => j.ad_account_id === selected.id)
@@ -428,14 +481,14 @@ export default function AccountsPage() {
                               {j.status.toUpperCase()} • {fmtDate(j.started_at)}
                             </li>
                           ))}
-                        {!syncJobs.some((j) => j.ad_account_id === selected.id) ? <li>No sync events yet</li> : null}
+                        {!syncJobs.some((j) => j.ad_account_id === selected.id) ? <li>Обновлений пока не было</li> : null}
                       </ul>
                     </div>
                   </div>
 
                   <div className="budgets-detail-actions">
-                    <button className="primary-btn" onClick={() => openMapping([selected.id])}>Resolve Mapping</button>
-                    <button className="ghost-btn" onClick={() => void retrySyncSelected()}>Retry Sync</button>
+                    <button className="primary-btn" onClick={() => openMapping([selected.id])}>Назначить клиента</button>
+                    <button className="ghost-btn" onClick={() => void retrySyncSelected()}>Обновить ещё раз</button>
                   </div>
                 </>
               )}
@@ -448,17 +501,17 @@ export default function AccountsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>Assign To Client</h3>
-              <div className="panel-subtitle">Map selected account(s) to an internal client.</div>
+              <h3 style={{ margin: 0 }}>Назначить клиента</h3>
+              <div className="panel-subtitle">Выбранные аккаунты попадут в отчёты этого клиента.</div>
             </div>
-            <button className="ghost-btn" onClick={() => setMapOpen(false)} disabled={mapLoading}>Close</button>
+            <button className="ghost-btn" onClick={() => setMapOpen(false)} disabled={mapLoading}>Закрыть</button>
           </div>
           <div className={`warning ${mapError ? "" : "hidden"}`} style={{ marginTop: 10 }}>{mapError}</div>
           <div style={{ marginTop: 10 }}>
             <label>
-              Client
+              Клиент
               <select value={mappingForm.client_id} onChange={(e) => setMappingForm({ client_id: e.target.value })}>
-                <option value="">Select client</option>
+                <option value="">Выберите клиента</option>
                 {clients.filter((c) => c.status !== "archived").map((c) => (
                   <option key={c.id} value={c.id}>{c.name}</option>
                 ))}
@@ -466,9 +519,9 @@ export default function AccountsPage() {
             </label>
           </div>
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-            <button className="ghost-btn" onClick={() => setMapOpen(false)} disabled={mapLoading}>Cancel</button>
+            <button className="ghost-btn" onClick={() => setMapOpen(false)} disabled={mapLoading}>Отмена</button>
             <button className="primary-btn" onClick={() => void applyMapping()} disabled={mapLoading || !mappingForm.client_id}>
-              {mapLoading ? "Applying..." : "Assign"}
+              {mapLoading ? "Сохраняем…" : "Назначить"}
             </button>
           </div>
         </div>

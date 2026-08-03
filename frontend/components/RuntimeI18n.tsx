@@ -10,6 +10,20 @@ import {
 } from "../lib/runtime-i18n";
 
 const ATTRS = ["placeholder", "title", "aria-label"] as const;
+const DATA_BEARING_SELECTOR = [
+  "[data-i18n-data]",
+  "td",
+  "option",
+  ".client-name",
+  ".client-id",
+  ".agency-name",
+  ".context-role",
+  ".topbar-title",
+  ".decision-title",
+  ".activity-title",
+  ".insight-title",
+  ".role-sidebar > .panel-subtitle",
+].join(",");
 
 const runtimeRuWordMapLower: Record<string, string> = Object.fromEntries(
   Object.entries(runtimeRuWordMap).map(([en, ru]) => [en.toLowerCase(), ru]),
@@ -38,14 +52,18 @@ function translateToken(token: string, ru: boolean): string {
   return applyCase(token, fallback);
 }
 
-function translateValue(value: string, ru: boolean): string {
+function allowWordFallback(element: Element | null): boolean {
+  return !element?.closest(DATA_BEARING_SELECTOR);
+}
+
+function translateValue(value: string, ru: boolean, wordFallback = true): string {
   const trimmed = value.trim();
   if (!trimmed) return value;
   const exact = ru
     ? (runtimeRuMap[trimmed] || trimmed)
     : (runtimeRuToEnMap[trimmed] || trimmed);
   let translated = exact;
-  if (translated === trimmed) {
+  if (translated === trimmed && wordFallback) {
     const normalized = trimmed.replaceAll("_", " ");
     translated = normalized.replace(/\p{L}[\p{L}\p{N}]*/gu, (token) => translateToken(token, ru));
     if (!translated) translated = trimmed;
@@ -84,7 +102,7 @@ export function RuntimeI18n() {
             continue;
           }
           const current = node.nodeValue || "";
-          const next = translateValue(current, ru);
+          const next = translateValue(current, ru, allowWordFallback(node.parentElement));
           if (next !== current) node.nodeValue = next;
           node = walker.nextNode();
         }
@@ -95,7 +113,7 @@ export function RuntimeI18n() {
           for (const attr of ATTRS) {
             const current = el.getAttribute(attr);
             if (!current) continue;
-            const next = translateValue(current, ru);
+            const next = translateValue(current, ru, allowWordFallback(el));
             if (next !== current) el.setAttribute(attr, next);
           }
         }

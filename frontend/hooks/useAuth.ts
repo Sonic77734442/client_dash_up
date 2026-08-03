@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse } from "../lib/types";
 import { fetchJson } from "../lib/api";
 import { resolveApiBase } from "../lib/apiBase";
+import { isAppRole } from "../lib/authRedirect";
 import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
@@ -20,9 +21,10 @@ export function useAuth(defaultApiBase: string) {
 
     try {
       const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
+      const nextRole = isAppRole(body.session.role) ? body.session.role : null;
       setMe(body);
-      setRole(body.session.role || null);
-      setAuthenticated(Boolean(body.session.valid));
+      setRole(nextRole);
+      setAuthenticated(Boolean(body.session.valid && nextRole));
       setReady(true);
     } catch {
       setAuthenticated(false);

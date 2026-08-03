@@ -8,7 +8,7 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson, getQuery } from "../../lib/api";
-import { AdAccount, AgencyOverview, Budget, Client } from "../../lib/types";
+import { AdAccount, AdStat, Budget, Client } from "../../lib/types";
 
 type StatusFilter = "active" | "archived" | "all";
 type RangePreset = "qtd" | "30" | "90";
@@ -55,8 +55,33 @@ type BudgetTransferOut = {
   created_at: string;
 };
 
+function normalizeCurrency(value: string | null | undefined) {
+  const currency = String(value || "USD").trim().toUpperCase();
+  try {
+    new Intl.NumberFormat("en-US", { style: "currency", currency }).format(0);
+    return currency;
+  } catch {
+    return "USD";
+  }
+}
+
+function isSupportedCurrency(value: string) {
+  const currency = value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) return false;
+  try {
+    new Intl.NumberFormat("en-US", { style: "currency", currency }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function fmtMoney(v: number | null | undefined, currency = "USD") {
-  return new Intl.NumberFormat("en-US", { style: "currency", currency, maximumFractionDigits: 0 }).format(v || 0);
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: normalizeCurrency(currency),
+    maximumFractionDigits: 0,
+  }).format(v || 0);
 }
 
 function todayIso() {
@@ -91,12 +116,13 @@ function paceLabel(pace: BudgetRow["pace"]) {
 }
 
 function buildCsv(rows: BudgetRow[]) {
-  const head = ["scope", "client", "account", "budget", "usage_percent", "pace", "period_start", "period_end", "status"];
+  const head = ["scope", "client", "account", "budget", "currency", "usage_percent", "pace", "period_start", "period_end", "status"];
   const lines = rows.map((r) => [
     r.scope,
     r.resolvedClientName,
     r.resolvedAccountName || "",
     r.amount,
+    r.currency || "USD",
     r.usagePercent == null ? "" : r.usagePercent.toFixed(1),
     r.pace,
     r.start_date || "",
@@ -132,7 +158,7 @@ export default function BudgetsPage() {
   const [clients, setClients] = useState<Client[]>([]);
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [budgets, setBudgets] = useState<Budget[]>([]);
-  const [agencyOverview, setAgencyOverview] = useState<AgencyOverview | null>(null);
+  const [stats, setStats] = useState<AdStat[]>([]);
 
   const [preset, setPreset] = useState<RangePreset>("qtd");
   const [status, setStatus] = useState<StatusFilter>("active");
@@ -173,17 +199,21 @@ export default function BudgetsPage() {
       date_from: range.date_from,
       date_to: range.date_to,
     });
-    const overviewQuery = getQuery({ date_from: range.date_from, date_to: range.date_to });
-    const [c, a, b, agency] = await Promise.all([
+    const statsQuery = getQuery({
+      date_from: range.date_from,
+      date_to: range.date_to,
+      client_id: clientId || undefined,
+    });
+    const [c, a, b, statPayload] = await Promise.all([
       req<{ items: Client[] }>("/clients?status=active"),
       req<{ items: AdAccount[] }>("/ad-accounts?status=active"),
       req<{ items: Budget[] }>(`/budgets${budgetQuery}`),
-      req<AgencyOverview>(`/agency/overview${overviewQuery}`),
+      req<{ items: AdStat[] }>(`/ad-stats${statsQuery}`),
     ]);
     setClients(c.items || []);
     setAccounts(a.items || []);
     setBudgets(b.items || []);
-    setAgencyOverview(agency);
+    setStats(statPayload.items || []);
   }, [req, preset, status, clientId]);
 
   useEffect(() => {
@@ -193,17 +223,22 @@ export default function BudgetsPage() {
 
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
-  const spendByClient = useMemo(() => new Map((agencyOverview?.per_client || []).map((r) => [r.client_id, Number(r.spend || 0)])), [agencyOverview]);
-  const spendByAccount = useMemo(
-    () => new Map((agencyOverview?.per_account || []).map((r) => [r.account_id, Number(r.spend || 0)])),
-    [agencyOverview]
-  );
 
   const rows = useMemo(() => {
     const q = search.trim().toLowerCase();
+    const selectedRange = rangeFromPreset(preset);
     const mapped = (budgets || []).map((b) => {
       const accountName = b.account_id ? accountMap.get(b.account_id)?.name || b.account_id : null;
-      const spend = b.scope === "account" ? Number(spendByAccount.get(b.account_id || "") || 0) : Number(spendByClient.get(b.client_id) || 0);
+      const effectiveFrom = b.start_date && b.start_date > selectedRange.date_from ? b.start_date : selectedRange.date_from;
+      const effectiveTo = b.end_date && b.end_date < selectedRange.date_to ? b.end_date : selectedRange.date_to;
+      const spend = stats.reduce((sum, stat) => {
+        const statAccountId = String(stat.ad_account_id || "");
+        const account = accountMap.get(statAccountId);
+        if (!account || account.client_id !== b.client_id) return sum;
+        if (b.scope === "account" && statAccountId !== String(b.account_id || "")) return sum;
+        if (stat.date < effectiveFrom || stat.date > effectiveTo) return sum;
+        return sum + Number(stat.spend || 0);
+      }, 0);
       const budget = Number(b.amount || 0);
       const usagePercent = budget > 0 ? (spend / budget) * 100 : null;
       const pace: BudgetRow["pace"] =
@@ -225,7 +260,7 @@ export default function BudgetsPage() {
     });
 
     return filtered.sort((a, b) => new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime());
-  }, [budgets, search, clientMap, accountMap, spendByClient, spendByAccount]);
+  }, [budgets, search, clientMap, accountMap, stats, preset]);
 
   useEffect(() => {
     if (!rows.length) {
@@ -273,17 +308,57 @@ export default function BudgetsPage() {
 
   const kpis = useMemo(() => {
     const active = rows.filter((r) => (r.status || "active") === "active");
-    const totalBudget = active.reduce((acc, x) => acc + Number(x.amount || 0), 0);
-    const totalSpend = active.reduce((acc, x) => acc + Number(x.spend || 0), 0);
-    const atRisk = active.filter((x) => x.pace === "overspending").length;
-    return { activeBudgets: active.length, totalBudget, totalSpend, atRisk };
-  }, [rows]);
+    const effectiveBudgets: BudgetRow[] = [];
+    const rowsByClient = new Map<string, BudgetRow[]>();
+    for (const row of active) {
+      const group = rowsByClient.get(row.client_id) || [];
+      group.push(row);
+      rowsByClient.set(row.client_id, group);
+    }
+    for (const clientRows of rowsByClient.values()) {
+      const clientCaps = clientRows.filter((row) => row.scope === "client");
+      effectiveBudgets.push(...(clientCaps.length ? clientCaps : clientRows.filter((row) => row.scope === "account")));
+    }
+
+    const currencies = new Set(effectiveBudgets.map((r) => String(r.currency || "USD").toUpperCase()));
+    const totalBudget = effectiveBudgets.reduce((acc, x) => acc + Number(x.amount || 0), 0);
+    const totalSpend = stats.reduce((sum, stat) => {
+      const accountId = String(stat.ad_account_id || "");
+      const account = accountMap.get(accountId);
+      if (!account) return sum;
+      const coveredByBudget = effectiveBudgets.some((budget) => {
+        if (budget.client_id !== account.client_id) return false;
+        if (budget.scope === "account" && String(budget.account_id || "") !== accountId) return false;
+        if (budget.start_date && stat.date < budget.start_date) return false;
+        if (budget.end_date && stat.date > budget.end_date) return false;
+        return true;
+      });
+      return coveredByBudget ? sum + Number(stat.spend || 0) : sum;
+    }, 0);
+    const atRisk = effectiveBudgets.filter((x) => x.pace === "overspending").length;
+    return {
+      activeBudgets: active.length,
+      totalBudget,
+      totalSpend,
+      atRisk,
+      currency: currencies.size === 1 ? [...currencies][0] : currencies.size === 0 ? "USD" : null,
+      hasMixedCurrencies: currencies.size > 1,
+    };
+  }, [rows, stats, accountMap]);
+
+  const totalBudgetLabel = kpis.currency ? fmtMoney(kpis.totalBudget, kpis.currency) : "Разные валюты";
+  const totalSpendLabel = kpis.currency ? fmtMoney(kpis.totalSpend, kpis.currency) : "Разные валюты";
+  const efficiencyLabel =
+    kpis.currency && kpis.totalBudget > 0
+      ? `${((kpis.totalSpend / kpis.totalBudget) * 100).toFixed(1)}%`
+      : "--";
 
   const parsedCreateAmount = Number(createForm.amount);
   const isAmountValid = Number.isFinite(parsedCreateAmount) && parsedCreateAmount > 0;
+  const isCurrencyValid = isSupportedCurrency(createForm.currency);
   const isDateRangeValid = !!createForm.start_date && !!createForm.end_date && createForm.start_date <= createForm.end_date;
   const isScopeValid = createForm.scope === "client" || !!createForm.account_id;
-  const canCreate = !!createForm.client_id && isAmountValid && isDateRangeValid && isScopeValid;
+  const canCreate = !!createForm.client_id && isAmountValid && isCurrencyValid && isDateRangeValid && isScopeValid;
   const createCapBlocksSubmit = createCapHint.level === "warn" && !!createCapHint.text;
 
   function openCreateModal() {
@@ -296,6 +371,10 @@ export default function BudgetsPage() {
   async function createBudget() {
     if (!isAmountValid) {
       setCreateError("Amount must be greater than 0.");
+      return;
+    }
+    if (!isCurrencyValid) {
+      setCreateError("Укажите корректный трёхбуквенный код валюты, например USD.");
       return;
     }
     if (!isDateRangeValid) {
@@ -678,17 +757,22 @@ export default function BudgetsPage() {
             </article>
             <article className="kpi-card">
               <div className="kpi-title">Total Budget</div>
-              <div className="kpi-value">{fmtMoney(kpis.totalBudget)}</div>
+              <div className="kpi-value">{totalBudgetLabel}</div>
             </article>
             <article className="kpi-card">
               <div className="kpi-title">Total Spend</div>
-              <div className="kpi-value">{fmtMoney(kpis.totalSpend)}</div>
+              <div className="kpi-value">{totalSpendLabel}</div>
             </article>
             <article className="kpi-card bad">
               <div className="kpi-title">At Risk</div>
               <div className="kpi-value">{kpis.atRisk}</div>
             </article>
           </section>
+          {kpis.hasMixedCurrencies ? (
+            <div className="warning">
+              В выборке несколько валют. Денежные итоги и общий процент эффективности не складываются; выберите одного клиента.
+            </div>
+          ) : null}
 
           <section className="budgets-layout">
             <article className="panel budgets-main">
@@ -941,9 +1025,9 @@ export default function BudgetsPage() {
 
           <section className="budgets-mobile" aria-label="mobile budgets view">
             <div className="budgets-mobile-kpis">
-              <div className="mobile-card"><div className="kpi-title">Total Allocated</div><div className="kpi-value">{fmtMoney(kpis.totalBudget)}</div></div>
-              <div className="mobile-card"><div className="kpi-title">Active Burn</div><div className="kpi-value">{fmtMoney(kpis.totalSpend)}</div></div>
-              <div className="mobile-card"><div className="kpi-title">Efficiency</div><div className="kpi-value">{kpis.totalBudget > 0 ? `${((kpis.totalSpend / kpis.totalBudget) * 100).toFixed(1)}%` : "--"}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Total Allocated</div><div className="kpi-value">{totalBudgetLabel}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Active Burn</div><div className="kpi-value">{totalSpendLabel}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Efficiency</div><div className="kpi-value">{efficiencyLabel}</div></div>
               <div className="mobile-card"><div className="kpi-title">Over Pace</div><div className="kpi-value">{kpis.atRisk}</div></div>
             </div>
             {rows.slice(0, 4).map((r) => (
@@ -1006,7 +1090,19 @@ export default function BudgetsPage() {
             </label>
             <label>
               Client
-              <select value={createForm.client_id} onChange={(e) => setCreateForm((s) => ({ ...s, client_id: e.target.value, account_id: "" }))}>
+              <select
+                value={createForm.client_id}
+                onChange={(e) => {
+                  const nextClientId = e.target.value;
+                  const clientCurrency = clients.find((client) => client.id === nextClientId)?.default_currency;
+                  setCreateForm((s) => ({
+                    ...s,
+                    client_id: nextClientId,
+                    account_id: "",
+                    currency: String(clientCurrency || "USD").toUpperCase(),
+                  }));
+                }}
+              >
                 <option value="">Select client</option>
                 {clients.map((c) => (
                   <option key={c.id} value={c.id}>{c.name}</option>
@@ -1018,7 +1114,15 @@ export default function BudgetsPage() {
               <select
                 value={createForm.account_id}
                 disabled={createForm.scope !== "account"}
-                onChange={(e) => setCreateForm((s) => ({ ...s, account_id: e.target.value }))}
+                onChange={(e) => {
+                  const nextAccountId = e.target.value;
+                  const accountCurrency = accounts.find((account) => account.id === nextAccountId)?.currency;
+                  setCreateForm((s) => ({
+                    ...s,
+                    account_id: nextAccountId,
+                    currency: String(accountCurrency || s.currency || "USD").toUpperCase(),
+                  }));
+                }}
               >
                 <option value="">Select account</option>
                 {accountsForClient.map((a) => (

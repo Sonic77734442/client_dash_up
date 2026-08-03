@@ -3,12 +3,26 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
-import { Locale } from "../../lib/i18n";
+import { type Locale } from "../../lib/i18n";
 import { DEFAULT_API_BASE, normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
+import {
+  type AppRole,
+  destinationForRole,
+  safeRelativePath,
+} from "../../lib/authRedirect";
+import { oauthErrorMessage } from "../../lib/oauthError";
 import { clearSessionToken, setSessionToken } from "../../lib/sessionToken";
 
 const LS_API_BASE = "ops_api_base";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
+
+function readRole(payload: unknown): AppRole | null {
+  if (!payload || typeof payload !== "object") return null;
+  const user = (payload as { user?: unknown }).user;
+  if (!user || typeof user !== "object") return null;
+  const role = (user as { role?: unknown }).role;
+  return role === "admin" || role === "agency" || role === "client" ? role : null;
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -27,6 +41,13 @@ export default function LoginPage() {
   const { locale, setLocale } = useLocale();
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
+  const requestedNext = useMemo(() => safeRelativePath(search.get("next"), "/"), [search]);
+  const oauthError = useMemo(() => oauthErrorMessage(search.get("oauth_error")), [search]);
+
+  function redirectAfterLogin(payload: unknown) {
+    const role = readRole(payload);
+    router.replace(role ? destinationForRole(role, requestedNext) : requestedNext);
+  }
 
   useEffect(() => {
     const base = resolveApiBase(defaultApiBase);
@@ -51,10 +72,11 @@ export default function LoginPage() {
         setError("Токен сессии недействителен");
         return;
       }
+      const body = await res.json().catch(() => ({}));
       localStorage.setItem(LS_API_BASE, base);
       setSessionToken(t);
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-      router.replace("/");
+      redirectAfterLogin(body);
     } catch {
       setError("Не удалось войти");
     } finally {
@@ -94,7 +116,7 @@ export default function LoginPage() {
         clearSessionToken();
       }
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-      router.replace("/");
+      redirectAfterLogin(body);
     } catch {
       setError("Не удалось принять приглашение");
     } finally {
@@ -126,7 +148,7 @@ export default function LoginPage() {
       localStorage.setItem(LS_API_BASE, base);
       clearSessionToken();
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-      router.replace("/");
+      redirectAfterLogin(body);
     } catch {
       setError("Не удалось войти по email и паролю");
     } finally {
@@ -151,6 +173,8 @@ export default function LoginPage() {
           </select>
         </div>
         <p className="panel-subtitle">Войдите удобным для вас способом.</p>
+
+        {oauthError ? <div className="warning">{oauthError}</div> : null}
 
         {tokenLoginEnabled ? (
           <>
@@ -222,7 +246,8 @@ export default function LoginPage() {
               localStorage.setItem(LS_API_BASE, base);
               clearSessionToken();
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-              window.location.href = `${base}/auth/facebook/start?next=/`;
+              const params = new URLSearchParams({ next: requestedNext, intent: "login" });
+              window.location.href = `${base}/auth/facebook/start?${params.toString()}`;
             }}
           >
             Продолжить через Facebook
@@ -234,7 +259,8 @@ export default function LoginPage() {
               localStorage.setItem(LS_API_BASE, base);
               clearSessionToken();
               window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-              window.location.href = `${base}/auth/google/start?next=/`;
+              const params = new URLSearchParams({ next: requestedNext, intent: "login" });
+              window.location.href = `${base}/auth/google/start?${params.toString()}`;
             }}
           >
             Продолжить через Google

@@ -224,3 +224,34 @@ def test_discovery_and_sync_are_forbidden_for_client_role():
         headers=auth_header(user_token),
     )
     assert sync.status_code == 403
+
+
+def test_agency_broad_sync_is_limited_to_assigned_clients_and_explicit_cross_tenant_is_rejected():
+    reset_state()
+    admin = mk_user("admin-sync-scope@acl.local", "admin")
+    admin_token = issue_token(admin["id"])
+    allowed_client = mk_client("Allowed sync tenant", admin_token)
+    hidden_client = mk_client("Hidden sync tenant", admin_token)
+    allowed_account = mk_account(allowed_client["id"], "allowed-sync", admin_token)
+    hidden_account = mk_account(hidden_client["id"], "hidden-sync", admin_token)
+
+    app.state.ad_account_sync_service.provider_fetchers = {
+        "meta": lambda external, date_from, date_to: [{"id": external}],
+    }
+
+    agency = mk_user("agency-sync-scope@acl.local", "agency")
+    agency_token = issue_token(agency["id"])
+    assign_access(agency["id"], allowed_client["id"], "agency")
+
+    broad = client.post("/ad-accounts/sync/run", json={}, headers=auth_header(agency_token))
+    assert broad.status_code == 200, broad.text
+    assert broad.json()["processed"] == 1
+    assert broad.json()["jobs"][0]["ad_account_id"] == allowed_account["id"]
+
+    explicit_hidden = client.post(
+        "/ad-accounts/sync/run",
+        json={"account_ids": [hidden_account["id"]]},
+        headers=auth_header(agency_token),
+    )
+    assert explicit_hidden.status_code == 403
+    assert explicit_hidden.json()["error"]["code"] == "forbidden"

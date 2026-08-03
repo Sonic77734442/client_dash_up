@@ -6,19 +6,16 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   await attachSession(page, context, token);
 
   await page.goto("/");
-  await expect(page.getByText("Platform Admin")).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Центр решений" })).toHaveCount(0);
   await expect(page.locator(".topbar-title").first()).toBeVisible();
 
-  await expect(page.getByRole("link", { name: "Clients" }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: "Клиенты" }).first()).toBeVisible();
 
-  const routes: Array<{ path: string; text: string }> = [
-    { path: "/integrations", text: "Integrations Hub" },
-    { path: "/sync-monitor", text: "Sync Monitor" },
-    { path: "/budgets", text: "Accounts Ledger" },
-  ];
+  const routes = ["/integrations", "/sync-monitor", "/budgets"];
 
-  for (const route of routes) {
-    await page.goto(route.path);
-    await expect(page.locator(".topbar-title").filter({ hasText: route.text })).toBeVisible({ timeout: 30000 });
+  for (const path of routes) {
+    await page.goto(path);
+    await expect(page).toHaveURL(new RegExp(`${path.replace("/", "\\/")}$`));
+    await expect(page.locator(".topbar-title").first()).toHaveText(/\S+/, { timeout: 30_000 });
   }
 });

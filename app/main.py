@@ -7,10 +7,11 @@ import time
 import os
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Union
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -129,7 +130,13 @@ from app.services.operational_actions import (
     OperationalActionStore,
     SqliteOperationalActionStore,
 )
-from app.services.acl import RequestContext, ensure_account_access, ensure_admin, ensure_client_access
+from app.services.acl import (
+    RequestContext,
+    ensure_account_access,
+    ensure_admin,
+    ensure_client_access,
+    ensure_tenant_write_access,
+)
 from app.services.providers import google_ads
 from app.services.audit_log import AuditLogStore, InMemoryAuditLogStore, SqliteAuditLogStore
 from app.services.alerts import AlertSignal, AlertStore, InMemoryAlertStore, SqliteAlertStore
@@ -523,13 +530,15 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content={
-            "error": {
-                "code": "validation_error",
-                "message": "Validation failed",
-                "details": {"errors": exc.errors()},
+        content=jsonable_encoder(
+            {
+                "error": {
+                    "code": "validation_error",
+                    "message": "Validation failed",
+                    "details": {"errors": exc.errors()},
+                }
             }
-        },
+        ),
     )
 
 
@@ -1389,6 +1398,7 @@ def _normalize_next_path(next_path: Optional[str]) -> str:
 def _with_oauth_connect_options(
     next_path: str,
     *,
+    intent: str,
     connect_mode: str,
     connection_key: Optional[str],
 ) -> str:
@@ -1396,8 +1406,12 @@ def _with_oauth_connect_options(
     query_items = [
         (k, v)
         for (k, v) in parse_qsl(parsed.query, keep_blank_values=True)
-        if k not in {"ops_connect_mode", "ops_connection_key"}
+        if k not in {"ops_oauth_intent", "ops_connect_mode", "ops_connection_key"}
     ]
+    normalized_intent = (intent or "login").strip().lower()
+    if normalized_intent not in {"login", "connect"}:
+        normalized_intent = "login"
+    query_items.append(("ops_oauth_intent", normalized_intent))
     mode = (connect_mode or "add").strip().lower()
     if mode not in {"add", "overwrite"}:
         mode = "add"
@@ -1408,12 +1422,18 @@ def _with_oauth_connect_options(
     return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
 
 
-def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, Optional[str]]:
+def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, str, Optional[str]]:
     parsed = urlsplit(_normalize_next_path(next_path))
+    intent = "login"
     mode = "add"
     key: Optional[str] = None
     clean_items: List[tuple[str, str]] = []
     for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        if k == "ops_oauth_intent":
+            candidate = str(v or "").strip().lower()
+            if candidate in {"login", "connect"}:
+                intent = candidate
+            continue
         if k == "ops_connect_mode":
             candidate = str(v or "").strip().lower()
             if candidate in {"add", "overwrite"}:
@@ -1428,7 +1448,19 @@ def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, Optional[s
     if mode == "overwrite" and not key:
         mode = "add"
     clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
-    return clean_next, mode, key
+    return clean_next, intent, mode, key
+
+
+def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
+    normalized = str(error_code or "").strip().lower()
+    safe_code = normalized if normalized in {"access_denied", "user_denied", "session_required"} else "provider_error"
+    base = settings.frontend_base_url.rstrip("/")
+    response = RedirectResponse(
+        url=f"{base}/login?{urlencode({'oauth_error': safe_code})}",
+        status_code=302,
+    )
+    response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
+    return response
 
 
 def _cookie_samesite_value() -> str:
@@ -1591,6 +1623,38 @@ def _account_or_404(account_id: UUID) -> AdAccountOut:
     if not account:
         raise HTTPException(status_code=404, detail="Ad account not found")
     return account
+
+
+def _client_or_404(client_id: UUID) -> ClientOut:
+    client = _client_store().get(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return client
+
+
+def _ensure_client_currency(client_id: UUID, currency: str, *, resource: str) -> ClientOut:
+    client = _client_store().get(client_id)
+    if not client:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_client", "message": "client_id does not exist"},
+        )
+    expected = client.default_currency.strip().upper()
+    actual = currency.strip().upper()
+    if actual != expected:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "currency_mismatch",
+                "message": f"{resource} currency must match the client default currency",
+                "details": {
+                    "client_id": str(client.id),
+                    "expected_currency": expected,
+                    "actual_currency": actual,
+                },
+            },
+        )
+    return client
 
 
 def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optional[UUID]) -> UUID:
@@ -2092,6 +2156,7 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
 def auth_oauth_start(
     provider: str,
     next_path: Optional[str] = Query(default="/", alias="next"),
+    intent: str = Query(default="login", pattern="^(login|connect)$"),
     connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
     connection_key: Optional[str] = Query(default=None),
 ):
@@ -2100,8 +2165,10 @@ def auth_oauth_start(
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
     cfg = _oauth_provider_config_or_400(provider)
+    cfg.intent = intent
     normalized_next = _with_oauth_connect_options(
         _normalize_next_path(next_path),
+        intent=intent,
         connect_mode=connect_mode,
         connection_key=connection_key,
     )
@@ -2147,17 +2214,28 @@ def auth_oauth_callback(
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
     if error:
-        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
+        return _oauth_error_redirect(error)
     if not code or not state:
-        raise HTTPException(status_code=400, detail="Missing OAuth callback parameters")
+        return _oauth_error_redirect("provider_error")
     nonce = request.cookies.get(settings.oauth_nonce_cookie_name)
     if not nonce:
-        raise HTTPException(status_code=400, detail="Missing OAuth nonce")
+        return _oauth_error_redirect("provider_error")
 
-    consumed = _oauth_state_store().consume_state(provider=provider, state=state, nonce=nonce)
+    try:
+        consumed = _oauth_state_store().consume_state(provider=provider, state=state, nonce=nonce)
+    except HTTPException:
+        return _oauth_error_redirect("provider_error")
+    redirect_next, oauth_intent, connect_mode, requested_connection_key = _extract_oauth_connect_options(
+        consumed.next_path or "/"
+    )
     cfg = _oauth_provider_config_or_400(provider)
-    identity = adapter.fetch_identity(cfg, code)
-    # If user is already authenticated, treat this as provider connect/link for current user.
+    cfg.intent = oauth_intent
+    try:
+        identity = adapter.fetch_identity(cfg, code)
+    except Exception:
+        logger.warning("OAuth identity exchange failed for provider=%s intent=%s", provider, oauth_intent)
+        return _oauth_error_redirect("provider_error")
+
     current_token = _get_session_token(
         request.headers.get("Authorization"),
         request.headers.get("X-Session-Token"),
@@ -2166,10 +2244,14 @@ def auth_oauth_callback(
     )
     current_ctx = _auth_facade().get_session_context(current_token) if current_token else None
 
-    if current_ctx and current_ctx.valid and current_ctx.user_id:
+    if oauth_intent == "connect":
+        if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
+            return _oauth_error_redirect("session_required")
         current_user = _auth_store().get_user(current_ctx.user_id)
         if not current_user:
-            raise HTTPException(status_code=401, detail="Session user not found")
+            return _oauth_error_redirect("session_required")
+        if current_user.role not in {"admin", "agency"}:
+            return _oauth_error_redirect("provider_error")
         linked = _auth_store().link_identity(
             AuthIdentityLink(
                 user_id=current_user.id,
@@ -2199,24 +2281,21 @@ def auth_oauth_callback(
     if not resolved.session:
         raise HTTPException(status_code=500, detail="OAuth session was not issued")
 
-    redirect_next, connect_mode, requested_connection_key = _extract_oauth_connect_options(consumed.next_path or "/")
-
-    _auto_upsert_integration_credentials(
-        provider=provider,
-        user=resolved.user,
-        provider_user_id=identity.provider_user_id,
-        connect_mode=connect_mode,
-        requested_connection_key=requested_connection_key,
-        oauth_tokens=identity.oauth_tokens,
-        cfg=cfg,
-    )
-    session_ctx = _auth_facade().get_session_context(resolved.session.token)
-    _schedule_login_auto_sync(background_tasks, session_ctx)
+    if oauth_intent == "connect":
+        _auto_upsert_integration_credentials(
+            provider=provider,
+            user=resolved.user,
+            provider_user_id=identity.provider_user_id,
+            connect_mode=connect_mode,
+            requested_connection_key=requested_connection_key,
+            oauth_tokens=identity.oauth_tokens,
+            cfg=cfg,
+        )
+        session_ctx = _auth_facade().get_session_context(resolved.session.token)
+        _schedule_login_auto_sync(background_tasks, session_ctx)
 
     base = settings.frontend_base_url.rstrip("/")
-    next_encoded = quote(redirect_next or "/", safe="/?=&")
-    token_fragment = quote(resolved.session.token, safe="")
-    redirect_url = f"{base}/login/success?next={next_encoded}#token={token_fragment}"
+    redirect_url = f"{base}/login/success?{urlencode({'next': redirect_next or '/'})}"
     response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
     max_age = (
         max(60, int((resolved.session.expires_at - _utcnow()).total_seconds()))
@@ -2655,11 +2734,7 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
 
 @app.post("/clients", response_model=ClientOut, summary="Create client")
 def create_client(payload: ClientCreate, ctx: RequestContext = Depends(auth_context)):
-    if ctx.role not in {"admin", "agency"}:
-        raise HTTPException(
-            status_code=403,
-            detail={"code": "forbidden", "message": "Only admin/agency can create clients"},
-        )
+    ensure_tenant_write_access(ctx)
     agency_ids: List[UUID] = []
     if ctx.role == "agency":
         if not ctx.user_id:
@@ -2702,12 +2777,41 @@ def get_client(client_id: UUID, ctx: RequestContext = Depends(auth_context)):
 
 @app.patch("/clients/{client_id}", response_model=ClientOut, summary="Update client")
 def patch_client(client_id: UUID, payload: ClientPatch, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, client_id)
+    existing = _client_or_404(client_id)
+    if payload.default_currency and payload.default_currency != existing.default_currency:
+        target_currency = payload.default_currency
+        conflicting_accounts = [
+            account
+            for account in _ad_account_store().list(client_id=client_id, status="all")
+            if account.currency != target_currency
+        ]
+        conflicting_budgets = [
+            budget
+            for budget in _budget_store().list(client_id=client_id, status="all")
+            if budget.currency != target_currency
+        ]
+        if conflicting_accounts or conflicting_budgets:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "currency_conflict",
+                    "message": "Client currency cannot change while dependent accounts or budgets use another currency",
+                    "details": {
+                        "client_id": str(client_id),
+                        "target_currency": target_currency,
+                        "conflicting_accounts": len(conflicting_accounts),
+                        "conflicting_budgets": len(conflicting_budgets),
+                    },
+                },
+            )
     return _client_store().patch(client_id, payload)
 
 
 @app.delete("/clients/{client_id}", summary="Archive client")
 def archive_client(client_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, client_id)
     row = _client_store().archive(client_id)
     return {"status": "archived", "client": row.model_dump(mode="json")}
@@ -2816,7 +2920,9 @@ def revoke_client_invite(
     ),
 )
 def create_ad_account(payload: AdAccountCreate, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, payload.client_id)
+    _ensure_client_currency(payload.client_id, payload.currency, resource="Ad account")
     return _ad_account_store().create(payload)
 
 
@@ -2853,15 +2959,41 @@ def get_ad_account(account_id: UUID, ctx: RequestContext = Depends(auth_context)
 
 @app.patch("/ad-accounts/{account_id}", response_model=AdAccountOut, summary="Update ad account")
 def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     existing = _account_or_404(account_id)
     ensure_account_access(ctx, existing.client_id, account_id=existing.id)
     if payload.client_id:
         ensure_client_access(ctx, payload.client_id)
+    target_client_id = payload.client_id or existing.client_id
+    target_currency = payload.currency or existing.currency
+    if payload.client_id is not None or payload.currency is not None:
+        _ensure_client_currency(target_client_id, target_currency, resource="Ad account")
+        account_budgets = _budget_store().list(account_id=existing.id, status="all")
+        if payload.client_id is not None and payload.client_id != existing.client_id and account_budgets:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "account_budget_conflict",
+                    "message": "Account cannot move to another client while budgets reference it",
+                    "details": {"account_id": str(existing.id), "budgets": len(account_budgets)},
+                },
+            )
+        conflicting_budgets = [budget for budget in account_budgets if budget.currency != target_currency]
+        if conflicting_budgets:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "currency_conflict",
+                    "message": "Account currency cannot change while budgets use another currency",
+                    "details": {"account_id": str(existing.id), "budgets": len(conflicting_budgets)},
+                },
+            )
     return _ad_account_store().patch(account_id, payload)
 
 
 @app.delete("/ad-accounts/{account_id}", summary="Archive ad account")
 def archive_ad_account(account_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     existing = _account_or_404(account_id)
     ensure_account_access(ctx, existing.client_id, account_id=existing.id)
     row = _ad_account_store().archive(account_id)
@@ -2885,11 +3017,13 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             detail={"code": "forbidden", "message": "Only admin/agency can run account discovery"},
         )
     target_client_id = _resolve_discovery_client_id(ctx, payload.client_id)
+    target_client = _client_or_404(target_client_id)
     result = _ad_account_discovery_service().discover(
         provider=payload.provider,
         client_id=target_client_id,
         user_id=ctx.user_id,
         upsert_existing=payload.upsert_existing,
+        expected_currency=target_client.default_currency,
     )
     _process_discovery_alerts(
         target_client_id=target_client_id,
@@ -2931,27 +3065,36 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
             status_code=403,
             detail={"code": "forbidden", "message": "Only admin/agency can run account sync"},
         )
-    requested_accounts = _ad_account_store().list(status="all")
+    all_accounts = _ad_account_store().list(status="all")
+    requested_accounts = all_accounts
     if payload.client_id:
         ensure_client_access(ctx, payload.client_id)
         requested_accounts = [a for a in requested_accounts if a.client_id == payload.client_id]
-    if payload.account_ids:
+    if payload.account_ids is not None:
         requested_ids = set(payload.account_ids)
+        if not ctx.global_access:
+            explicitly_disallowed = [
+                a.id
+                for a in all_accounts
+                if a.id in requested_ids and a.client_id not in ctx.accessible_client_ids
+            ]
+            if explicitly_disallowed:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "forbidden",
+                        "message": "Requested account scope is outside allowed tenant access",
+                        "details": {"account_ids": [str(x) for x in explicitly_disallowed]},
+                    },
+                )
         requested_accounts = [a for a in requested_accounts if a.id in requested_ids]
     if payload.platform:
-        requested_accounts = [a for a in requested_accounts if a.platform == payload.platform]
+        platform_filter = payload.platform.strip().lower()
+        requested_accounts = [
+            a for a in requested_accounts if (a.platform or "").strip().lower() == platform_filter
+        ]
 
     if not ctx.global_access:
-        disallowed = [a.id for a in requested_accounts if a.client_id not in ctx.accessible_client_ids]
-        if disallowed:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "forbidden",
-                    "message": "Requested account scope is outside allowed tenant access",
-                    "details": {"account_ids": [str(x) for x in disallowed]},
-                },
-            )
         requested_accounts = [a for a in requested_accounts if a.client_id in ctx.accessible_client_ids]
 
     result = _ad_account_sync_service().run_sync(
@@ -3122,6 +3265,11 @@ def ad_account_sync_diagnostics(
     ),
 )
 def integrations_overview(ctx: RequestContext = Depends(auth_context)):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Integration management is available to admin and agency roles"},
+        )
     accounts = [a for a in _ad_account_store().list(status="all") if a.status != "archived"]
     if not ctx.global_access:
         accounts = [a for a in accounts if a.client_id in ctx.accessible_client_ids]
@@ -3132,11 +3280,53 @@ def integrations_overview(ctx: RequestContext = Depends(auth_context)):
 
     provider_configs = _auth_store().list_provider_configs()
     identities = _auth_store().list_identities()
+    credential_rows = _integration_credential_store().list(status="active")
+    if not ctx.global_access:
+        agency_ids = set(_agency_scope_ids_for_user(ctx.user_id))
+        credential_rows = [
+            row
+            for row in credential_rows
+            if row.scope_type == "global"
+            or (row.scope_type == "client" and row.scope_id in ctx.accessible_client_ids)
+            or (row.scope_type == "agency" and row.scope_id in agency_ids)
+        ]
+        visible_user_ids = {ctx.user_id}
+        for agency_id in agency_ids:
+            try:
+                visible_user_ids.update(
+                    member.user_id
+                    for member in _platform_admin_store().list_members(agency_id)
+                    if member.status == "active"
+                )
+            except Exception:
+                continue
+        identities = [identity for identity in identities if identity.user_id in visible_user_ids]
+
+    ready_credentials_by_provider: dict[str, int] = {}
+    for row in credential_rows:
+        provider = "meta" if row.provider.strip().lower() == "facebook" else row.provider.strip().lower()
+        credentials = row.credentials or {}
+        ready = False
+        if provider == "meta":
+            ready = bool(str(credentials.get("access_token") or "").strip())
+        elif provider == "google":
+            ready = all(
+                str(credentials.get(key) or "").strip()
+                for key in ("client_id", "client_secret", "refresh_token")
+            ) and bool(
+                str(credentials.get("developer_token") or os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN", "")).strip()
+            )
+        elif provider == "tiktok":
+            ready = bool(str(credentials.get("access_token") or "").strip())
+        if ready:
+            ready_credentials_by_provider[provider] = ready_credentials_by_provider.get(provider, 0) + 1
+
     return build_integrations_overview(
         accounts=accounts,
         sync_jobs=jobs,
         provider_configs=provider_configs,
         identities=identities,
+        ready_credentials_by_provider=ready_credentials_by_provider,
     )
 
 
@@ -3155,10 +3345,23 @@ def ingest_ad_stats(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     ctx: RequestContext = Depends(auth_context),
 ):
-    if not ctx.global_access:
-        for row in payload.rows:
-            account = _account_or_404(row.ad_account_id)
-            ensure_account_access(ctx, account.client_id, account_id=account.id)
+    ensure_tenant_write_access(ctx)
+    for row in payload.rows:
+        account = _account_or_404(row.ad_account_id)
+        ensure_account_access(ctx, account.client_id, account_id=account.id)
+        if account.platform.strip().lower() != row.platform:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "platform_mismatch",
+                    "message": "Ad stat platform must match ad account platform",
+                    "details": {
+                        "ad_account_id": str(account.id),
+                        "account_platform": account.platform,
+                        "row_platform": row.platform,
+                    },
+                },
+            )
     return _ad_stats_store().ingest(payload, idempotency_key=idempotency_key)
 
 
@@ -3206,12 +3409,22 @@ def list_ad_stats(
     responses={409: {"description": "Active budget overlap conflict for scope key."}},
 )
 def create_budget(payload: BudgetCreate, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, payload.client_id)
+    _ensure_client_currency(payload.client_id, payload.currency, resource="Budget")
     if payload.account_id:
         account = _account_or_404(payload.account_id)
         ensure_account_access(ctx, account.client_id, account_id=account.id)
         if account.client_id != payload.client_id:
             raise HTTPException(status_code=400, detail="account_id must belong to client_id")
+        if account.currency != payload.currency:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "currency_mismatch",
+                    "message": "Budget currency must match the ad account currency",
+                },
+            )
     row = _budget_store().create(payload)
     _audit_event(
         event_type="budget.created",
@@ -3275,6 +3488,7 @@ def get_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
     responses={409: {"description": "Active budget overlap conflict for scope key."}},
 )
 def patch_budget(budget_id: UUID, payload: BudgetPatch, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     existing = _budget_store().get(budget_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -3283,11 +3497,22 @@ def patch_budget(budget_id: UUID, payload: BudgetPatch, ctx: RequestContext = De
         ensure_client_access(ctx, payload.client_id)
     target_account_id = payload.account_id if payload.account_id is not None else existing.account_id
     target_client_id = payload.client_id if payload.client_id is not None else existing.client_id
+    target_currency = payload.currency if payload.currency is not None else existing.currency
+    if {"client_id", "account_id", "scope", "currency"} & payload.model_fields_set:
+        _ensure_client_currency(target_client_id, target_currency, resource="Budget")
     if target_account_id:
         account = _account_or_404(target_account_id)
         ensure_account_access(ctx, account.client_id, account_id=account.id)
         if account.client_id != target_client_id:
             raise HTTPException(status_code=400, detail="account_id must belong to client_id")
+        if account.currency != target_currency:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "currency_mismatch",
+                    "message": "Budget currency must match the ad account currency",
+                },
+            )
     row = _budget_store().patch(budget_id, payload)
     _audit_event(
         event_type="budget.updated",
@@ -3311,6 +3536,7 @@ def get_budget_history(budget_id: UUID, ctx: RequestContext = Depends(auth_conte
 
 @app.delete("/budgets/{budget_id}", summary="Archive budget")
 def delete_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     row = _budget_store().get(budget_id)
     if not row:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -3329,6 +3555,7 @@ def delete_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
 
 @app.post("/budgets/{budget_id}/transfer", response_model=BudgetTransferResponse, summary="Transfer budget between accounts")
 def transfer_budget(budget_id: UUID, payload: BudgetTransferRequest, ctx: RequestContext = Depends(auth_context)):
+    ensure_tenant_write_access(ctx)
     source = _budget_store().get(budget_id)
     if not source:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -3339,6 +3566,18 @@ def transfer_budget(budget_id: UUID, payload: BudgetTransferRequest, ctx: Reques
     ensure_account_access(ctx, target_account.client_id, account_id=target_account.id)
     if target_account.client_id != source.client_id:
         raise HTTPException(status_code=400, detail="target account must belong to same client as source budget")
+    if target_account.currency != source.currency:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "currency_mismatch",
+                "message": "Budget transfer requires source and target accounts to use the same currency",
+                "details": {
+                    "source_currency": source.currency,
+                    "target_currency": target_account.currency,
+                },
+            },
+        )
     result = _budget_store().transfer(budget_id, payload)
     _audit_event(
         event_type="budget.transferred",
@@ -3482,27 +3721,71 @@ def insights_operational(
     description="Executes/queues an action selected from operational insights cards and stores action event in backend.",
 )
 def execute_operational_action(payload: OperationalActionExecuteRequest, ctx: RequestContext = Depends(auth_context)):
-    resolved_client_id = payload.client_id
-    resolved_account_id = payload.account_id
+    ensure_tenant_write_access(ctx)
+    resolved_client_id: Optional[UUID] = None
+    resolved_account_id: Optional[UUID] = None
+    resolved_scope_id = payload.scope_id.strip()
 
-    if payload.scope == "account" and not resolved_account_id:
+    if payload.scope == "account":
         try:
-            resolved_account_id = UUID(payload.scope_id)
+            scope_account_id = UUID(resolved_scope_id)
         except Exception:
-            raise HTTPException(status_code=400, detail="account scope requires account_id or UUID scope_id")
-
-    if resolved_account_id:
-        account = _account_or_404(resolved_account_id)
+            raise HTTPException(status_code=400, detail="account scope requires a UUID scope_id")
+        if payload.account_id and payload.account_id != scope_account_id:
+            raise HTTPException(status_code=400, detail="account_id must match account scope_id")
+        account = _account_or_404(scope_account_id)
         ensure_account_access(ctx, account.client_id, account_id=account.id)
-        if resolved_client_id and resolved_client_id != account.client_id:
+        if payload.client_id and payload.client_id != account.client_id:
             raise HTTPException(status_code=400, detail="account_id must belong to client_id")
-        if not resolved_client_id:
-            resolved_client_id = account.client_id
+        resolved_account_id = account.id
+        resolved_client_id = account.client_id
+        resolved_scope_id = str(account.id)
+    elif payload.scope == "client":
+        if payload.account_id:
+            raise HTTPException(status_code=400, detail="client scope does not accept account_id")
+        try:
+            scope_client_id = UUID(resolved_scope_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="client scope requires a UUID scope_id")
+        if payload.client_id and payload.client_id != scope_client_id:
+            raise HTTPException(status_code=400, detail="client_id must match client scope_id")
+        if not _client_store().get(scope_client_id):
+            raise HTTPException(status_code=404, detail="Client not found")
+        ensure_client_access(ctx, scope_client_id)
+        resolved_client_id = scope_client_id
+        resolved_scope_id = str(scope_client_id)
+    else:
+        if payload.client_id or payload.account_id:
+            raise HTTPException(status_code=400, detail="agency scope does not accept client_id or account_id")
+        if resolved_scope_id == "all":
+            if ctx.role != "admin":
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "forbidden",
+                        "message": "The global agency scope is available only to platform admins",
+                    },
+                )
+        else:
+            try:
+                scope_agency_id = UUID(resolved_scope_id)
+            except Exception:
+                raise HTTPException(status_code=400, detail="agency scope requires a UUID scope_id or 'all'")
+            if not _platform_admin_store().get_agency(scope_agency_id):
+                raise HTTPException(status_code=404, detail="Agency not found")
+            _ensure_agency_member_access(ctx, scope_agency_id)
+            resolved_scope_id = str(scope_agency_id)
 
     if resolved_client_id:
         ensure_client_access(ctx, resolved_client_id)
 
-    payload = payload.model_copy(update={"client_id": resolved_client_id, "account_id": resolved_account_id})
+    payload = payload.model_copy(
+        update={
+            "scope_id": resolved_scope_id,
+            "client_id": resolved_client_id,
+            "account_id": resolved_account_id,
+        }
+    )
     return _operational_action_store().create(payload, created_by=ctx.user_id)
 
 

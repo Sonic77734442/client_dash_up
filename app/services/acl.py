@@ -21,6 +21,14 @@ def ensure_admin(ctx: RequestContext) -> None:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Admin access required"})
 
 
+def ensure_tenant_write_access(ctx: RequestContext) -> None:
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Client role is read-only"},
+        )
+
+
 def ensure_client_access(ctx: RequestContext, client_id: UUID) -> None:
     if ctx.global_access:
         return

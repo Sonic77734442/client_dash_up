@@ -8,6 +8,12 @@ import { ToastHost } from "./ToastHost";
 import { useSession } from "../hooks/useSession";
 import { useToast } from "../hooks/useToast";
 import { fetchJson, getQuery } from "../lib/api";
+import { normalizeOverviewPayload } from "../lib/analyticsPayload";
+import {
+  hasOptionalStringFields,
+  hasStringFields,
+  normalizeListPayload,
+} from "../lib/listPayload";
 import {
   AdAccount,
   AdStat,
@@ -50,6 +56,44 @@ const TAB_LABELS: Record<ClientPortalTab, string> = {
   plan: "План действий",
   billing: "Бюджет",
 };
+
+function isClientItem(value: unknown): value is ClientOut {
+  return hasStringFields(value, ["id", "name"]);
+}
+
+function isAdAccountItem(value: unknown): value is AdAccount {
+  return (
+    hasStringFields(value, ["id", "client_id", "platform", "name"]) &&
+    hasOptionalStringFields(value, ["external_account_id", "currency", "last_sync_at"])
+  );
+}
+
+function isBudgetItem(value: unknown): value is Budget {
+  return (
+    hasStringFields(value, ["client_id", "scope", "amount"]) &&
+    hasOptionalStringFields(value, ["currency", "start_date", "end_date", "status"])
+  );
+}
+
+function isActionItem(value: unknown): value is OperationalAction {
+  return hasStringFields(value, [
+    "id",
+    "action",
+    "scope",
+    "scope_id",
+    "status",
+    "title",
+    "created_at",
+  ]);
+}
+
+function isAdStatItem(value: unknown): value is AdStat {
+  return hasStringFields(value, ["date", "platform"]);
+}
+
+function isInsightItem(value: unknown): value is OperationalInsight {
+  return hasStringFields(value, ["scope", "scope_id", "title", "reason", "action", "priority"]);
+}
 
 function fmtMoney(value: number | null | undefined, currency = "USD") {
   const safeCurrency = /^[A-Z]{3}$/.test(currency) ? currency : "USD";
@@ -278,9 +322,15 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
         return;
       }
 
-      const clientPayload = await req<{ items: ClientOut[] }>("/clients?status=active");
-      const availableIds = context.accessible_client_ids || [];
-      const availableClients = (clientPayload.items || []).filter((client) => availableIds.includes(client.id));
+      const clientPayload = await req<unknown>("/clients?status=active");
+      const availableIds = Array.isArray(context.accessible_client_ids)
+        ? context.accessible_client_ids.filter((id): id is string => typeof id === "string")
+        : [];
+      const availableClients = normalizeListPayload(
+        clientPayload,
+        isClientItem,
+        "клиентов",
+      ).filter((client) => availableIds.includes(client.id));
       setClients(availableClients);
 
       const clientId =
@@ -303,22 +353,29 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       const query = getQuery({ client_id: clientId, date_from: range.from, date_to: range.to });
       const [overviewPayload, accountPayload, budgetPayload, actionPayload, statPayload, insightPayload] =
         await Promise.all([
-          req<Overview>(`/insights/overview${query}`),
-          req<{ items: AdAccount[] }>(`/ad-accounts${getQuery({ client_id: clientId, status: "active" })}`),
-          req<{ items: Budget[] }>(
+          req<unknown>(`/insights/overview${query}`),
+          req<unknown>(`/ad-accounts${getQuery({ client_id: clientId, status: "active" })}`),
+          req<unknown>(
             `/budgets${getQuery({ client_id: clientId, status: "active", date_from: range.from, date_to: range.to })}`
           ),
-          req<OperationalAction[]>(`/insights/operational/actions${getQuery({ client_id: clientId })}`),
-          req<{ items: AdStat[] }>(`/ad-stats${query}`),
-          req<{ items: OperationalInsight[] }>(`/insights/operational${query}`),
+          req<unknown>(`/insights/operational/actions${getQuery({ client_id: clientId })}`),
+          req<unknown>(`/ad-stats${query}`),
+          req<unknown>(`/insights/operational${query}`),
         ]);
 
-      setOverview(overviewPayload);
-      setAccounts(accountPayload.items || []);
-      setBudgets(budgetPayload.items || []);
-      setActions(Array.isArray(actionPayload) ? actionPayload.slice(0, 20) : []);
-      setStats(statPayload.items || []);
-      setInsights(insightPayload.items || []);
+      const nextOverview = normalizeOverviewPayload(overviewPayload);
+      const nextAccounts = normalizeListPayload(accountPayload, isAdAccountItem, "рекламных аккаунтов");
+      const nextBudgets = normalizeListPayload(budgetPayload, isBudgetItem, "бюджетов");
+      const nextActions = normalizeListPayload(actionPayload, isActionItem, "действий").slice(0, 20);
+      const nextStats = normalizeListPayload(statPayload, isAdStatItem, "статистики");
+      const nextInsights = normalizeListPayload(insightPayload, isInsightItem, "рекомендаций");
+
+      setOverview(nextOverview);
+      setAccounts(nextAccounts);
+      setBudgets(nextBudgets);
+      setActions(nextActions);
+      setStats(nextStats);
+      setInsights(nextInsights);
       setWarning("");
     } finally {
       setLoading(false);
@@ -370,9 +427,10 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   }, [stats]);
 
   const timelinePoints = useMemo<TimelinePoint[]>(() => {
-    if (!overview || !spendByDate.length) return [];
-    const start = new Date(`${overview.range.date_from}T00:00:00Z`);
-    const end = new Date(`${overview.range.date_to}T00:00:00Z`);
+    const overviewRange = overview?.range;
+    if (!overviewRange?.date_from || !overviewRange.date_to || !spendByDate.length) return [];
+    const start = new Date(`${overviewRange.date_from}T00:00:00Z`);
+    const end = new Date(`${overviewRange.date_to}T00:00:00Z`);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
 
     const dates: string[] = [];
@@ -384,7 +442,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
 
     const dailySpend = new Map(spendByDate.map((row) => [row.date, row.spend]));
     const budget = Number(overview.budget_summary?.budget || 0);
-    const asOf = overview.range.as_of_date || overview.range.date_to;
+    const asOf = overviewRange.as_of_date || overviewRange.date_to;
     let cumulative = 0;
     return dates.map((date, index) => {
       cumulative += Number(dailySpend.get(date) || 0);
@@ -465,8 +523,12 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   const totalSpend = Number(overview?.spend_summary?.spend || 0);
   const totalLeads = Number(overview?.spend_summary?.conversions || 0);
   const totalCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
-  const budgetUsage = overview?.budget_summary?.usage_percent;
-  const periodLabel = overview
+  const rawBudgetUsage = overview?.budget_summary?.usage_percent;
+  const budgetUsage =
+    rawBudgetUsage == null || !Number.isFinite(Number(rawBudgetUsage))
+      ? null
+      : Number(rawBudgetUsage);
+  const periodLabel = overview?.range
     ? `${fmtShortDate(overview.range.date_from)} — ${fmtShortDate(overview.range.date_to)}`
     : `${periodDays} дней`;
 
@@ -628,7 +690,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   note={
                     overview?.budget_summary?.forecast_spend == null
                       ? "Прогноз недоступен"
-                      : `Прогноз: ${fmtMoney(overview.budget_summary.forecast_spend, currency)}`
+                      : `Прогноз: ${fmtMoney(overview?.budget_summary?.forecast_spend, currency)}`
                   }
                   tone={pace.tone}
                 />
@@ -1182,7 +1244,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   value={
                     overview?.budget_summary?.budget == null
                       ? "Не задан"
-                      : fmtMoney(overview.budget_summary.budget, currency)
+                      : fmtMoney(overview?.budget_summary?.budget, currency)
                   }
                   note="Доступный бюджет выбранного периода"
                 />
@@ -1192,7 +1254,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   value={
                     overview?.budget_summary?.remaining == null
                       ? "Нет данных"
-                      : fmtMoney(overview.budget_summary.remaining, currency)
+                      : fmtMoney(overview?.budget_summary?.remaining, currency)
                   }
                   note="Бюджет минус фактический расход"
                 />
@@ -1201,7 +1263,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   value={
                     overview?.budget_summary?.forecast_spend == null
                       ? "Нет данных"
-                      : fmtMoney(overview.budget_summary.forecast_spend, currency)
+                      : fmtMoney(overview?.budget_summary?.forecast_spend, currency)
                   }
                   note="Прогноз расхода к концу периода"
                 />

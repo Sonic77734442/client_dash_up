@@ -13,6 +13,12 @@ import { useOperationalActions } from "../hooks/useOperationalActions";
 import { useToast } from "../hooks/useToast";
 import { fetchJson, getQuery } from "../lib/api";
 import {
+  normalizeAgencyOverviewPayload,
+  normalizeOverviewPayload,
+} from "../lib/analyticsPayload";
+import { isAppRole } from "../lib/authRedirect";
+import { hasStringFields, normalizeListPayload } from "../lib/listPayload";
+import {
   AdStat,
   AgencyOverview,
   AuthMeResponse,
@@ -28,8 +34,50 @@ import {
 
 const TIMELINE_FUTURE_DAYS = 2;
 
-function fmtMoney(v: number | null | undefined) {
-  return new Intl.NumberFormat("ru-RU", { style: "currency", currency: "KZT", maximumFractionDigits: 0 }).format(v || 0);
+function isClientItem(value: unknown): value is Client {
+  return hasStringFields(value, ["id", "name"]);
+}
+
+function isAdStatItem(value: unknown): value is AdStat {
+  return hasStringFields(value, ["date", "platform"]);
+}
+
+function isInsightItem(value: unknown): value is OperationalInsight {
+  return hasStringFields(value, ["scope", "scope_id", "title", "reason", "action", "priority"]);
+}
+
+function isActionItem(value: unknown): value is OperationalAction {
+  return hasStringFields(value, [
+    "id",
+    "action",
+    "scope",
+    "scope_id",
+    "status",
+    "title",
+    "created_at",
+  ]);
+}
+
+function isBudgetItem(value: unknown): value is Budget {
+  return hasStringFields(value, ["client_id", "scope", "amount", "updated_at"]);
+}
+
+function normalizeCurrency(value: string | null | undefined) {
+  const currency = String(value || "USD").trim().toUpperCase();
+  try {
+    new Intl.NumberFormat("ru-RU", { style: "currency", currency }).format(0);
+    return currency;
+  } catch {
+    return "USD";
+  }
+}
+
+function fmtMoney(v: number | null | undefined, currency = "USD") {
+  return new Intl.NumberFormat("ru-RU", {
+    style: "currency",
+    currency: normalizeCurrency(currency),
+    maximumFractionDigits: 0,
+  }).format(v || 0);
 }
 
 function fmtNum(v: number | null | undefined) {
@@ -59,9 +107,10 @@ function fmtLocalDate(d: Date) {
 function buildPeriodDates(fromIso: string, toIso: string) {
   const from = parseIsoDate(fromIso);
   const to = parseIsoDate(toIso);
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return [];
   const out: string[] = [];
   const cur = new Date(from);
-  while (cur <= to) {
+  while (cur <= to && out.length < 370) {
     out.push(fmtLocalDate(cur));
     cur.setDate(cur.getDate() + 1);
   }
@@ -98,6 +147,52 @@ export default function HomePage() {
   const [agencyOverview, setAgencyOverview] = useState<AgencyOverview | null>(null);
   const [budgets, setBudgets] = useState<Budget[]>([]);
 
+  const currencyByClient = useMemo(() => {
+    const currencies = new Map<string, string>();
+    for (const client of clients) {
+      if (client.default_currency) currencies.set(client.id, normalizeCurrency(client.default_currency));
+    }
+    for (const budget of budgets) {
+      if (!currencies.has(budget.client_id) && budget.currency) {
+        currencies.set(budget.client_id, normalizeCurrency(budget.currency));
+      }
+    }
+    for (const client of clients) {
+      if (!currencies.has(client.id)) currencies.set(client.id, "USD");
+    }
+    return currencies;
+  }, [clients, budgets]);
+
+  const dashboardCurrency = useMemo(() => {
+    if (clientId) return currencyByClient.get(clientId) || "USD";
+    const unique = new Set(currencyByClient.values());
+    return unique.size === 1 ? [...unique][0] : null;
+  }, [clientId, currencyByClient]);
+
+  const fmtDashboardMoney = useCallback(
+    (value: number | null | undefined) =>
+      dashboardCurrency ? fmtMoney(value, dashboardCurrency) : "Разные валюты",
+    [dashboardCurrency]
+  );
+
+  const fmtScopedDashboardMoney = useCallback(
+    (
+      value: number | null | undefined,
+      scope: "account" | "client" | "agency",
+      scopeId: string,
+    ) => {
+      const scopedClientId =
+        scope === "client"
+          ? scopeId
+          : scope === "account"
+            ? overview?.breakdowns?.accounts?.find((row) => row.account_id === scopeId)?.client_id
+            : null;
+      const currency = scopedClientId ? currencyByClient.get(scopedClientId) : dashboardCurrency;
+      return currency ? fmtMoney(value, currency) : "Разные валюты";
+    },
+    [currencyByClient, dashboardCurrency, overview]
+  );
+
   const [warning, setWarning] = useState("");
   const [authResolved, setAuthResolved] = useState(false);
   const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
@@ -118,15 +213,18 @@ export default function HomePage() {
 
   const resolveAuth = useCallback(async () => {
     const me = await req<AuthMeResponse>("/auth/me");
-    const role = (me?.user?.role || "unknown") as "admin" | "agency" | "client" | "unknown";
+    const role = me?.user?.role;
+    if (!isAppRole(role)) {
+      throw new Error("Сессия содержит неизвестную роль. Войдите заново.");
+    }
     setCurrentRole(role);
     setAuthResolved(true);
     return role;
   }, [req]);
 
   const loadClients = useCallback(async () => {
-    const payload = await req<{ items: Client[] }>("/clients?status=active");
-    setClients(payload.items || []);
+    const payload = await req<unknown>("/clients?status=active");
+    setClients(normalizeListPayload(payload, isClientItem, "клиентов"));
   }, [req]);
 
   const buildOverviewQuery = useCallback(() => {
@@ -135,26 +233,39 @@ export default function HomePage() {
 
   const loadOverviewData = useCallback(async () => {
     const query = buildOverviewQuery();
+    const statsQuery = getQuery({
+      date_from: dateFrom,
+      date_to: dateTo,
+      client_id: clientId || undefined,
+      platform: platform === "all" ? undefined : platform,
+    });
     const [ov, stats, ops, acts] = await Promise.all([
-      req<Overview>(`/insights/overview${query}`),
-      req<{ items: AdStat[] }>(`/ad-stats${query}`),
-      req<{ items: OperationalInsight[] }>(`/insights/operational${query}`),
+      req<unknown>(`/insights/overview${query}`),
+      req<unknown>(`/ad-stats${statsQuery}`),
+      req<unknown>(`/insights/operational${query}`),
       listActions({ clientId: clientId || undefined }),
     ]);
-    setOverview(ov);
-    setDailyRows(stats.items || []);
-    setOperationalInsights(ops.items || []);
-    setRecentActions(Array.isArray(acts) ? acts : []);
-  }, [req, buildOverviewQuery, clientId, listActions]);
+    const nextOverview = normalizeOverviewPayload(ov);
+    const nextStats = normalizeListPayload(stats, isAdStatItem, "статистики");
+    const nextInsights = normalizeListPayload(ops, isInsightItem, "рекомендаций");
+    const nextActions = normalizeListPayload(acts, isActionItem, "действий");
+
+    setOverview(nextOverview);
+    setDailyRows(nextStats);
+    setOperationalInsights(nextInsights);
+    setRecentActions(nextActions);
+  }, [req, buildOverviewQuery, clientId, listActions, dateFrom, dateTo, platform]);
 
   const loadClientOpsData = useCallback(async () => {
     const query = getQuery({ date_from: dateFrom, date_to: dateTo });
     const [agency, bgs] = await Promise.all([
-      req<AgencyOverview>(`/agency/overview${query}`),
-      req<{ items: Budget[] }>(`/budgets${getQuery({ status: "active", date_from: dateFrom, date_to: dateTo })}`),
+      req<unknown>(`/agency/overview${query}`),
+      req<unknown>(`/budgets${getQuery({ status: "active", date_from: dateFrom, date_to: dateTo })}`),
     ]);
-    setAgencyOverview(agency);
-    setBudgets(bgs.items || []);
+    const nextAgencyOverview = normalizeAgencyOverviewPayload(agency);
+    const nextBudgets = normalizeListPayload(bgs, isBudgetItem, "бюджетов");
+    setAgencyOverview(nextAgencyOverview);
+    setBudgets(nextBudgets);
   }, [req, dateFrom, dateTo]);
 
   const refresh = useCallback(async () => {
@@ -203,7 +314,7 @@ useEffect(() => {
 
   useEffect(() => {
     if (currentRole === "agency" && !clientId) return;
-    if (!ready || !authResolved || currentRole === "client") return;
+    if (!ready || !authResolved || (currentRole !== "admin" && currentRole !== "agency")) return;
     void refresh();
   }, [ready, authResolved, currentRole, dateFrom, dateTo, clientId, platform, refresh]);
 
@@ -222,17 +333,86 @@ useEffect(() => {
     setPeriodDays(days);
   }, []);
 
+  const effectiveOverview = useMemo<Overview | null>(() => {
+    if (!overview || platform === "all") return overview;
+
+    const rows = dailyRows.filter((row) => row.platform === platform);
+    const spend = rows.reduce((sum, row) => sum + Number(row.spend || 0), 0);
+    const impressions = rows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
+    const clicks = rows.reduce((sum, row) => sum + Number(row.clicks || 0), 0);
+    const conversions = rows.reduce((sum, row) => sum + Number(row.conversions || 0), 0);
+
+    return {
+      ...overview,
+      spend_summary: {
+        spend,
+        impressions,
+        clicks,
+        conversions,
+        ctr: impressions > 0 ? clicks / impressions : 0,
+        cpc: clicks > 0 ? spend / clicks : 0,
+        cpm: impressions > 0 ? (spend * 1000) / impressions : 0,
+      },
+      budget_summary: {
+        ...(overview.budget_summary || {}),
+        budget: null,
+        spend,
+        remaining: null,
+        usage_percent: null,
+        expected_spend_to_date: null,
+        forecast_spend: null,
+        pace_status: "not_applicable",
+        pace_delta: null,
+        pace_delta_percent: null,
+      },
+      breakdowns: {
+        platforms: (overview.breakdowns?.platforms || []).filter((row) => row.platform === platform),
+        accounts: (overview.breakdowns?.accounts || []).filter((row) => row.platform === platform),
+      },
+    };
+  }, [overview, dailyRows, platform]);
+
+  const platformAccountIds = useMemo(
+    () => new Set((effectiveOverview?.breakdowns?.accounts || []).map((row) => row.account_id)),
+    [effectiveOverview]
+  );
+
+  const visibleOperationalInsights = useMemo(
+    () =>
+      platform === "all"
+        ? operationalInsights
+        : operationalInsights.filter(
+            (row) => row.scope === "account" && platformAccountIds.has(row.scope_id)
+          ),
+    [operationalInsights, platform, platformAccountIds]
+  );
+
+  const visibleRecentActions = useMemo(
+    () =>
+      platform === "all"
+        ? recentActions
+        : recentActions.filter((row) => {
+            const accountId = row.account_id || (row.scope === "account" ? row.scope_id : null);
+            return Boolean(accountId && platformAccountIds.has(accountId));
+          }),
+    [recentActions, platform, platformAccountIds]
+  );
+
   const groupedTimeline = useMemo(() => {
-    if (!overview) return [] as TimelinePoint[];
-    const dates = buildPeriodDates(overview.range.date_from, overview.range.date_to);
+    const overviewRange = effectiveOverview?.range;
+    if (!overviewRange?.date_from || !overviewRange.date_to) return [] as TimelinePoint[];
+    const dates = buildPeriodDates(overviewRange.date_from, overviewRange.date_to);
     const map = new Map(dates.map((d) => [d, 0]));
     for (const r of dailyRows) {
       if (platform !== "all" && r.platform !== platform) continue;
       map.set(r.date, Number(map.get(r.date) || 0) + Number(r.spend || 0));
     }
     const points = [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-    const budgetTotal = Number(overview.budget_summary.budget || 0);
-    const expectedTotal = budgetTotal > 0 ? budgetTotal : Number(overview.budget_summary.expected_spend_to_date || 0);
+    const budgetTotal = Number(effectiveOverview?.budget_summary?.budget || 0);
+    const expectedTotal =
+      budgetTotal > 0
+        ? budgetTotal
+        : Number(effectiveOverview?.budget_summary?.expected_spend_to_date || 0);
     const totalPoints = points.length + TIMELINE_FUTURE_DAYS;
     const step = totalPoints ? expectedTotal / totalPoints : 0;
     let run = 0;
@@ -241,7 +421,7 @@ useEffect(() => {
       return { date: k, label: k.slice(5), expected: step * (i + 1), actual: run };
     });
     const tail: TimelinePoint[] = [];
-    const lastDate = parseIsoDate(overview.range.date_to);
+    const lastDate = parseIsoDate(overviewRange.date_to);
     for (let i = 1; i <= TIMELINE_FUTURE_DAYS; i += 1) {
       const d = new Date(lastDate);
       d.setDate(d.getDate() + i);
@@ -249,31 +429,30 @@ useEffect(() => {
       tail.push({ date: iso, label: iso.slice(5), expected: step * (base.length + i), actual: null });
     }
     return [...base, ...tail];
-  }, [overview, dailyRows, platform]);
+  }, [effectiveOverview, dailyRows, platform]);
 
   const timelineActions = useMemo(
     () =>
-      (recentActions || [])
+      (visibleRecentActions || [])
         .map((a) => ({ date: String(a.created_at || "").slice(0, 10), action: a.action, title: a.title }))
         .filter((x) => /^\d{4}-\d{2}-\d{2}$/.test(x.date))
         .slice(0, 16) as TimelineAction[],
-    [recentActions]
+    [visibleRecentActions]
   );
 
   const platformRows = useMemo(
-    () => (overview ? (overview.breakdowns.platforms || []).filter((p) => platform === "all" || p.platform === platform) : []),
-    [overview, platform]
+    () => effectiveOverview?.breakdowns?.platforms || [],
+    [effectiveOverview]
   );
 
   const riskRows = useMemo(
     () =>
-      overview
-        ? [...(overview.breakdowns.accounts || [])]
-            .filter((x) => platform === "all" || x.platform === platform)
+      effectiveOverview
+        ? [...(effectiveOverview.breakdowns?.accounts || [])]
             .sort((a, b) => Number(b.cpc || 0) - Number(a.cpc || 0))
             .slice(0, 8)
         : [],
-    [overview, platform]
+    [effectiveOverview]
   );
 
   const clientOpsRows = useMemo(() => {
@@ -298,6 +477,7 @@ useEffect(() => {
       .map((c) => {
         const spend = Number(spendByClient.get(c.id)?.spend || 0);
         const budget = Number(clientBudgetMap.get(c.id)?.amount || 0);
+        const currency = currencyByClient.get(c.id) || "USD";
         const usage = budget > 0 ? (spend / budget) * 100 : null;
         const pace: ClientOpsRow["pace"] = usage == null ? "no_budget" : usage >= 90 ? "critical" : usage >= 70 ? "warning" : "stable";
         const riskBase = usage == null ? 58 : usage;
@@ -311,6 +491,7 @@ useEffect(() => {
         return {
           id: c.id,
           name: c.name,
+          currency,
           spend,
           budget,
           usage,
@@ -322,7 +503,7 @@ useEffect(() => {
         };
       })
       .sort((a, b) => b.riskScore - a.riskScore);
-  }, [agencyOverview, budgets, recentActions, clients]);
+  }, [agencyOverview, budgets, recentActions, clients, currencyByClient]);
 
   const filteredClientOpsRows = useMemo(() => {
     let rows = [...clientOpsRows];
@@ -370,49 +551,57 @@ useEffect(() => {
 
   const runInsightAction = useCallback(
     async (row: OperationalInsight) => {
-      const payload: Record<string, unknown> = {
-        action: row.action,
-        scope: row.scope,
-        scope_id: row.scope_id,
-        title: row.title,
-        reason: row.reason,
-        metrics: row.metrics || {},
-      };
-      if (row.scope === "account") payload.account_id = row.scope_id;
-      if (row.scope === "client") payload.client_id = row.scope_id;
-      if (overview?.scope?.client_id && !payload.client_id) payload.client_id = overview.scope.client_id;
+      try {
+        const payload: Record<string, unknown> = {
+          action: row.action,
+          scope: row.scope,
+          scope_id: row.scope_id,
+          title: row.title,
+          reason: row.reason,
+          metrics: row.metrics || {},
+        };
+        if (row.scope === "account") payload.account_id = row.scope_id;
+        if (row.scope === "client") payload.client_id = row.scope_id;
+        if (overview?.scope?.client_id && !payload.client_id) payload.client_id = overview.scope.client_id;
 
-      await executeAction({
-        action: row.action,
-        scope: row.scope,
-        scope_id: row.scope_id,
-        title: row.title,
-        reason: row.reason,
-        metrics: (row.metrics || {}) as Record<string, unknown>,
-        client_id: payload.client_id as string | undefined,
-        account_id: payload.account_id as string | undefined,
-      });
-      const acts = await listActions({ clientId: clientId || undefined });
-      setRecentActions(Array.isArray(acts) ? acts : []);
-      push(`Action queued: ${row.action.toUpperCase()} for ${row.scope} ${row.scope_id}`, "success");
+        await executeAction({
+          action: row.action,
+          scope: row.scope,
+          scope_id: row.scope_id,
+          title: row.title,
+          reason: row.reason,
+          metrics: (row.metrics || {}) as Record<string, unknown>,
+          client_id: payload.client_id as string | undefined,
+          account_id: payload.account_id as string | undefined,
+        });
+        const acts = await listActions({ clientId: clientId || undefined });
+        setRecentActions(Array.isArray(acts) ? acts : []);
+        push("Задача добавлена в очередь. Рекламный кабинет автоматически не изменён.", "success");
+      } catch (error) {
+        push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
+      }
     },
     [executeAction, listActions, overview, clientId, push]
   );
 
   const runClientAlertAction = useCallback(
     async (row: ClientOpsRow, action: "cap" | "review") => {
-      await executeAction({
-        action,
-        scope: "client",
-        scope_id: row.id,
-        title: `${action.toUpperCase()} for ${row.name}`,
-        reason: "Triggered from Urgent Alerts panel",
-        metrics: { risk_score: row.riskScore, usage: row.usage },
-        client_id: row.id,
-      });
-      const acts = await listActions({ clientId: clientId || undefined });
-      setRecentActions(Array.isArray(acts) ? acts : []);
-      push(`Action queued: ${action.toUpperCase()} for ${row.name}`, "success");
+      try {
+        await executeAction({
+          action,
+          scope: "client",
+          scope_id: row.id,
+          title: `${action.toUpperCase()} for ${row.name}`,
+          reason: "Создано из блока клиентов, требующих внимания.",
+          metrics: { risk_score: row.riskScore, usage: row.usage },
+          client_id: row.id,
+        });
+        const acts = await listActions({ clientId: clientId || undefined });
+        setRecentActions(Array.isArray(acts) ? acts : []);
+        push(`Задача для ${row.name} добавлена в очередь`, "success");
+      } catch (error) {
+        push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
+      }
     },
     [executeAction, listActions, clientId, push]
   );
@@ -425,19 +614,23 @@ useEffect(() => {
           : label.toLocaleLowerCase("ru").includes("огранич")
           ? "cap"
           : "review";
-      await executeAction({
-        action,
-        scope: "account",
-        scope_id: accountId,
-        title: label,
-        reason: "Действие создано из центра эффективности после проверки показателей аккаунта.",
-        metrics: {},
-        client_id: clientId || undefined,
-        account_id: accountId,
-      });
-      const acts = await listActions({ clientId: clientId || undefined });
-      setRecentActions(Array.isArray(acts) ? acts : []);
-      push(`Действие «${label}» добавлено в работу`, "success");
+      try {
+        await executeAction({
+          action,
+          scope: "account",
+          scope_id: accountId,
+          title: label,
+          reason: "Задача создана из центра эффективности после проверки показателей аккаунта.",
+          metrics: {},
+          client_id: clientId || undefined,
+          account_id: accountId,
+        });
+        const acts = await listActions({ clientId: clientId || undefined });
+        setRecentActions(Array.isArray(acts) ? acts : []);
+        push("Задача добавлена в очередь. Изменение ещё не применено к рекламной платформе.", "success");
+      } catch (error) {
+        push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
+      }
     },
     [clientId, executeAction, listActions, push]
   );
@@ -543,19 +736,25 @@ useEffect(() => {
           </section>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
+          {!dashboardCurrency && view === "dashboard" ? (
+            <div className="warning">
+              В выборке несколько валют. Выберите одного клиента, чтобы денежные KPI и темп бюджета были сопоставимы.
+            </div>
+          ) : null}
 
           {view === "dashboard" ? (
             <DashboardView
-              overview={overview}
+              overview={effectiveOverview}
               platform={platform}
               platformRows={platformRows}
               riskRows={riskRows}
               periodDays={periodDays}
               groupedTimeline={groupedTimeline}
               timelineActions={timelineActions}
-              operationalInsights={operationalInsights}
-              recentActions={recentActions}
-              fmtMoney={fmtMoney}
+              operationalInsights={visibleOperationalInsights}
+              recentActions={visibleRecentActions}
+              fmtMoney={fmtDashboardMoney}
+              fmtScopedMoney={fmtScopedDashboardMoney}
               fmtNum={fmtNum}
               paceClass={paceClass}
               onInsightAction={runInsightAction}

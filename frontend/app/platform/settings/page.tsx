@@ -6,15 +6,8 @@ import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
 import { useSession } from "../../../hooks/useSession";
 import { fetchJson } from "../../../lib/api";
-import { IntegrationsOverview } from "../../../lib/types";
-
-type ProviderConfig = {
-  provider: string;
-  enabled?: boolean;
-  client_id_hint?: string | null;
-  redirect_uri?: string | null;
-  updated_at?: string | null;
-};
+import { normalizeProviderConfigs, type ProviderConfig } from "../../../lib/providerConfigs";
+import { type IntegrationsOverview } from "../../../lib/types";
 
 export default function PlatformSettingsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
@@ -31,13 +24,15 @@ export default function PlatformSettingsPage() {
   const loadData = useCallback(async () => {
     try {
       const [providerRows, integrationRows] = await Promise.all([
-        req<ProviderConfig[]>("/auth/provider-configs"),
+        req<unknown>("/auth/provider-configs"),
         req<IntegrationsOverview>("/integrations/overview"),
       ]);
-      setProviders(providerRows || []);
+      setProviders(normalizeProviderConfigs(providerRows));
       setIntegrations(integrationRows);
       setWarning("");
     } catch (error) {
+      setProviders([]);
+      setIntegrations(null);
       setWarning(error instanceof Error ? error.message : "Не удалось загрузить настройки");
     }
   }, [req]);

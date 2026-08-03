@@ -40,7 +40,11 @@ export function resolveApiBase(defaultApiBase: string): string {
   }
   const normalizedDefault = normalizeApiBase(defaultApiBase, DEFAULT_API_BASE);
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
-  if (!tokenLoginEnabled || normalizedDefault.startsWith("/")) {
+  if (!tokenLoginEnabled) {
+    localStorage.removeItem(LS_API_BASE);
+    return DEFAULT_API_BASE;
+  }
+  if (normalizedDefault.startsWith("/")) {
     localStorage.removeItem(LS_API_BASE);
     return normalizedDefault;
   }

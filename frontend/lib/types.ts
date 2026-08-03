@@ -1,4 +1,8 @@
-export type Client = { id: string; name: string };
+export type Client = {
+  id: string;
+  name: string;
+  default_currency?: string;
+};
 export type ClientOut = {
   id: string;
   name: string;
@@ -387,6 +391,7 @@ export type AgencyOverview = {
 export type ClientOpsRow = {
   id: string;
   name: string;
+  currency: string;
   spend: number;
   budget: number;
   usage: number | null;

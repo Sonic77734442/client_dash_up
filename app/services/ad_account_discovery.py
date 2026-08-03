@@ -149,6 +149,7 @@ class AdAccountDiscoveryService:
         client_id: UUID,
         user_id: Optional[UUID] = None,
         upsert_existing: bool = True,
+        expected_currency: Optional[str] = None,
     ) -> DiscoveryResult:
         provider_filter = _normalize_provider(provider)
         if provider_filter == "all":
@@ -175,6 +176,8 @@ class AdAccountDiscoveryService:
         items: List[AdAccountOut] = []
         providers_failed: Dict[str, str] = {}
         provider_conflicts: Dict[str, int] = {}
+        provider_currency_mismatches: Dict[str, int] = {}
+        normalized_expected_currency = str(expected_currency or "").strip().upper()
 
         for p in providers:
             discoverer = self.discoverers.get(p)
@@ -223,6 +226,10 @@ class AdAccountDiscoveryService:
                     discovered += 1
                     name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
                     currency = str(row.get("currency") or "USD").strip().upper() or "USD"
+                    if normalized_expected_currency and currency != normalized_expected_currency:
+                        skipped += 1
+                        provider_currency_mismatches[p] = provider_currency_mismatches.get(p, 0) + 1
+                        continue
                     key = (str(client_id), p, external_account_id)
                     existing_account = existing.get(key)
                     discovery_meta = {
@@ -331,6 +338,10 @@ class AdAccountDiscoveryService:
 
         for p, count in provider_conflicts.items():
             providers_failed[p] = f"conflict_skipped:{count}"
+        for p, count in provider_currency_mismatches.items():
+            existing_reason = providers_failed.get(p)
+            mismatch_reason = f"currency_mismatch_skipped:{count}"
+            providers_failed[p] = f"{existing_reason};{mismatch_reason}" if existing_reason else mismatch_reason
 
         return DiscoveryResult(
             requested_provider=provider_filter,

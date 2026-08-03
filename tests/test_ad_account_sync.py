@@ -113,6 +113,11 @@ def test_sync_jobs_list_filters_by_account_id():
 
 def test_sync_run_empty_selection_processes_zero():
     reset_state()
+    c = mk_client("Empty selection")
+    mk_account(c["id"], "meta", "must-not-sync")
+    app.state.ad_account_sync_service.provider_fetchers = {
+        "meta": lambda external, date_from, date_to: [{"id": external}],
+    }
     run = client.post("/ad-accounts/sync/run", json={"account_ids": []})
     assert run.status_code == 200
     body = run.json()

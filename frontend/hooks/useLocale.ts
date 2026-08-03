@@ -7,11 +7,11 @@ const LS_LOCALE = "ops_locale";
 const LOCALE_UPDATED_EVENT = "ops-locale-updated";
 
 function normalizeLocale(value: string | null | undefined): Locale {
-  return value === "ru" ? "ru" : "en";
+  return value === "en" ? "en" : "ru";
 }
 
 export function useLocale() {
-  const [locale, setLocaleState] = useState<Locale>("en");
+  const [locale, setLocaleState] = useState<Locale>("ru");
 
   useEffect(() => {
     const saved = normalizeLocale(localStorage.getItem(LS_LOCALE));

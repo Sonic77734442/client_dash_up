@@ -3,7 +3,14 @@ from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _normalize_currency_code(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if len(normalized) != 3 or not normalized.isascii() or not normalized.isalpha():
+        raise ValueError("currency must be a three-letter ISO-style code")
+    return normalized
 
 
 class AccountConfig(BaseModel):
@@ -61,6 +68,11 @@ class BudgetBase(BaseModel):
             raise ValueError("scope='account' requires account_id")
         return self
 
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return _normalize_currency_code(value)
+
 
 class BudgetCreate(BudgetBase):
     pass
@@ -81,6 +93,11 @@ class BudgetPatch(BaseModel):
     note: Optional[str] = None
     status: Optional[Literal["active", "archived"]] = None
     changed_by: Optional[UUID] = Field(None, description="Actor id for audit history row.")
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_currency_code(value) if value is not None else None
 
 
 class BudgetOut(BaseModel):
@@ -141,6 +158,11 @@ class ClientCreate(BaseModel):
     timezone: Optional[str] = None
     notes: Optional[str] = None
 
+    @field_validator("default_currency")
+    @classmethod
+    def normalize_default_currency(cls, value: str) -> str:
+        return _normalize_currency_code(value)
+
 
 class ClientPatch(BaseModel):
     name: Optional[str] = Field(None, min_length=1)
@@ -149,6 +171,11 @@ class ClientPatch(BaseModel):
     default_currency: Optional[str] = None
     timezone: Optional[str] = None
     notes: Optional[str] = None
+
+    @field_validator("default_currency")
+    @classmethod
+    def normalize_default_currency(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_currency_code(value) if value is not None else None
 
 
 class ClientOut(BaseModel):
@@ -173,6 +200,11 @@ class AdAccountCreate(BaseModel):
     status: Literal["active", "inactive", "archived"] = "active"
     metadata: Optional[Dict[str, Any]] = None
 
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: str) -> str:
+        return _normalize_currency_code(value)
+
 
 class AdAccountPatch(BaseModel):
     client_id: Optional[UUID] = None
@@ -183,6 +215,11 @@ class AdAccountPatch(BaseModel):
     timezone: Optional[str] = None
     status: Optional[Literal["active", "inactive", "archived"]] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_currency(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_currency_code(value) if value is not None else None
 
 
 class AdAccountOut(BaseModel):
@@ -338,11 +375,19 @@ class IntegrationsOverviewResponse(BaseModel):
 class AdStatWrite(BaseModel):
     ad_account_id: UUID
     date: date
-    platform: str
-    impressions: int = 0
-    clicks: int = 0
-    spend: Decimal = Field(..., decimal_places=2, max_digits=14)
-    conversions: Optional[Decimal] = Field(None, decimal_places=2, max_digits=14)
+    platform: str = Field(..., min_length=1)
+    impressions: int = Field(default=0, ge=0)
+    clicks: int = Field(default=0, ge=0)
+    spend: Decimal = Field(..., ge=0, decimal_places=2, max_digits=14)
+    conversions: Optional[Decimal] = Field(None, ge=0, decimal_places=2, max_digits=14)
+
+    @field_validator("platform")
+    @classmethod
+    def normalize_platform(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("platform must not be empty")
+        return normalized
 
 
 class AdStatsIngestRequest(BaseModel):

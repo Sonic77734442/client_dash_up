@@ -15,13 +15,21 @@ type DashboardViewProps = {
   operationalInsights: OperationalInsight[];
   recentActions: OperationalAction[];
   fmtMoney: (v: number | null | undefined) => string;
+  fmtScopedMoney: (
+    v: number | null | undefined,
+    scope: "account" | "client" | "agency",
+    scopeId: string,
+  ) => string;
   fmtNum: (v: number | null | undefined) => string;
   paceClass: (status: string) => string;
   onInsightAction: (row: OperationalInsight) => Promise<void>;
   onRiskActionDraft: (accountId: string, label: string) => Promise<void>;
 };
 
-function insightCopy(row: OperationalInsight | null) {
+function insightCopy(
+  row: OperationalInsight | null,
+  fmtMoney: (v: number | null | undefined) => string,
+) {
   if (!row) {
     return {
       title: "Показатели стабильны",
@@ -41,13 +49,13 @@ function insightCopy(row: OperationalInsight | null) {
   if (row.action === "cap") {
     return {
       title: `Ограничить расход${platform ? ` в ${platform}` : ""}`,
-      reason: `Стоимость клика ${metric("cpc").toFixed(2)} KZT выше обычного уровня, при этом аккаунт формирует ${(metric("spend_share") * 100).toFixed(1)}% расхода.`,
+      reason: `Стоимость клика ${fmtMoney(metric("cpc"))} выше обычного уровня, при этом аккаунт формирует ${(metric("spend_share") * 100).toFixed(1)}% расхода.`,
     };
   }
   if (row.action === "scale") {
     return {
       title: `Рассмотреть масштабирование${platform ? ` в ${platform}` : ""}`,
-      reason: `CTR ${(metric("ctr") * 100).toFixed(2)}% выше среднего, а стоимость клика ${metric("cpc").toFixed(2)} KZT остаётся эффективной.`,
+      reason: `CTR ${(metric("ctr") * 100).toFixed(2)}% выше среднего, а стоимость клика ${fmtMoney(metric("cpc"))} остаётся эффективной.`,
     };
   }
   if (row.metrics?.pace_delta_percent != null) {
@@ -76,6 +84,7 @@ export function DashboardView({
   operationalInsights,
   recentActions,
   fmtMoney,
+  fmtScopedMoney,
   fmtNum,
   paceClass,
   onInsightAction,
@@ -86,7 +95,12 @@ export function DashboardView({
   const cpl = conversions > 0 ? spend / conversions : null;
   const attentionCount = operationalInsights.filter((row) => row.priority === "high" || row.priority === "medium").length;
   const leadInsight = operationalInsights[0] || null;
-  const leadCopy = insightCopy(leadInsight);
+  const leadCopy = insightCopy(
+    leadInsight,
+    (value) => leadInsight
+      ? fmtScopedMoney(value, leadInsight.scope, leadInsight.scope_id)
+      : fmtMoney(value),
+  );
   const contributionTotal = platformRows.reduce((sum, row) => sum + Number(row.spend || 0), 0) || 1;
 
   return (
@@ -95,7 +109,11 @@ export function DashboardView({
         <article className="kpi-card">
           <div className="kpi-title">Расход за период</div>
           <div className="kpi-value">{fmtMoney(spend)}</div>
-          <div className="kpi-meta">Бюджет: {overview?.budget_summary?.budget == null ? "не задан" : fmtMoney(overview.budget_summary.budget)}</div>
+          <div className="kpi-meta">
+            {platform === "all"
+              ? `Бюджет: ${overview?.budget_summary?.budget == null ? "не задан" : fmtMoney(overview.budget_summary.budget)}`
+              : "Без сравнения с общим бюджетом клиента"}
+          </div>
         </article>
         <article className="kpi-card">
           <div className="kpi-title">Конверсии</div>
@@ -117,7 +135,11 @@ export function DashboardView({
       <section className="mid-grid blueprint-main-grid">
         <article className="panel">
           <h3>Динамика расходов</h3>
-          <div className="panel-subtitle">Фактический расход относительно ожидаемой траектории</div>
+          <div className="panel-subtitle">
+            {platform === "all"
+              ? "Фактический расход относительно ожидаемой траектории"
+              : `Расход в ${platform.toUpperCase()} без сравнения с общим бюджетом клиента`}
+          </div>
           <div className="chart">
             <TimelineChart
               points={groupedTimeline}
@@ -182,7 +204,11 @@ export function DashboardView({
             </thead>
             <tbody>
               {riskRows.map((r) => {
-                const rec = r.cpc > 3 ? { label: "Ограничить −10%", cls: "cap" } : r.ctr < 0.03 ? { label: "Проверить", cls: "pause" } : { label: "Масштабировать +10%", cls: "scale" };
+                const rec = r.cpc > 3
+                  ? { label: "Создать задачу: ограничить −10%", cls: "cap" }
+                  : r.ctr < 0.03
+                    ? { label: "Создать задачу: проверить", cls: "pause" }
+                    : { label: "Создать задачу: масштабировать +10%", cls: "scale" };
                 const paceLabel = r.cpc > 3 ? "Высокая стоимость" : r.ctr < 0.03 ? "Низкий CTR" : "Можно масштабировать";
                 const status = r.cpc > 3 ? "overspending" : r.ctr < 0.03 ? "underspending" : "on_track";
                 return (
@@ -191,7 +217,7 @@ export function DashboardView({
                       <strong>{r.name || r.account_id.slice(0, 8)}</strong>
                     </td>
                     <td>{r.platform.toUpperCase()}</td>
-                    <td>{fmtMoney(Number(r.spend || 0) / Math.max(1, periodDays))}</td>
+                    <td>{fmtScopedMoney(Number(r.spend || 0) / Math.max(1, periodDays), "account", r.account_id)}</td>
                     <td>
                       <span className={`badge ${paceClass(status)}`}>
                         {paceLabel}
@@ -251,7 +277,10 @@ export function DashboardView({
           <StateMessage title="Рекомендаций пока нет" message="Выберите другой период или дождитесь новых данных." />
         ) : (
           operationalInsights.slice(0, 5).map((row) => {
-            const copy = insightCopy(row);
+            const copy = insightCopy(
+              row,
+              (value) => fmtScopedMoney(value, row.scope, row.scope_id),
+            );
             const priorityLabel = row.priority === "high" ? "Высокий" : row.priority === "medium" ? "Средний" : "Наблюдение";
             return (
               <div key={`${row.action}-${row.scope_id}`} className={`insight-card ${row.priority === "high" ? "bad" : ""}`}>

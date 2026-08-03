@@ -131,8 +131,10 @@ test("client portal isolates data between two client tenants", async ({ browser,
   await c1Page.goto("/portal");
   await expect(c1Page.getByText(c1AccountName)).toBeVisible();
   await expect(c1Page.getByText(c2AccountName)).toHaveCount(0);
-  await expect(c1Page.getByText("$1,111")).toBeVisible();
-  await expect(c1Page.getByText("$2,222")).toHaveCount(0);
+  await c1Page.goto("/portal/billing");
+  const c1BudgetRow = c1Page.getByRole("row").filter({ hasText: c1AccountName });
+  await expect(c1BudgetRow).toContainText(/1[\s\u00a0]111\s*\$/);
+  await expect(c1Page.getByRole("row").filter({ hasText: c2AccountName })).toHaveCount(0);
 
   const c2Context = await browser.newContext();
   const c2Page = await c2Context.newPage();
@@ -140,8 +142,10 @@ test("client portal isolates data between two client tenants", async ({ browser,
   await c2Page.goto("/portal");
   await expect(c2Page.getByText(c2AccountName)).toBeVisible();
   await expect(c2Page.getByText(c1AccountName)).toHaveCount(0);
-  await expect(c2Page.getByText("$2,222")).toBeVisible();
-  await expect(c2Page.getByText("$1,111")).toHaveCount(0);
+  await c2Page.goto("/portal/billing");
+  const c2BudgetRow = c2Page.getByRole("row").filter({ hasText: c2AccountName });
+  await expect(c2BudgetRow).toContainText(/2[\s\u00a0]222\s*\$/);
+  await expect(c2Page.getByRole("row").filter({ hasText: c1AccountName })).toHaveCount(0);
 
   await c1Context.close();
   await c2Context.close();

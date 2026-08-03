@@ -7,6 +7,12 @@ import { AppTopTabs } from "../../components/AppTopTabs";
 import { StateMessage } from "../../components/common/StateMessage";
 import { useSession } from "../../hooks/useSession";
 import { fetchJson } from "../../lib/api";
+import { normalizeIntegrationsOverviewPayload } from "../../lib/analyticsPayload";
+import {
+  hasOptionalStringFields,
+  hasStringFields,
+  normalizeListPayload,
+} from "../../lib/listPayload";
 import {
   AgencyOut,
   AlertOut,
@@ -14,6 +20,25 @@ import {
   ClientOut,
   IntegrationsOverview,
 } from "../../lib/types";
+
+function isAuthUserItem(value: unknown): value is AuthUser {
+  return (
+    hasStringFields(value, ["id", "name", "role", "status"]) &&
+    hasOptionalStringFields(value, ["email"])
+  );
+}
+
+function isAgencyItem(value: unknown): value is AgencyOut {
+  return hasStringFields(value, ["id", "name", "status"]);
+}
+
+function isClientItem(value: unknown): value is ClientOut {
+  return hasStringFields(value, ["id", "name"]);
+}
+
+function isAlertItem(value: unknown): value is AlertOut {
+  return hasStringFields(value, ["id", "code", "severity", "title"]);
+}
 
 export default function PlatformDecisionCenterPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
@@ -35,17 +60,23 @@ export default function PlatformDecisionCenterPage() {
     setLoading(true);
     try {
       const [userRows, agencyRows, clientRows, alertRows, integrationRows] = await Promise.all([
-        req<{ items: AuthUser[] }>("/auth/internal/users"),
-        req<{ items: AgencyOut[] }>("/platform/agencies?status=all"),
-        req<{ items: ClientOut[] }>("/clients?status=all"),
-        req<AlertOut[]>("/alerts?status=open&limit=100"),
-        req<IntegrationsOverview>("/integrations/overview"),
+        req<unknown>("/auth/internal/users"),
+        req<unknown>("/platform/agencies?status=all"),
+        req<unknown>("/clients?status=all"),
+        req<unknown>("/alerts?status=open&limit=100"),
+        req<unknown>("/integrations/overview"),
       ]);
-      setUsers(userRows.items || []);
-      setAgencies(agencyRows.items || []);
-      setClients(clientRows.items || []);
-      setAlerts(alertRows || []);
-      setIntegrations(integrationRows);
+      const nextUsers = normalizeListPayload(userRows, isAuthUserItem, "пользователей");
+      const nextAgencies = normalizeListPayload(agencyRows, isAgencyItem, "агентств");
+      const nextClients = normalizeListPayload(clientRows, isClientItem, "клиентов");
+      const nextAlerts = normalizeListPayload(alertRows, isAlertItem, "инцидентов");
+      const nextIntegrations = normalizeIntegrationsOverviewPayload(integrationRows);
+
+      setUsers(nextUsers);
+      setAgencies(nextAgencies);
+      setClients(nextClients);
+      setAlerts(nextAlerts);
+      setIntegrations(nextIntegrations);
       setWarning("");
     } catch (error) {
       setWarning(error instanceof Error ? error.message : "Не удалось загрузить центр решений");
@@ -203,7 +234,7 @@ export default function PlatformDecisionCenterPage() {
                 <div className="activity-title">Подключения</div>
                 <div className="activity-meta">
                   {integrations
-                    ? `${integrations.summary.healthy_connections} работают · ${connectionProblems} требуют внимания`
+                    ? `${Number(integrations.summary?.healthy_connections || 0)} работают · ${connectionProblems} требуют внимания`
                     : "Загрузка…"}
                 </div>
                 <Link className="ghost-btn activity-action" href="/integrations">Открыть подключения</Link>

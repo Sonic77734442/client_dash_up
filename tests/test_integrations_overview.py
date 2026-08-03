@@ -81,8 +81,15 @@ def test_integrations_overview_returns_provider_health_and_sanitized_events():
         assert "message" in evt
 
 
-def test_integrations_overview_accounts_for_google_identity_link():
+def test_integrations_overview_requires_real_google_credentials_not_only_an_identity_link(monkeypatch):
     reset_state()
+    for key in (
+        "GOOGLE_ADS_DEVELOPER_TOKEN",
+        "GOOGLE_ADS_CLIENT_ID",
+        "GOOGLE_ADS_CLIENT_SECRET",
+        "GOOGLE_ADS_REFRESH_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
     c = mk_client("Identity Tenant")
     _ = mk_account(c["id"], "google", "g-identity-1")
 
@@ -121,4 +128,51 @@ def test_integrations_overview_accounts_for_google_identity_link():
     google = providers["google"]
     assert google["identity_linked_users"] >= 1
     assert "identity_link" in google["connection_sources"]
+    assert google["sync_ready"] is False
+
+    stored = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "global",
+            "connection_key": "google:test",
+            "credentials": {
+                "client_id": "g-client",
+                "client_secret": "g-secret",
+                "refresh_token": "g-refresh",
+                "developer_token": "g-developer",
+            },
+        },
+    )
+    assert stored.status_code == 200
+
+    with_credentials = client.get("/integrations/overview")
+    assert with_credentials.status_code == 200
+    google = {p["provider"]: p for p in with_credentials.json()["providers"]}["google"]
     assert google["sync_ready"] is True
+    assert "stored_credentials" in google["connection_sources"]
+
+
+def test_integrations_overview_is_not_available_to_client_role():
+    reset_state()
+    tenant = mk_client("Read-only client")
+    user = client.post(
+        "/auth/internal/users",
+        json={"email": "client-integrations@test.local", "name": "Client", "role": "client", "status": "active"},
+    ).json()
+    access = client.post(
+        "/auth/internal/access",
+        json={"user_id": user["id"], "client_id": tenant["id"], "role": "client"},
+    )
+    assert access.status_code == 200
+    token = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": user["id"], "ttl_minutes": 60},
+    ).json()["token"]
+
+    denied = client.get(
+        "/integrations/overview",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "forbidden"

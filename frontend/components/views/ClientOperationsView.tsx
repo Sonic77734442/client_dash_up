@@ -60,7 +60,7 @@ type ClientOperationsViewProps = {
   setPage: (v: number | ((p: number) => number)) => void;
   onOpenClient: (clientId: string) => void;
   onAlertAction: (row: ClientOpsRow, action: "cap" | "review") => Promise<void>;
-  fmtMoney: (v: number | null | undefined) => string;
+  fmtMoney: (v: number | null | undefined, currency?: string) => string;
 };
 
 export function ClientOperationsView({
@@ -87,19 +87,26 @@ export function ClientOperationsView({
   onAlertAction,
   fmtMoney,
 }: ClientOperationsViewProps) {
-  const rows = filteredClientOpsRows.length ? filteredClientOpsRows : clientOpsRows;
+  const rows = filteredClientOpsRows;
   const activeClients = rows.length;
   const totalSpend = rows.reduce((s, x) => s + Number(x.spend || 0), 0);
   const atRisk = rows.filter((x) => x.riskScore >= 70).length;
   const usageRows = rows.filter((x) => x.usage != null);
   const paceDelta = usageRows.reduce((s, x) => s + (Number(x.usage || 0) - 80), 0) / Math.max(1, usageRows.length);
+  const rowCurrencies = new Set(rows.map((row) => row.currency));
+  const totalSpendValue =
+    rowCurrencies.size === 1
+      ? fmtMoney(totalSpend, [...rowCurrencies][0])
+      : rowCurrencies.size > 1
+      ? "Разные валюты"
+      : fmtMoney(0, "USD");
 
   return (
     <>
       <section className="clientops-kpi-row">
         {[
           { label: "Клиенты в выборке", value: String(activeClients), note: "текущий срез портфеля" },
-          { label: "Общий расход", value: fmtMoney(totalSpend), note: "по выбранным клиентам" },
+          { label: "Общий расход", value: totalSpendValue, note: "по выбранным клиентам" },
           { label: "Требуют внимания", value: String(atRisk), note: "риск 70 и выше" },
           {
             label: "Отклонение темпа",
@@ -200,8 +207,8 @@ export function ClientOperationsView({
                         <div className="client-id">Код: {r.id.slice(0, 8)}</div>
                       </div>
                     </td>
-                    <td>{fmtMoney(r.spend)}</td>
-                    <td>{r.budget ? fmtMoney(r.budget) : "—"}</td>
+                    <td>{fmtMoney(r.spend, r.currency)}</td>
+                    <td>{r.budget ? fmtMoney(r.budget, r.currency) : "—"}</td>
                     <td>
                       <div className={`usage-bar ${usageTone}`}><div style={{ width: `${usage == null ? 0 : Math.min(100, usage)}%` }}></div></div>
                       {usage == null ? "—" : `${usage.toFixed(1)}%`}
@@ -247,10 +254,10 @@ export function ClientOperationsView({
                 <div key={r.id} className={`alert-card ${highPriority ? "high" : ""}`}>
                   <div className={`alert-priority ${highPriority ? "high" : ""}`}>{highPriority ? "Высокий приоритет" : "Средний приоритет"}</div>
                   <div className="insight-title" style={{ marginTop: 8 }}>{r.name}: нужна проверка</div>
-                  <div className="insight-text">Расход {fmtMoney(r.spend)} · бюджет {r.budget ? fmtMoney(r.budget) : "не задан"}.</div>
+                  <div className="insight-text">Расход {fmtMoney(r.spend, r.currency)} · бюджет {r.budget ? fmtMoney(r.budget, r.currency) : "не задан"}.</div>
                   <div className="alert-actions">
-                    <button className="mini-btn" onClick={() => void onAlertAction(r, "cap")}>Ограничить</button>
-                    <button className="mini-btn" onClick={() => void onAlertAction(r, "review")}>Проверить</button>
+                    <button className="mini-btn" onClick={() => void onAlertAction(r, "cap")}>Создать задачу: ограничить</button>
+                    <button className="mini-btn" onClick={() => void onAlertAction(r, "review")}>Создать задачу: проверить</button>
                     <button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>Открыть</button>
                   </div>
                 </div>

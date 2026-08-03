@@ -23,6 +23,7 @@ class OAuthProviderConfig:
     client_secret: str
     redirect_uri: str
     enabled: bool
+    intent: str = "login"
 
 
 @dataclass
@@ -141,12 +142,16 @@ class FacebookOAuthAdapter:
     provider = "facebook"
 
     def build_authorize_url(self, cfg: OAuthProviderConfig, state: str) -> str:
+        connect_intent = cfg.intent == "connect"
         params = {
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "state": state,
-            # Include ads scopes for integration-connect flow.
-            "scope": "public_profile,ads_read,business_management",
+            "scope": (
+                "public_profile,email,ads_read,business_management"
+                if connect_intent
+                else "public_profile,email"
+            ),
             "response_type": "code",
         }
         return f"https://www.facebook.com/v19.0/dialog/oauth?{urlencode(params)}"
@@ -200,17 +205,22 @@ class GoogleOAuthAdapter:
     provider = "google"
 
     def build_authorize_url(self, cfg: OAuthProviderConfig, state: str) -> str:
+        connect_intent = cfg.intent == "connect"
         params = {
             "client_id": cfg.client_id,
             "redirect_uri": cfg.redirect_uri,
             "response_type": "code",
-            # Include adwords scope so callback token can be used for Google Ads discovery/sync.
-            "scope": "openid email profile https://www.googleapis.com/auth/adwords",
+            "scope": (
+                "openid email profile https://www.googleapis.com/auth/adwords"
+                if connect_intent
+                else "openid email profile"
+            ),
             "state": state,
-            "access_type": "offline",
-            "prompt": "consent",
-            "include_granted_scopes": "true",
+            "prompt": "consent" if connect_intent else "select_account",
         }
+        if connect_intent:
+            params["access_type"] = "offline"
+            params["include_granted_scopes"] = "true"
         return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
     def fetch_identity(self, cfg: OAuthProviderConfig, code: str) -> ExternalIdentityPayload:

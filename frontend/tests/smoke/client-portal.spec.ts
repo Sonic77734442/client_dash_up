@@ -6,11 +6,11 @@ test("client portal shell is read-only", async ({ page, context, request }) => {
   await attachSession(page, context, token);
   await page.goto("/portal");
 
-  await expect(page.getByText("Client Overview")).toBeVisible();
-  await expect(page.getByText("Client Portal")).toBeVisible();
+  await expect(page.locator(".topbar-title")).toHaveText("Результаты рекламы");
+  await expect(page.getByText(/клиентский кабинет/i).first()).toBeVisible();
 
-  await expect(page.getByText("Integrations")).toHaveCount(0);
-  await expect(page.getByText("Sync Monitor")).toHaveCount(0);
-  await expect(page.getByText("Create Budget")).toHaveCount(0);
-  await expect(page.getByText("Reconnect")).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Источники рекламы" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Синхронизация" })).toHaveCount(0);
+  await expect(page.getByText("Создать бюджет", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Переподключить", { exact: true })).toHaveCount(0);
 });

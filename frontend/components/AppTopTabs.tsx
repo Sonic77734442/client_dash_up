@@ -25,7 +25,7 @@ const SEARCH_ITEMS = {
     { label: "Агентства", href: "/platform/agencies", hint: "Управление" },
     { label: "Клиенты", href: "/clients", hint: "Управление" },
     { label: "Карта доступов", href: "/platform/access", hint: "Безопасность" },
-    { label: "Подключения", href: "/integrations", hint: "Данные" },
+    { label: "Источники рекламы", href: "/integrations", hint: "Подключения, аккаунты и синхронизация" },
     { label: "Журнал действий", href: "/platform/audit", hint: "Аудит" },
   ],
   agency: [
@@ -33,9 +33,8 @@ const SEARCH_ITEMS = {
     { label: "Клиенты", href: "/clients", hint: "Портфель" },
     { label: "Отклонения", href: "/agency/actions", hint: "Действия" },
     { label: "Отчёты", href: "/agency/reports", hint: "Результаты" },
-    { label: "Рекламные аккаунты", href: "/accounts", hint: "Данные" },
     { label: "Лиды", href: "/traffic", hint: "Данные" },
-    { label: "Подключения", href: "/integrations", hint: "Данные" },
+    { label: "Источники рекламы", href: "/integrations", hint: "Подключения, аккаунты и синхронизация" },
     { label: "Команда", href: "/agency/team", hint: "Доступы" },
   ],
   client: [
@@ -76,7 +75,7 @@ export function AppTopTabs({
     dashboard: t(locale, "tab_dashboard", "Центр эффективности"),
     accounts: t(locale, "tab_accounts", "Рекламные аккаунты"),
     traffic: t(locale, "tab_traffic", "Лиды и трафик"),
-    integrations: t(locale, "tab_integrations", "Подключения"),
+    integrations: t(locale, "tab_integrations", "Источники рекламы"),
     sync_monitor: t(locale, "tab_sync_monitor", "Синхронизация"),
     budgets: t(locale, "tab_budgets", "Бюджеты"),
     clients: t(locale, "tab_clients", "Клиенты"),
@@ -133,8 +132,8 @@ export function AppTopTabs({
           className="locale-switch"
           value={locale}
           onChange={(e) => setLocale(e.target.value as Locale)}
-          aria-label="Language"
-          title="Language"
+          aria-label="Язык"
+          title="Язык"
         >
           <option value="en">EN</option>
           <option value="ru">RU</option>

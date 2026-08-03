@@ -71,18 +71,21 @@ test("client portal shows agency-assigned accounts, budgets and report data", as
   await attachSession(page, context, clientToken);
 
   await page.goto("/portal");
-  await expect(page.getByText("Client Overview")).toBeVisible();
+  await expect(page.locator(".topbar-title")).toHaveText("Результаты рекламы");
   await expect(page.getByText(accountName)).toBeVisible();
-  await expect(page.getByText("$1,200")).toBeVisible();
+  await expect(page.getByText(/245\s*\$/).first()).toBeVisible();
 
   await page.goto("/portal/reports");
-  await expect(page.getByText("Client Reports")).toBeVisible();
-  await expect(page.getByText("Account Performance")).toBeVisible();
-  await expect(page.getByText(accountName)).toBeVisible();
-  await expect(page.getByText("$245").first()).toBeVisible({ timeout: 10000 });
+  await expect(page.locator(".topbar-title")).toHaveText("Отчёты");
+  await expect(page.getByRole("heading", { name: "Результаты по рекламным аккаунтам" })).toBeVisible();
+  const reportRow = page.getByRole("row").filter({ hasText: accountName });
+  await expect(reportRow).toBeVisible();
+  await expect(reportRow).toContainText(/245\s*\$/);
 
   await page.goto("/portal/billing");
-  await expect(page.getByText("Client Billing")).toBeVisible();
-  await expect(page.getByText("Billing Scope")).toBeVisible();
-  await expect(page.getByText("$1,200")).toBeVisible();
+  await expect(page.locator(".topbar-title")).toHaveText("Бюджет");
+  await expect(page.getByRole("heading", { name: "Бюджетные лимиты" })).toBeVisible();
+  const budgetRow = page.getByRole("row").filter({ hasText: accountName });
+  await expect(budgetRow).toBeVisible();
+  await expect(budgetRow).toContainText(/1[\s\u00a0]200\s*\$/);
 });

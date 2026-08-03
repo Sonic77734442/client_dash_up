@@ -42,14 +42,13 @@ export async function attachSession(page: Page, context: BrowserContext, token: 
     {
       name: "ops_session",
       value: token,
-      domain: "127.0.0.1",
-      path: "/",
+      url: "http://localhost:5173",
       httpOnly: true,
     },
   ]);
-  await page.addInitScript((apiBase: string) => {
-    localStorage.setItem("ops_api_base", apiBase);
-  }, API_BASE);
+  await page.addInitScript(() => {
+    localStorage.setItem("ops_api_base", "/api/backend");
+  });
 }
 
 export async function createAdminSession(request: APIRequestContext) {

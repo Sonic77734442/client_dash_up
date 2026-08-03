@@ -7,7 +7,7 @@ import { ToastHost } from "../../components/ToastHost";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import { AdAccount, AdStat } from "../../lib/types";
+import { AdAccount, AdStat, Client } from "../../lib/types";
 
 function normalizePlatform(value?: string | null) {
   const raw = String(value || "").trim().toLowerCase();
@@ -28,9 +28,10 @@ function fmtNum(v?: number | string | null, digits = 0) {
 
 function fmtMoney(v?: number | string | null, currency = "USD") {
   const n = Number(v || 0);
+  const normalizedCurrency = /^[A-Z]{3}$/.test(currency.toUpperCase()) ? currency.toUpperCase() : "USD";
   return new Intl.NumberFormat("en-US", {
     style: "currency",
-    currency,
+    currency: normalizedCurrency,
     maximumFractionDigits: 2,
   }).format(Number.isFinite(n) ? n : 0);
 }
@@ -56,14 +57,20 @@ type TrafficSummary = {
   ctr: number;
   cpc: number;
   cpm: number;
-  currency: string;
+  currency: string | null;
 };
 
-function summarize(rows: AdStat[]): TrafficSummary {
+function summarize(rows: AdStat[], accountMap: Map<string, AdAccount>): TrafficSummary {
   const spend = rows.reduce((sum, row) => sum + Number(row.spend || 0), 0);
   const impressions = rows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
   const clicks = rows.reduce((sum, row) => sum + Number(row.clicks || 0), 0);
   const conversions = rows.reduce((sum, row) => sum + Number(row.conversions || 0), 0);
+  const currencies = new Set(
+    rows
+      .map((row) => accountMap.get(String(row.ad_account_id || ""))?.currency)
+      .filter((currency): currency is string => Boolean(currency))
+      .map((currency) => currency.toUpperCase()),
+  );
   return {
     spend,
     impressions,
@@ -72,7 +79,7 @@ function summarize(rows: AdStat[]): TrafficSummary {
     ctr: impressions ? clicks / impressions : 0,
     cpc: clicks ? spend / clicks : 0,
     cpm: impressions ? (spend / impressions) * 1000 : 0,
-    currency: "USD",
+    currency: currencies.size === 1 ? [...currencies][0] : currencies.size > 1 ? null : "USD",
   };
 }
 
@@ -92,6 +99,7 @@ function groupByAccount(rows: AdStat[], accountMap: Map<string, AdAccount>) {
     .map(([accountId, v]) => ({
       account_id: accountId,
       account_name: accountMap.get(accountId)?.name || accountId,
+      currency: accountMap.get(accountId)?.currency?.toUpperCase() || "USD",
       spend: v.spend,
       impressions: v.impressions,
       clicks: v.clicks,
@@ -103,21 +111,36 @@ function groupByAccount(rows: AdStat[], accountMap: Map<string, AdAccount>) {
     .sort((a, b) => b.spend - a.spend);
 }
 
-function groupDaily(rows: AdStat[]) {
-  const buckets = new Map<string, { spend: number; impressions: number; clicks: number; conversions: number }>();
+function groupDaily(rows: AdStat[], accountMap: Map<string, AdAccount>) {
+  const buckets = new Map<string, {
+    spend: number;
+    impressions: number;
+    clicks: number;
+    conversions: number;
+    currencies: Set<string>;
+  }>();
   for (const row of rows) {
     const d = String(row.date || "").trim();
     if (!d) continue;
-    const bucket = buckets.get(d) || { spend: 0, impressions: 0, clicks: 0, conversions: 0 };
+    const bucket = buckets.get(d) || {
+      spend: 0,
+      impressions: 0,
+      clicks: 0,
+      conversions: 0,
+      currencies: new Set<string>(),
+    };
     bucket.spend += Number(row.spend || 0);
     bucket.impressions += Number(row.impressions || 0);
     bucket.clicks += Number(row.clicks || 0);
     bucket.conversions += Number(row.conversions || 0);
+    const currency = accountMap.get(String(row.ad_account_id || ""))?.currency;
+    if (currency) bucket.currencies.add(currency.toUpperCase());
     buckets.set(d, bucket);
   }
   return [...buckets.entries()]
     .map(([date, v]) => ({
       date,
+      currency: v.currencies.size === 1 ? [...v.currencies][0] : v.currencies.size > 1 ? "mixed" : "USD",
       spend: v.spend,
       impressions: v.impressions,
       clicks: v.clicks,
@@ -136,6 +159,7 @@ function TableBlock({ title, rows }: { title: string; rows: Record<string, unkno
       "date",
       "account_name",
       "account_id",
+      "currency",
       "spend",
       "impressions",
       "clicks",
@@ -167,8 +191,17 @@ function TableBlock({ title, rows }: { title: string; rows: Record<string, unkno
                   const raw = r[c];
                   const isMoney = ["spend", "cpc", "cpm"].includes(c);
                   const isPct = c === "ctr";
+                  const rowCurrency = typeof r.currency === "string" ? r.currency : "USD";
                   const val =
-                    isMoney ? fmtMoney(raw as number) : isPct ? toPct(raw as number) : typeof raw === "number" ? fmtNum(raw, 0) : String(raw ?? "--");
+                    isMoney
+                      ? rowCurrency === "mixed"
+                        ? "Разные валюты"
+                        : fmtMoney(raw as number, rowCurrency)
+                      : isPct
+                        ? toPct(raw as number)
+                        : typeof raw === "number"
+                          ? fmtNum(raw, 0)
+                          : String(raw ?? "--");
                   return <td key={`${idx}-${c}`}>{val}</td>;
                 })}
               </tr>
@@ -186,16 +219,16 @@ function TableBlock({ title, rows }: { title: string; rows: Record<string, unkno
 }
 
 function Metrics({ summary }: { summary: TrafficSummary }) {
-  const currency = summary.currency || "USD";
+  const money = (value: number) => summary.currency ? fmtMoney(value, summary.currency) : "Разные валюты";
   return (
     <section className="kpi-grid" style={{ marginTop: 8 }}>
-      <article className="kpi-card"><div className="kpi-title">Spend</div><div className="kpi-value">{fmtMoney(summary.spend, currency)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">Spend</div><div className="kpi-value">{money(summary.spend)}</div></article>
       <article className="kpi-card"><div className="kpi-title">Impressions</div><div className="kpi-value">{fmtNum(summary.impressions)}</div></article>
       <article className="kpi-card"><div className="kpi-title">Clicks</div><div className="kpi-value">{fmtNum(summary.clicks)}</div></article>
       <article className="kpi-card"><div className="kpi-title">Conversions</div><div className="kpi-value">{fmtNum(summary.conversions, 2)}</div></article>
       <article className="kpi-card"><div className="kpi-title">CTR</div><div className="kpi-value">{toPct(summary.ctr)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">CPC</div><div className="kpi-value">{fmtMoney(summary.cpc, currency)}</div></article>
-      <article className="kpi-card"><div className="kpi-title">CPM</div><div className="kpi-value">{fmtMoney(summary.cpm, currency)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">CPC</div><div className="kpi-value">{money(summary.cpc)}</div></article>
+      <article className="kpi-card"><div className="kpi-title">CPM</div><div className="kpi-value">{money(summary.cpm)}</div></article>
     </section>
   );
 }
@@ -209,6 +242,8 @@ export default function TrafficPage() {
   const [warning, setWarning] = useState("");
   const [dateFrom, setDateFrom] = useState(lastDays(30).from);
   const [dateTo, setDateTo] = useState(lastDays(30).to);
+  const [clients, setClients] = useState<Client[]>([]);
+  const [clientId, setClientId] = useState("");
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [metaRows, setMetaRows] = useState<AdStat[]>([]);
   const [googleRows, setGoogleRows] = useState<AdStat[]>([]);
@@ -222,14 +257,22 @@ export default function TrafficPage() {
     [session.apiBase, session.token]
   );
 
-  const metaAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "meta"), [accounts]);
-  const googleAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "google"), [accounts]);
-  const tiktokAccounts = useMemo(() => accounts.filter((x) => normalizePlatform(x.platform) === "tiktok"), [accounts]);
+  const visibleAccounts = useMemo(
+    () => accounts.filter((account) => !clientId || account.client_id === clientId),
+    [accounts, clientId],
+  );
+  const metaAccounts = useMemo(() => visibleAccounts.filter((x) => normalizePlatform(x.platform) === "meta"), [visibleAccounts]);
+  const googleAccounts = useMemo(() => visibleAccounts.filter((x) => normalizePlatform(x.platform) === "google"), [visibleAccounts]);
+  const tiktokAccounts = useMemo(() => visibleAccounts.filter((x) => normalizePlatform(x.platform) === "tiktok"), [visibleAccounts]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
 
-  const loadAccounts = useCallback(async () => {
-    const data = await req<{ items: AdAccount[] }>("/ad-accounts?status=active");
-    setAccounts(data.items || []);
+  const loadReferenceData = useCallback(async () => {
+    const [accountPayload, clientPayload] = await Promise.all([
+      req<{ items: AdAccount[] }>("/ad-accounts?status=active"),
+      req<{ items: Client[] }>("/clients?status=active"),
+    ]);
+    setAccounts(accountPayload.items || []);
+    setClients(clientPayload.items || []);
   }, [req]);
 
   const loadStats = useCallback(async () => {
@@ -240,6 +283,7 @@ export default function TrafficPage() {
       rows.filter((row) => {
         const rowAccountId = String(row.ad_account_id || "");
         if (selectedAccountId && rowAccountId !== selectedAccountId) return false;
+        if (clientId && accountMap.get(rowAccountId)?.client_id !== clientId) return false;
         const mappedPlatform = normalizePlatform(accountMap.get(rowAccountId)?.platform);
         const rowPlatform = normalizePlatform(row.platform);
         const resolvedPlatform = mappedPlatform || rowPlatform;
@@ -248,29 +292,39 @@ export default function TrafficPage() {
     setMetaRows(byPlatform("meta", metaAccount || undefined));
     setGoogleRows(byPlatform("google", googleAccount || undefined));
     setTiktokRows(byPlatform("tiktok", tiktokAccount || undefined));
-  }, [dateFrom, dateTo, metaAccount, googleAccount, tiktokAccount, req, accountMap]);
+  }, [dateFrom, dateTo, clientId, metaAccount, googleAccount, tiktokAccount, req, accountMap]);
 
   useEffect(() => {
     if (!ready) return;
-    void loadAccounts().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load accounts"));
-  }, [ready, loadAccounts]);
+    void loadReferenceData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load accounts"));
+  }, [ready, loadReferenceData]);
+
+  useEffect(() => {
+    setMetaAccount("");
+    setGoogleAccount("");
+    setTiktokAccount("");
+  }, [clientId]);
 
   useEffect(() => {
     if (!ready) return;
     void loadStats().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load traffic data"));
   }, [ready, loadStats]);
 
-  const metaSummary = useMemo(() => summarize(metaRows), [metaRows]);
-  const googleSummary = useMemo(() => summarize(googleRows), [googleRows]);
-  const tiktokSummary = useMemo(() => summarize(tiktokRows), [tiktokRows]);
+  const metaSummary = useMemo(() => summarize(metaRows, accountMap), [metaRows, accountMap]);
+  const googleSummary = useMemo(() => summarize(googleRows, accountMap), [googleRows, accountMap]);
+  const tiktokSummary = useMemo(() => summarize(tiktokRows, accountMap), [tiktokRows, accountMap]);
 
   const metaByAccount = useMemo(() => groupByAccount(metaRows, accountMap), [metaRows, accountMap]);
   const googleByAccount = useMemo(() => groupByAccount(googleRows, accountMap), [googleRows, accountMap]);
   const tiktokByAccount = useMemo(() => groupByAccount(tiktokRows, accountMap), [tiktokRows, accountMap]);
 
-  const metaDaily = useMemo(() => groupDaily(metaRows), [metaRows]);
-  const googleDaily = useMemo(() => groupDaily(googleRows), [googleRows]);
-  const tiktokDaily = useMemo(() => groupDaily(tiktokRows), [tiktokRows]);
+  const metaDaily = useMemo(() => groupDaily(metaRows, accountMap), [metaRows, accountMap]);
+  const googleDaily = useMemo(() => groupDaily(googleRows, accountMap), [googleRows, accountMap]);
+  const tiktokDaily = useMemo(() => groupDaily(tiktokRows, accountMap), [tiktokRows, accountMap]);
+
+  const hasMixedCurrencies = [metaSummary, googleSummary, tiktokSummary].some(
+    (summary) => summary.currency === null,
+  );
 
   return (
     <>
@@ -305,7 +359,7 @@ export default function TrafficPage() {
                     persist(next);
                     setSession(next);
                     try {
-                      await Promise.all([loadAccounts(), loadStats()]);
+                      await Promise.all([loadReferenceData(), loadStats()]);
                       push("Session saved", "success");
                     } catch (err) {
                       setWarning(err instanceof Error ? err.message : "Load failed");
@@ -324,6 +378,15 @@ export default function TrafficPage() {
               <h3>Global Filters</h3>
               <div className="session-controls">
                 <label>
+                  Client
+                  <select value={clientId} onChange={(e) => setClientId(e.target.value)}>
+                    <option value="">All Clients</option>
+                    {clients.map((client) => (
+                      <option key={client.id} value={client.id}>{client.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
                   From
                   <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
                 </label>
@@ -337,6 +400,11 @@ export default function TrafficPage() {
           </section>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
+          {hasMixedCurrencies ? (
+            <div className="warning">
+              В выборке несколько валют. Выберите одного клиента: расход, CPC и CPM нельзя корректно складывать без конвертации.
+            </div>
+          ) : null}
 
           <section className="panel" style={{ marginTop: 12 }}>
             <div className="panel-head budgets-toolbar">

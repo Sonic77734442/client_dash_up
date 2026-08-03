@@ -42,11 +42,11 @@ export function ImpersonationBanner() {
   return (
     <div className="impersonation-banner">
       <div>
-        <strong>Impersonation mode</strong>
-        <span>You are working as {label}</span>
+        <strong>Режим просмотра от имени пользователя</strong>
+        <span>Вы работаете как {label}</span>
       </div>
       <button className="ghost-btn" onClick={returnToAdmin}>
-        Return to admin
+        Вернуться в админку
       </button>
     </div>
   );

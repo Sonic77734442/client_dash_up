@@ -59,6 +59,17 @@ function fmtDate(v?: string) {
   return d.toLocaleString();
 }
 
+function isSupportedCurrency(value: string) {
+  const currency = value.trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) return false;
+  try {
+    new Intl.NumberFormat("ru-RU", { style: "currency", currency }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export default function ClientsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -198,6 +209,10 @@ export default function ClientsPage() {
   async function saveClient() {
     if (!form.name.trim()) {
       setModalError("Name is required.");
+      return;
+    }
+    if (!isSupportedCurrency(form.default_currency)) {
+      setModalError("Укажите корректный трёхбуквенный код валюты, например USD.");
       return;
     }
     try {
@@ -510,7 +525,11 @@ export default function ClientsPage() {
             </label>
             <label>
               Default Currency
-              <input value={form.default_currency} onChange={(e) => setForm((s) => ({ ...s, default_currency: e.target.value.toUpperCase() }))} />
+              <input
+                value={form.default_currency}
+                maxLength={3}
+                onChange={(e) => setForm((s) => ({ ...s, default_currency: e.target.value.toUpperCase() }))}
+              />
             </label>
             <label>
               Timezone
@@ -549,7 +568,11 @@ export default function ClientsPage() {
 
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
             <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Cancel</button>
-            <button className="primary-btn" onClick={() => void saveClient()} disabled={modalLoading || !form.name.trim()}>
+            <button
+              className="primary-btn"
+              onClick={() => void saveClient()}
+              disabled={modalLoading || !form.name.trim() || !isSupportedCurrency(form.default_currency)}
+            >
               {modalLoading ? "Saving..." : editingId ? "Save Changes" : "Create Client"}
             </button>
           </div>

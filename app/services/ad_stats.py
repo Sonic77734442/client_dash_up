@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from app.db import init_sqlite, sqlite_conn
-from app.schemas import AdStatOut, AdStatsIngestRequest
+from app.schemas import AdStatOut, AdStatsIngestRequest, AdStatWrite
 from app.services.ad_accounts import AdAccountStore
 
 
@@ -28,6 +28,26 @@ def _q(v: Decimal) -> Decimal:
 
 def _to_decimal(v) -> Decimal:
     return Decimal(str(v or 0))
+
+
+def _validate_row_account(ad_account_store: AdAccountStore, row: AdStatWrite):
+    account = ad_account_store.get(row.ad_account_id)
+    if not account:
+        raise HTTPException(status_code=400, detail=f"ad_account_id not found: {row.ad_account_id}")
+    if account.platform.strip().lower() != row.platform:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "platform_mismatch",
+                "message": "Ad stat platform must match ad account platform",
+                "details": {
+                    "ad_account_id": str(account.id),
+                    "account_platform": account.platform,
+                    "row_platform": row.platform,
+                },
+            },
+        )
+    return account
 
 
 class AdStatsStore(Protocol):
@@ -106,9 +126,7 @@ class SqliteAdStatsStore:
                         payload_prev["idempotency"] = {"key": idempotency_key, "replayed": True}
                     return payload_prev
             for row in payload.rows:
-                acc = self.ad_account_store.get(row.ad_account_id)
-                if not acc:
-                    raise HTTPException(status_code=400, detail=f"ad_account_id not found: {row.ad_account_id}")
+                _validate_row_account(self.ad_account_store, row)
 
                 stat_id = str(uuid4())
                 existing = conn.execute(
@@ -361,8 +379,7 @@ class InMemoryAdStatsStore:
         inserted = 0
         updated = 0
         for row in payload.rows:
-            if not self.ad_account_store.get(row.ad_account_id):
-                raise HTTPException(status_code=400, detail=f"ad_account_id not found: {row.ad_account_id}")
+            _validate_row_account(self.ad_account_store, row)
             key = f"{row.ad_account_id}:{row.date.isoformat()}:{row.platform}"
             now = _utcnow()
             if key in self.items:

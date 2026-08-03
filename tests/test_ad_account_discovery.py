@@ -98,7 +98,7 @@ def test_discover_updates_existing_account_when_upsert_enabled():
     c = mk_client("Acme")
     existing = mk_account(c["id"], "google", "1234567890", "Old Name", status="archived")
     app.state.ad_account_discovery_service.discoverers = {
-        "google": lambda: [{"external_account_id": "1234567890", "name": "New Name", "currency": "EUR"}]
+        "google": lambda: [{"external_account_id": "1234567890", "name": "New Name", "currency": "USD"}]
     }
 
     res = client.post(
@@ -112,8 +112,27 @@ def test_discover_updates_existing_account_when_upsert_enabled():
     updated = body["items"][0]
     assert updated["id"] == existing["id"]
     assert updated["name"] == "New Name"
-    assert updated["currency"] == "EUR"
+    assert updated["currency"] == "USD"
     assert updated["status"] == "active"
+
+
+def test_discover_skips_accounts_with_currency_that_does_not_match_target_client():
+    reset_state()
+    c = mk_client("USD tenant")
+    app.state.ad_account_discovery_service.discoverers = {
+        "google": lambda: [{"external_account_id": "eur-1", "name": "EUR account", "currency": "EUR"}]
+    }
+
+    res = client.post(
+        "/ad-accounts/discover",
+        json={"provider": "google", "client_id": c["id"]},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["discovered"] == 1
+    assert body["created"] == 0
+    assert body["skipped"] == 1
+    assert body["providers_failed"]["google"] == "currency_mismatch_skipped:1"
 
 
 def test_discover_returns_provider_failures_without_crashing():
@@ -151,7 +170,7 @@ def test_discover_does_not_reassign_account_between_clients():
     existing = mk_account(c1["id"], "google", "1234567890", "Acme Google")
 
     app.state.ad_account_discovery_service.discoverers = {
-        "google": lambda: [{"external_account_id": "1234567890", "name": "Nova Google", "currency": "EUR"}]
+        "google": lambda: [{"external_account_id": "1234567890", "name": "Nova Google", "currency": "USD"}]
     }
 
     run = client.post("/ad-accounts/discover", json={"provider": "google", "client_id": c2["id"], "upsert_existing": True})

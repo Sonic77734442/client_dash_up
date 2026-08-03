@@ -3,8 +3,14 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "../hooks/useAuth";
-
-const PUBLIC_PATHS = new Set(["/login", "/login/success"]);
+import {
+  type AppRole,
+  destinationForRole,
+  isAppRole,
+  isPathAllowedForRole,
+  isPublicPath,
+  safeRelativePath,
+} from "../lib/authRedirect";
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -13,26 +19,34 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const { ready, authenticated, role } = useAuth(defaultApiBase);
 
   const currentPath = pathname || "";
-  const isPublic = PUBLIC_PATHS.has(currentPath);
-  const isPlatformAdmin = currentPath.startsWith("/platform");
+  const isPublic = isPublicPath(currentPath);
+  const currentRole: AppRole | null = isAppRole(role) ? role : null;
+  const roleAllowed = Boolean(currentRole && isPathAllowedForRole(currentRole, currentPath));
 
   useEffect(() => {
     if (!ready) return;
 
     if (!authenticated && !isPublic) {
-      router.replace("/login");
+      const requestedPath = safeRelativePath(
+        `${currentPath}${window.location.search}${window.location.hash}`,
+        currentPath || "/",
+      );
+      router.replace(`/login?next=${encodeURIComponent(requestedPath)}`);
       return;
     }
 
-    if (authenticated && isPublic) {
-      router.replace("/");
+    if (!authenticated || !currentRole) return;
+
+    if (isPublic) {
+      const requestedPath = new URLSearchParams(window.location.search).get("next");
+      router.replace(destinationForRole(currentRole, requestedPath));
       return;
     }
 
-    if (authenticated && isPlatformAdmin && role !== "admin") {
-      router.replace("/");
+    if (!roleAllowed) {
+      router.replace(destinationForRole(currentRole));
     }
-  }, [ready, authenticated, isPublic, isPlatformAdmin, role, router]);
+  }, [ready, authenticated, currentPath, currentRole, isPublic, roleAllowed, router]);
 
   if (!ready) {
     return null;
@@ -46,7 +60,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     return null;
   }
 
-  if (authenticated && isPlatformAdmin && role !== "admin") {
+  if (authenticated && (!currentRole || isPublic || !roleAllowed)) {
     return null;
   }
 
