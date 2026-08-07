@@ -2,7 +2,12 @@ import { expect, test } from "@playwright/test";
 import { agencySelectionRequiredMessage, resolveAgencySelection } from "../../lib/agencyContext";
 import { calculateClientRiskScore } from "../../lib/riskScore";
 import type { AgencyOut } from "../../lib/types";
-import { attachSession, createAgencySessionWithAccess, createMultiAgencySessionWithAccess } from "./auth";
+import {
+  attachSession,
+  createAdminSession,
+  createAgencySessionWithAccess,
+  createMultiAgencySessionWithAccess,
+} from "./auth";
 
 const API_BASE = "http://127.0.0.1:8000";
 
@@ -94,6 +99,36 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   expect(oauthUrl.searchParams.get("intent")).toBe("connect");
   expect(oauthUrl.searchParams.get("connect_mode")).toBe("add");
   expect(oauthUrl.searchParams.get("agency_id")).toBe(agency.id);
+});
+
+test("archived clients are not offered as discovery targets", async ({ page, context, request }) => {
+  const token = await createAdminSession(request);
+  const headers = { Authorization: `Bearer ${token}` };
+  const activeName = `active-discovery-${Date.now()}`;
+  const archivedName = `archived-discovery-${Date.now()}`;
+
+  const activeResponse = await request.post(`${API_BASE}/clients`, {
+    headers,
+    data: { name: activeName, status: "active", default_currency: "USD" },
+  });
+  expect(activeResponse.ok()).toBeTruthy();
+
+  const archivedResponse = await request.post(`${API_BASE}/clients`, {
+    headers,
+    data: { name: archivedName, status: "active", default_currency: "USD" },
+  });
+  expect(archivedResponse.ok()).toBeTruthy();
+  const archivedClient = (await archivedResponse.json()) as { id: string };
+  const archiveResponse = await request.delete(`${API_BASE}/clients/${archivedClient.id}`, { headers });
+  expect(archiveResponse.ok()).toBeTruthy();
+
+  await attachSession(page, context, token);
+  await page.goto("/sync-monitor");
+
+  const discoveryTarget = page.getByLabel("Клиент для найденных аккаунтов");
+  await expect(discoveryTarget).toBeVisible({ timeout: 30_000 });
+  await expect(discoveryTarget.locator("option", { hasText: activeName })).toHaveCount(1);
+  await expect(discoveryTarget.locator("option", { hasText: archivedName })).toHaveCount(0);
 });
 
 test("switching agency drops delayed old scope and constrains bulk sync", async ({ page, context, request }) => {

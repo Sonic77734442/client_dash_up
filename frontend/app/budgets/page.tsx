@@ -110,10 +110,18 @@ function statusClass(pace: BudgetRow["pace"]) {
 }
 
 function paceLabel(pace: BudgetRow["pace"]) {
-  if (pace === "overspending") return "OVERSPENDING";
-  if (pace === "underspending") return "UNDERSPENDING";
-  if (pace === "on_track") return "ON TRACK";
-  return "NO SIGNAL";
+  if (pace === "overspending") return "ПЕРЕРАСХОД";
+  if (pace === "underspending") return "НИЖЕ ПЛАНА";
+  if (pace === "on_track") return "ПО ПЛАНУ";
+  return "НЕТ ДАННЫХ";
+}
+
+function budgetStatusLabel(status?: string | null) {
+  return status === "archived" ? "В архиве" : status === "active" || !status ? "Активен" : status;
+}
+
+function budgetScopeLabel(scope: Budget["scope"]) {
+  return scope === "account" ? "Аккаунт" : "Клиент";
 }
 
 function buildCsv(rows: BudgetRow[]) {
@@ -245,7 +253,7 @@ export default function BudgetsPage() {
 
   useEffect(() => {
     if (!ready || agencyContext.loading) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load budgets"));
+    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Не удалось загрузить бюджеты"));
   }, [agencyContext.loading, ready, loadData]);
 
   useEffect(() => {
@@ -431,7 +439,7 @@ export default function BudgetsPage() {
       return;
     }
     if (!isAmountValid) {
-      setCreateError("Amount must be greater than 0.");
+      setCreateError("Сумма должна быть больше нуля.");
       return;
     }
     if (!isCurrencyValid) {
@@ -439,15 +447,15 @@ export default function BudgetsPage() {
       return;
     }
     if (!isDateRangeValid) {
-      setCreateError("End date must be on or after start date.");
+      setCreateError("Дата окончания не может быть раньше даты начала.");
       return;
     }
     if (!canCreate) {
-      setCreateError("Fill all required fields before creating budget.");
+      setCreateError("Заполните все обязательные поля.");
       return;
     }
     if (createCapBlocksSubmit) {
-      setCreateError("Fix cap rule conflict before submit.");
+      setCreateError("Устраните конфликт с лимитом бюджета.");
       return;
     }
     try {
@@ -468,12 +476,12 @@ export default function BudgetsPage() {
           note: createForm.note || null,
         }),
       });
-      push("Budget created", "success");
+      push("Бюджет создан", "success");
       setCreateOpen(false);
       setCreateForm(defaultCreateForm());
       await loadData();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Create budget failed";
+      const msg = err instanceof Error ? err.message : "Не удалось создать бюджет";
       setWarning(msg);
       setCreateError(msg);
       push(msg, "error");
@@ -484,7 +492,7 @@ export default function BudgetsPage() {
 
   async function adjustSelected(deltaFactor: number) {
     if (!selected?.id || !selectedIsScoped) {
-      const msg = "Selected budget has no id. Reload list and try again.";
+      const msg = "У выбранного бюджета нет идентификатора. Обновите список и повторите попытку.";
       setWarning(msg);
       push(msg, "error");
       return;
@@ -498,15 +506,15 @@ export default function BudgetsPage() {
         method: "PATCH",
         body: JSON.stringify({ amount: nextAmount.toFixed(2) }),
       });
-      const msg = `Allocation updated to ${fmtMoney(nextAmount, selected.currency || "USD")}`;
+      const msg = `Бюджет изменён до ${fmtMoney(nextAmount, selected.currency || "USD")}`;
       setActionStatus(msg);
       push(msg, "success");
       await loadData();
       await loadTransferHistory(selected.id, transferDirection);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Adjust allocation failed";
+      const msg = err instanceof Error ? err.message : "Не удалось изменить бюджет";
       setWarning(msg);
-      setActionStatus(`Adjust failed: ${msg}`);
+      setActionStatus(`Не удалось изменить бюджет: ${msg}`);
       push(msg, "error");
     } finally {
       setActionLoading(false);
@@ -515,7 +523,7 @@ export default function BudgetsPage() {
 
   async function archiveSelected() {
     if (!selected?.id || !selectedIsScoped) {
-      const msg = "Selected budget has no id. Reload list and try again.";
+      const msg = "У выбранного бюджета нет идентификатора. Обновите список и повторите попытку.";
       setWarning(msg);
       push(msg, "error");
       return;
@@ -524,14 +532,14 @@ export default function BudgetsPage() {
       setActionLoading(true);
       setActionStatus("");
       await req<Budget>(`/budgets/${selected.id}`, { method: "DELETE" });
-      const msg = "Budget archived. To restore, switch Status filter to Archived/All and click Restore.";
+      const msg = "Бюджет перемещён в архив. Чтобы вернуть его, выберите статус «Архив» или «Все» и нажмите «Восстановить».";
       setActionStatus(msg);
-      push("Budget archived", "success");
+      push("Бюджет перемещён в архив", "success");
       await loadData();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Archive failed";
+      const msg = err instanceof Error ? err.message : "Не удалось архивировать бюджет";
       setWarning(msg);
-      setActionStatus(`Archive failed: ${msg}`);
+      setActionStatus(`Не удалось архивировать бюджет: ${msg}`);
       push(msg, "error");
     } finally {
       setActionLoading(false);
@@ -540,7 +548,7 @@ export default function BudgetsPage() {
 
   async function restoreSelected() {
     if (!selected?.id || !selectedIsScoped) {
-      const msg = "Selected budget has no id. Reload list and try again.";
+      const msg = "У выбранного бюджета нет идентификатора. Обновите список и повторите попытку.";
       setWarning(msg);
       push(msg, "error");
       return;
@@ -552,15 +560,15 @@ export default function BudgetsPage() {
         method: "PATCH",
         body: JSON.stringify({ status: "active" }),
       });
-      const msg = "Budget restored to active.";
+      const msg = "Бюджет восстановлен и снова активен.";
       setActionStatus(msg);
       push(msg, "success");
       await loadData();
       await loadTransferHistory(selected.id, transferDirection);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Restore failed";
+      const msg = err instanceof Error ? err.message : "Не удалось восстановить бюджет";
       setWarning(msg);
-      setActionStatus(`Restore failed: ${msg}`);
+      setActionStatus(`Не удалось восстановить бюджет: ${msg}`);
       push(msg, "error");
     } finally {
       setActionLoading(false);
@@ -578,12 +586,12 @@ export default function BudgetsPage() {
 
   async function submitTransfer() {
     if (!selected?.id || !selectedIsScoped || selected.scope !== "account" || !selected.account_id) {
-      setTransferError("Select an active account budget first.");
+      setTransferError("Сначала выберите активный бюджет рекламного аккаунта.");
       return;
     }
     const amount = Number(transferAmount);
     if (!transferTargetAccountId) {
-      setTransferError("Select target account.");
+      setTransferError("Выберите аккаунт-получатель.");
       return;
     }
     if (!accounts.some(
@@ -593,11 +601,11 @@ export default function BudgetsPage() {
       return;
     }
     if (!Number.isFinite(amount) || amount <= 0) {
-      setTransferError("Transfer amount must be greater than 0.");
+      setTransferError("Сумма перевода должна быть больше нуля.");
       return;
     }
     if (amount > Number(selected.amount || 0)) {
-      setTransferError("Transfer amount exceeds source budget.");
+      setTransferError("Сумма перевода превышает исходный бюджет.");
       return;
     }
     try {
@@ -611,14 +619,14 @@ export default function BudgetsPage() {
           note: `Transfer from ${selected.account_id} to ${transferTargetAccountId}`,
         }),
       });
-      const msg = `Transferred ${fmtMoney(Number(res.transferred_amount || amount), selected.currency || "USD")}`;
+      const msg = `Переведено ${fmtMoney(Number(res.transferred_amount || amount), selected.currency || "USD")}`;
       setActionStatus(msg);
       push(msg, "success");
       setTransferOpen(false);
       await loadData();
       await loadTransferHistory(selected.id, transferDirection);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Transfer failed";
+      const msg = err instanceof Error ? err.message : "Не удалось перевести бюджет";
       setTransferError(msg);
       push(msg, "error");
     } finally {
@@ -635,7 +643,7 @@ export default function BudgetsPage() {
     a.download = `budgets-ledger-${todayIso()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    push("CSV exported", "info");
+    push("CSV-файл выгружен", "info");
   }
 
   const accountsForClient = useMemo(
@@ -681,7 +689,7 @@ export default function BudgetsPage() {
         return;
       }
 
-      setCreateCapHint({ loading: true, level: "info", text: "Checking budget cap..." });
+      setCreateCapHint({ loading: true, level: "info", text: "Проверяем лимит бюджета…" });
       try {
         const q = getQuery({
           client_id: createForm.client_id,
@@ -704,7 +712,7 @@ export default function BudgetsPage() {
             setCreateCapHint({
               loading: false,
               level: "info",
-              text: "No active client budget for this period. Server cap check still applies.",
+              text: "На этот период нет активного бюджета клиента. Ограничение всё равно будет проверено при сохранении.",
             });
             return;
           }
@@ -714,13 +722,13 @@ export default function BudgetsPage() {
             setCreateCapHint({
               loading: false,
               level: "warn",
-              text: `Projected account allocations ${fmtMoney(projected)} exceed client cap ${fmtMoney(clientCap)}.`,
+              text: `План по аккаунтам ${fmtMoney(projected)} превышает лимит клиента ${fmtMoney(clientCap)}.`,
             });
           } else {
             setCreateCapHint({
               loading: false,
               level: "ok",
-              text: `Projected account allocations ${fmtMoney(projected)} / client cap ${fmtMoney(clientCap)}.`,
+              text: `План по аккаунтам: ${fmtMoney(projected)} из лимита клиента ${fmtMoney(clientCap)}.`,
             });
           }
           return;
@@ -730,13 +738,13 @@ export default function BudgetsPage() {
           setCreateCapHint({
             loading: false,
             level: "warn",
-            text: `Client budget ${fmtMoney(amount)} is lower than allocated account budgets ${fmtMoney(accountSum)}.`,
+            text: `Бюджет клиента ${fmtMoney(amount)} меньше суммы бюджетов аккаунтов ${fmtMoney(accountSum)}.`,
           });
         } else {
           setCreateCapHint({
             loading: false,
             level: "ok",
-            text: `Client budget ${fmtMoney(amount)} covers account allocations ${fmtMoney(accountSum)}.`,
+            text: `Бюджет клиента ${fmtMoney(amount)} покрывает бюджеты аккаунтов ${fmtMoney(accountSum)}.`,
           });
         }
       } catch {
@@ -744,7 +752,7 @@ export default function BudgetsPage() {
           setCreateCapHint({
             loading: false,
             level: "info",
-            text: "Cap pre-check unavailable. Server validation will run on submit.",
+            text: "Предварительная проверка лимита недоступна. Проверим его при сохранении.",
           });
         }
       }
@@ -768,14 +776,14 @@ export default function BudgetsPage() {
   return (
     <>
       <div className="app-shell budgets-shell">
-        <AppSidebar active="budgets" subtitle="Financial Control" className="sidebar budgets-sidebar" />
+        <AppSidebar active="budgets" subtitle="Финансовый контроль" className="sidebar budgets-sidebar" />
 
         <main className="content budgets-content">
           <header className="topbar budgets-topbar">
             <div className="topbar-left">
               <AppTopTabs active="budgets" />
-              <div className="topbar-title">Accounts Ledger</div>
-              <div className="panel-subtitle">Precision tracking for active organizational allocations.</div>
+              <div className="topbar-title">Реестр бюджетов</div>
+              <div className="panel-subtitle">Контроль бюджетов клиентов и рекламных аккаунтов.</div>
             </div>
             <div className="session-controls">
               {tokenLoginEnabled ? (
@@ -784,13 +792,13 @@ export default function BudgetsPage() {
                     type="text"
                     value={session.apiBase}
                     onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                    placeholder="API base"
+                    placeholder="Адрес API"
                   />
                   <input
                     type="password"
                     value={session.token}
                     onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                    placeholder="Session token"
+                    placeholder="Токен сессии"
                   />
                   <button
                     className="ghost-btn"
@@ -800,18 +808,18 @@ export default function BudgetsPage() {
                       setSession(next);
                       try {
                         await loadData();
-                        push("Session saved", "success");
+                        push("Сессия сохранена", "success");
                       } catch (err) {
-                        setWarning(err instanceof Error ? err.message : "Load failed");
+                        setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные");
                       }
                     }}
                     disabled={!ready}
                   >
-                    Save
+                    Сохранить
                   </button>
                 </>
               ) : null}
-              <button className="primary-btn" onClick={openCreateModal}>Create Budget</button>
+              <button className="primary-btn" onClick={openCreateModal}>Создать бюджет</button>
             </div>
           </header>
 
@@ -819,19 +827,19 @@ export default function BudgetsPage() {
 
           <section className="kpi-grid budgets-kpis">
             <article className="kpi-card">
-              <div className="kpi-title">Active Budgets</div>
+              <div className="kpi-title">Активные бюджеты</div>
               <div className="kpi-value">{kpis.activeBudgets}</div>
             </article>
             <article className="kpi-card">
-              <div className="kpi-title">Total Budget</div>
+              <div className="kpi-title">Общий бюджет</div>
               <div className="kpi-value">{totalBudgetLabel}</div>
             </article>
             <article className="kpi-card">
-              <div className="kpi-title">Total Spend</div>
+              <div className="kpi-title">Общие расходы</div>
               <div className="kpi-value">{totalSpendLabel}</div>
             </article>
             <article className="kpi-card bad">
-              <div className="kpi-title">At Risk</div>
+              <div className="kpi-title">Требуют внимания</div>
               <div className="kpi-value">{kpis.atRisk}</div>
             </article>
           </section>
@@ -846,35 +854,35 @@ export default function BudgetsPage() {
               <div className="panel-head budgets-toolbar">
                 <div className="session-controls budgets-filters">
                   <label>
-                    Range
+                    Период
                     <select value={preset} onChange={(e) => setPreset(e.target.value as RangePreset)}>
-                      <option value="qtd">Current Quarter</option>
-                      <option value="30">Last 30 Days</option>
-                      <option value="90">Last 90 Days</option>
+                      <option value="qtd">Текущий квартал</option>
+                      <option value="30">Последние 30 дней</option>
+                      <option value="90">Последние 90 дней</option>
                     </select>
                   </label>
                   <label>
-                    Client
+                    Клиент
                     <select value={clientId} onChange={(e) => setClientId(e.target.value)}>
-                      <option value="">All Clients</option>
+                      <option value="">Все клиенты</option>
                       {clients.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
                       ))}
                     </select>
                   </label>
                   <label>
-                    Status
+                    Статус
                     <select value={status} onChange={(e) => setStatus(e.target.value as StatusFilter)}>
-                      <option value="active">Active</option>
-                      <option value="archived">Archived</option>
-                      <option value="all">All</option>
+                      <option value="active">Активные</option>
+                      <option value="archived">Архив</option>
+                      <option value="all">Все</option>
                     </select>
                   </label>
                 </div>
                 <div className="session-controls">
-                  <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search client/account/id" />
-                  <button className="ghost-btn" onClick={() => void loadData()}>Apply Filters</button>
-                  <button className="ghost-btn" onClick={exportCsv}>Export</button>
+                  <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Клиент, аккаунт или ID" />
+                  <button className="ghost-btn" onClick={() => void loadData()}>Применить</button>
+                  <button className="ghost-btn" onClick={exportCsv}>Выгрузить CSV</button>
                 </div>
               </div>
 
@@ -882,13 +890,13 @@ export default function BudgetsPage() {
                 <table className="budgets-table">
                   <thead>
                     <tr>
-                      <th>Scope</th>
-                      <th>Account Name</th>
-                      <th>Period</th>
-                      <th>Budget</th>
-                      <th>Usage</th>
-                      <th>Pace</th>
-                      <th>Status</th>
+                      <th>Уровень</th>
+                      <th>Клиент или аккаунт</th>
+                      <th>Период</th>
+                      <th>Бюджет</th>
+                      <th>Расход</th>
+                      <th>Темп</th>
+                      <th>Статус</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -898,7 +906,7 @@ export default function BudgetsPage() {
                         className={r.id === selectedBudgetId ? "selected" : ""}
                         onClick={() => setSelectedBudgetId(r.id || "")}
                       >
-                        <td><span className={`badge scope-${r.scope}`}>{r.scope.toUpperCase()}</span></td>
+                        <td><span className={`badge scope-${r.scope}`}>{budgetScopeLabel(r.scope)}</span></td>
                         <td>
                           <div className="client-cell">
                             <div className="client-name">{r.resolvedAccountName || r.resolvedClientName}</div>
@@ -920,7 +928,7 @@ export default function BudgetsPage() {
                           )}
                         </td>
                         <td><span className={`badge ${statusClass(r.pace)}`}>{paceLabel(r.pace)}</span></td>
-                        <td>{r.status || "active"}</td>
+                        <td>{budgetStatusLabel(r.status)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -929,14 +937,14 @@ export default function BudgetsPage() {
 
               <div className="table-footer">
                 <div className="session-controls">
-                  <span className="muted-note">Rows per page</span>
+                  <span className="muted-note">Строк на странице</span>
                   <select value={String(rowsPerPage)} onChange={(e) => setRowsPerPage(Number(e.target.value))}>
                     <option value="5">5</option>
                     <option value="10">10</option>
                     <option value="20">20</option>
                   </select>
                   <span className="muted-note">
-                    Showing {rows.length ? (safePage - 1) * rowsPerPage + 1 : 0}-{Math.min(safePage * rowsPerPage, rows.length)} of {rows.length}
+                    Показано {rows.length ? (safePage - 1) * rowsPerPage + 1 : 0}–{Math.min(safePage * rowsPerPage, rows.length)} из {rows.length}
                   </span>
                 </div>
                 <div className="pager">
@@ -950,27 +958,27 @@ export default function BudgetsPage() {
             <aside className="panel budgets-detail">
               <div className="budgets-detail-head">
                 <div>
-                  <div className="kpi-title">Detail Panel</div>
-                  <h3>{selected?.resolvedAccountName || selected?.resolvedClientName || "No selection"}</h3>
+                  <div className="kpi-title">Детали бюджета</div>
+                  <h3>{selected?.resolvedAccountName || selected?.resolvedClientName || "Ничего не выбрано"}</h3>
                 </div>
               </div>
 
               {!selected ? (
-                <div className="muted-note">Select a budget row to inspect details.</div>
+                <div className="muted-note">Выберите строку бюджета, чтобы посмотреть детали.</div>
               ) : (
                 <>
                   <div className="detail-grid">
-                    <div className="detail-item"><div className="detail-k">Status</div><div className="detail-v">{selected.status || "active"}</div></div>
-                    <div className="detail-item"><div className="detail-k">Scope</div><div className="detail-v">{selected.scope}</div></div>
-                    <div className="detail-item"><div className="detail-k">Duration</div><div className="detail-v">{selected.start_date || "--"} - {selected.end_date || "--"}</div></div>
-                    <div className="detail-item"><div className="detail-k">Version</div><div className="detail-v">{selected.version || 1}</div></div>
+                    <div className="detail-item"><div className="detail-k">Статус</div><div className="detail-v">{budgetStatusLabel(selected.status)}</div></div>
+                    <div className="detail-item"><div className="detail-k">Уровень</div><div className="detail-v">{budgetScopeLabel(selected.scope)}</div></div>
+                    <div className="detail-item"><div className="detail-k">Период</div><div className="detail-v">{selected.start_date || "--"} - {selected.end_date || "--"}</div></div>
+                    <div className="detail-item"><div className="detail-k">Версия</div><div className="detail-v">{selected.version || 1}</div></div>
                   </div>
 
                   <div className="panel budgets-detail-card">
-                    <div className="kpi-title">Total Allocated</div>
+                    <div className="kpi-title">Выделено</div>
                     <div className="budgets-money-line">
                       <strong>{fmtMoney(Number(selected.amount || 0), selected.currency || "USD")}</strong>
-                      <span>Remaining {selected.usagePercent == null ? "--" : fmtMoney(Math.max(0, Number(selected.amount) - selected.spend), selected.currency || "USD")}</span>
+                      <span>Осталось {selected.usagePercent == null ? "--" : fmtMoney(Math.max(0, Number(selected.amount) - selected.spend), selected.currency || "USD")}</span>
                     </div>
                     <div className="usage-bar low">
                       <div style={{ width: `${Math.min(100, selected.usagePercent || 0)}%` }} />
@@ -979,11 +987,11 @@ export default function BudgetsPage() {
 
                   <div className="panel" style={{ marginTop: 10 }}>
                     <div className="action-row-head" style={{ marginBottom: 8 }}>
-                      <h3 style={{ fontSize: 16, margin: 0 }}>Audit Trail</h3>
+                      <h3 style={{ fontSize: 16, margin: 0 }}>История изменений</h3>
                       <div className="alert-actions" style={{ marginTop: 0 }}>
-                        <button className={`mini-btn ${auditFilter === "all" ? "active" : ""}`} onClick={() => setAuditFilter("all")}>All</button>
-                        <button className={`mini-btn ${auditFilter === "transfers" ? "active" : ""}`} onClick={() => setAuditFilter("transfers")}>Transfers</button>
-                        <button className={`mini-btn ${auditFilter === "notes" ? "active" : ""}`} onClick={() => setAuditFilter("notes")}>Notes</button>
+                        <button className={`mini-btn ${auditFilter === "all" ? "active" : ""}`} onClick={() => setAuditFilter("all")}>Все</button>
+                        <button className={`mini-btn ${auditFilter === "transfers" ? "active" : ""}`} onClick={() => setAuditFilter("transfers")}>Переводы</button>
+                        <button className={`mini-btn ${auditFilter === "notes" ? "active" : ""}`} onClick={() => setAuditFilter("notes")}>Заметки</button>
                       </div>
                     </div>
                     {(auditFilter === "all" || auditFilter === "transfers") ? (
@@ -992,62 +1000,62 @@ export default function BudgetsPage() {
                           className={`mini-btn ${transferDirection === "all" ? "active" : ""}`}
                           onClick={() => setTransferDirection("all")}
                         >
-                          All Transfers
+                          Все переводы
                         </button>
                         <button
                           className={`mini-btn ${transferDirection === "incoming" ? "active" : ""}`}
                           onClick={() => setTransferDirection("incoming")}
                         >
-                          Incoming
+                          Входящие
                         </button>
                         <button
                           className={`mini-btn ${transferDirection === "outgoing" ? "active" : ""}`}
                           onClick={() => setTransferDirection("outgoing")}
                         >
-                          Outgoing
+                          Исходящие
                         </button>
                       </div>
                     ) : null}
 
                     {(auditFilter === "all" || auditFilter === "notes") ? (
                       <div className="activity-item">
-                        <div className="activity-title">Budget snapshot loaded</div>
+                        <div className="activity-title">Состояние бюджета загружено</div>
                         <div className="activity-meta">{new Date(selected.updated_at).toLocaleString()}</div>
                       </div>
                     ) : null}
                     {(auditFilter === "all" || auditFilter === "notes") && selected.note ? (
                       <div className="activity-item">
-                        <div className="activity-title">Note</div>
+                        <div className="activity-title">Заметка</div>
                         <div className="activity-meta">{selected.note}</div>
                       </div>
                     ) : null}
                     {(auditFilter === "all" || auditFilter === "transfers") ? (
                       transferHistoryLoading ? (
                         <div className="activity-item">
-                          <div className="activity-meta">Loading transfer history...</div>
+                          <div className="activity-meta">Загружаем историю переводов…</div>
                         </div>
                       ) : transferHistory.length ? (
                         transferHistory.slice(0, 6).map((t) => (
                           <div className="activity-item" key={t.id}>
                             <div className="activity-title">
-                              Transfer {fmtMoney(Number(t.amount || 0), selected.currency || "USD")}
+                              Перевод {fmtMoney(Number(t.amount || 0), selected.currency || "USD")}
                             </div>
                             <div className="activity-meta">
-                              {t.source_budget_id === selected.id ? "Outgoing" : "Incoming"} · {new Date(t.created_at).toLocaleString()}
+                              {t.source_budget_id === selected.id ? "Исходящий" : "Входящий"} · {new Date(t.created_at).toLocaleString()}
                             </div>
                             {t.note ? <div className="activity-meta">{t.note}</div> : null}
                           </div>
                         ))
                       ) : (
                         <div className="activity-item">
-                          <div className="activity-meta">No transfers yet.</div>
+                          <div className="activity-meta">Переводов пока нет.</div>
                         </div>
                       )
                     ) : null}
                   </div>
 
                   <div className="muted-note" style={{ marginTop: 10 }}>
-                    Archive hides budget from default list (`status=active`). Use `Archived` or `All` filter to restore later.
+                    Архивный бюджет скрывается из списка по умолчанию. Чтобы вернуть его, выберите фильтр «Архив» или «Все».
                   </div>
                   <div className={`budgets-action-status ${actionStatus ? "" : "hidden"}`} style={{ marginTop: 8 }}>
                     {actionStatus}
@@ -1055,33 +1063,33 @@ export default function BudgetsPage() {
 
                   <div className="budgets-detail-actions">
                     <button className="primary-btn" onClick={() => void adjustSelected(1.1)} disabled={actionLoading || selected.status === "archived"}>
-                      {actionLoading ? "Saving..." : "Adjust +10%"}
+                      {actionLoading ? "Сохраняем…" : "Увеличить на 10%"}
                     </button>
                     <button className="ghost-btn" onClick={() => void adjustSelected(0.9)} disabled={actionLoading || selected.status === "archived"}>
-                      {actionLoading ? "Saving..." : "Adjust -10%"}
+                      {actionLoading ? "Сохраняем…" : "Уменьшить на 10%"}
                     </button>
                     <button
                       className="ghost-btn"
                       onClick={openTransferModal}
                       disabled={actionLoading || selected.status === "archived" || selected.scope !== "account"}
                     >
-                      Transfer
+                      Перевести
                     </button>
                     {selected.status === "archived" ? (
                       <button className="ghost-btn" onClick={() => void restoreSelected()} disabled={actionLoading}>
-                        {actionLoading ? "Saving..." : "Restore"}
+                        {actionLoading ? "Сохраняем…" : "Восстановить"}
                       </button>
                     ) : (
                       <button
                         className="ghost-btn"
                         onClick={() => {
-                          if (window.confirm("Archive this budget? It will disappear from default active list.")) {
+                          if (window.confirm("Переместить бюджет в архив? Он исчезнет из списка активных бюджетов.")) {
                             void archiveSelected();
                           }
                         }}
                         disabled={actionLoading}
                       >
-                        {actionLoading ? "Saving..." : "Archive Budget"}
+                        {actionLoading ? "Сохраняем…" : "В архив"}
                       </button>
                     )}
                   </div>
@@ -1090,12 +1098,12 @@ export default function BudgetsPage() {
             </aside>
           </section>
 
-          <section className="budgets-mobile" aria-label="mobile budgets view">
+          <section className="budgets-mobile" aria-label="Бюджеты на мобильном устройстве">
             <div className="budgets-mobile-kpis">
-              <div className="mobile-card"><div className="kpi-title">Total Allocated</div><div className="kpi-value">{totalBudgetLabel}</div></div>
-              <div className="mobile-card"><div className="kpi-title">Active Burn</div><div className="kpi-value">{totalSpendLabel}</div></div>
-              <div className="mobile-card"><div className="kpi-title">Efficiency</div><div className="kpi-value">{efficiencyLabel}</div></div>
-              <div className="mobile-card"><div className="kpi-title">Over Pace</div><div className="kpi-value">{kpis.atRisk}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Выделено</div><div className="kpi-value">{totalBudgetLabel}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Расход</div><div className="kpi-value">{totalSpendLabel}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Использовано</div><div className="kpi-value">{efficiencyLabel}</div></div>
+              <div className="mobile-card"><div className="kpi-title">Перерасход</div><div className="kpi-value">{kpis.atRisk}</div></div>
             </div>
             {rows.slice(0, 4).map((r) => (
               <article className="mobile-card" key={`m-${r.id}`}>
@@ -1106,20 +1114,20 @@ export default function BudgetsPage() {
                   </div>
                   <span className={`badge ${statusClass(r.pace)}`}>{paceLabel(r.pace)}</span>
                 </div>
-                <div className="panel-subtitle" style={{ marginTop: 8 }}>Spend</div>
+                <div className="panel-subtitle" style={{ marginTop: 8 }}>Расход</div>
                 <div className="kpi-value" style={{ fontSize: 28 }}>{fmtMoney(r.spend, r.currency || "USD")}</div>
                 <div className="usage-bar low"><div style={{ width: `${Math.min(100, r.usagePercent || 0)}%` }} /></div>
                 <div className="alert-actions">
-                  <button className="mini-btn" onClick={() => setSelectedBudgetId(r.id || "")}>Edit</button>
-                  <button className="mini-btn" onClick={() => push("History opened in detail panel", "info")}>History</button>
+                  <button className="mini-btn" onClick={() => setSelectedBudgetId(r.id || "")}>Открыть</button>
+                  <button className="mini-btn" onClick={() => push("История открыта в панели деталей", "info")}>История</button>
                 </div>
               </article>
             ))}
             <div className="mobile-bottom-nav">
-              <div className="mobile-nav-item">Overview</div>
-              <div className="mobile-nav-item" style={{ background: "#2f4666", color: "#fff" }}>Budgets</div>
-              <div className="mobile-nav-item">Analysis</div>
-              <div className="mobile-nav-item">Settings</div>
+              <div className="mobile-nav-item">Обзор</div>
+              <div className="mobile-nav-item" style={{ background: "#2f4666", color: "#fff" }}>Бюджеты</div>
+              <div className="mobile-nav-item">Аналитика</div>
+              <div className="mobile-nav-item">Настройки</div>
             </div>
             <button className="budgets-fab" onClick={openCreateModal}>+</button>
           </section>
@@ -1135,28 +1143,28 @@ export default function BudgetsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>Create Budget</h3>
-              <div className="panel-subtitle">Manual budget entry (client/account scope)</div>
+              <h3 style={{ margin: 0 }}>Новый бюджет</h3>
+              <div className="panel-subtitle">Задайте бюджет для клиента или рекламного аккаунта.</div>
             </div>
-            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Close</button>
+            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Закрыть</button>
           </div>
           <div className={`warning ${createError ? "" : "hidden"}`} style={{ marginTop: 10 }}>{createError}</div>
           <div className={`budgets-cap-hint ${createCapHint.level} ${createCapHint.text ? "" : "hidden"}`} style={{ marginTop: 8 }}>
-            {createCapHint.loading ? "Checking..." : createCapHint.text}
+            {createCapHint.loading ? "Проверяем…" : createCapHint.text}
           </div>
             <div className="detail-grid" style={{ marginTop: 10 }}>
             <label>
-              Scope
+              Уровень
               <select
                 value={createForm.scope}
                 onChange={(e) => setCreateForm((s) => ({ ...s, scope: e.target.value as "client" | "account", account_id: "" }))}
               >
-                <option value="client">Client</option>
-                <option value="account">Account</option>
+                <option value="client">Клиент</option>
+                <option value="account">Аккаунт</option>
               </select>
             </label>
             <label>
-              Client
+              Клиент
               <select
                 value={createForm.client_id}
                 onChange={(e) => {
@@ -1170,14 +1178,14 @@ export default function BudgetsPage() {
                   }));
                 }}
               >
-                <option value="">Select client</option>
+                <option value="">Выберите клиента</option>
                 {clients.map((c) => (
                   <option key={c.id} value={c.id}>{c.name}</option>
                 ))}
               </select>
             </label>
             <label>
-              Account
+              Аккаунт
               <select
                 value={createForm.account_id}
                 disabled={createForm.scope !== "account"}
@@ -1191,14 +1199,14 @@ export default function BudgetsPage() {
                   }));
                 }}
               >
-                <option value="">Select account</option>
+                <option value="">Выберите аккаунт</option>
                 {accountsForClient.map((a) => (
                   <option key={a.id} value={a.id}>{a.name}</option>
                 ))}
               </select>
             </label>
             <label>
-              Amount
+              Сумма
               <input
                 type="number"
                 min="0.01"
@@ -1208,41 +1216,41 @@ export default function BudgetsPage() {
               />
             </label>
             <label>
-              Currency
+              Валюта
               <input value={createForm.currency} onChange={(e) => setCreateForm((s) => ({ ...s, currency: e.target.value.toUpperCase() }))} />
             </label>
             <label>
-              Period Type
+              Тип периода
               <select
                 value={createForm.period_type}
                 onChange={(e) => setCreateForm((s) => ({ ...s, period_type: e.target.value as "monthly" | "custom" }))}
               >
-                <option value="monthly">monthly</option>
-                <option value="custom">custom</option>
+                <option value="monthly">Месяц</option>
+                <option value="custom">Произвольный период</option>
               </select>
             </label>
             <label>
-              Start Date
+              Дата начала
               <input type="date" value={createForm.start_date} onChange={(e) => setCreateForm((s) => ({ ...s, start_date: e.target.value }))} />
             </label>
             <label>
-              End Date
+              Дата окончания
               <input type="date" value={createForm.end_date} onChange={(e) => setCreateForm((s) => ({ ...s, end_date: e.target.value }))} />
             </label>
           </div>
           <label style={{ display: "block", marginTop: 10 }}>
-            Note
+            Заметка
             <textarea value={createForm.note} onChange={(e) => setCreateForm((s) => ({ ...s, note: e.target.value }))} rows={3} style={{ width: "100%" }} />
           </label>
           {createForm.scope === "account" && createForm.client_id && accountsForClient.length === 0 ? (
             <div className="muted-note" style={{ marginTop: 8 }}>
-              No active ad accounts for selected client.
+              У выбранного клиента нет активных рекламных аккаунтов.
             </div>
           ) : null}
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Cancel</button>
+            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Отмена</button>
             <button className="primary-btn" disabled={!canCreate || createLoading || createCapBlocksSubmit} onClick={() => void createBudget()}>
-              {createLoading ? "Creating..." : "Create Budget"}
+              {createLoading ? "Создаём…" : "Создать бюджет"}
             </button>
           </div>
         </div>
@@ -1257,26 +1265,26 @@ export default function BudgetsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>Transfer Budget</h3>
-              <div className="panel-subtitle">Move amount from selected source account budget to another account.</div>
+              <h3 style={{ margin: 0 }}>Перевод бюджета</h3>
+              <div className="panel-subtitle">Перенесите часть бюджета с выбранного аккаунта на другой.</div>
             </div>
-            <button className="ghost-btn" onClick={() => setTransferOpen(false)} disabled={transferLoading}>Close</button>
+            <button className="ghost-btn" onClick={() => setTransferOpen(false)} disabled={transferLoading}>Закрыть</button>
           </div>
 
           <div className={`warning ${transferError ? "" : "hidden"}`} style={{ marginTop: 10 }}>{transferError}</div>
           <div className="detail-grid" style={{ marginTop: 10 }}>
             <div className="detail-item">
-              <div className="detail-k">Source Budget</div>
+              <div className="detail-k">Исходный бюджет</div>
               <div className="detail-v">{selected ? fmtMoney(Number(selected.amount || 0), selected.currency || "USD") : "--"}</div>
             </div>
             <div className="detail-item">
-              <div className="detail-k">Max Transfer</div>
+              <div className="detail-k">Можно перевести</div>
               <div className="detail-v">{selected ? fmtMoney(Number(selected.amount || 0), selected.currency || "USD") : "--"}</div>
             </div>
             <label>
-              Target Account
+              Аккаунт-получатель
               <select value={transferTargetAccountId} onChange={(e) => setTransferTargetAccountId(e.target.value)}>
-                <option value="">Select target account</option>
+                <option value="">Выберите аккаунт</option>
                 {transferAccountOptions.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.name} ({a.platform})
@@ -1285,7 +1293,7 @@ export default function BudgetsPage() {
               </select>
             </label>
             <label>
-              Amount
+              Сумма
               <input
                 type="number"
                 min="0.01"
@@ -1297,15 +1305,15 @@ export default function BudgetsPage() {
             </label>
           </div>
           <div className="budgets-transfer-preview">
-            <div className="detail-k">Transfer Preview</div>
+            <div className="detail-k">После перевода</div>
             <div className="budgets-transfer-row">
-              <span>Source</span>
+              <span>Источник</span>
               <strong>
                 {selected ? `${fmtMoney(transferPreview?.sourceBefore || 0, selected.currency || "USD")} -> ${fmtMoney(transferPreview?.sourceAfter || 0, selected.currency || "USD")}` : "--"}
               </strong>
             </div>
             <div className="budgets-transfer-row">
-              <span>Target</span>
+              <span>Получатель</span>
               <strong>
                 {selected ? `${fmtMoney(transferPreview?.targetBefore || 0, selected.currency || "USD")} -> ${fmtMoney(transferPreview?.targetAfter || 0, selected.currency || "USD")}` : "--"}
               </strong>
@@ -1314,17 +1322,17 @@ export default function BudgetsPage() {
               {transferPreview?.hasTarget
                 ? transferPreview?.validAmount
                   ? transferPreview?.validSource
-                    ? "Transfer is valid. Source/target projections shown above."
-                    : "Invalid: transfer amount exceeds source budget."
-                  : "Enter transfer amount greater than 0."
-                : "Select target account to preview transfer."}
+                    ? "Перевод доступен. Итоговые суммы показаны выше."
+                    : "Сумма перевода превышает исходный бюджет."
+                  : "Введите сумму больше нуля."
+                : "Выберите аккаунт-получатель, чтобы увидеть расчёт."}
             </div>
           </div>
 
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-            <button className="ghost-btn" onClick={() => setTransferOpen(false)} disabled={transferLoading}>Cancel</button>
+            <button className="ghost-btn" onClick={() => setTransferOpen(false)} disabled={transferLoading}>Отмена</button>
             <button className="primary-btn" onClick={() => void submitTransfer()} disabled={!canSubmitTransfer}>
-              {transferLoading ? "Transferring..." : "Transfer"}
+              {transferLoading ? "Переводим…" : "Перевести"}
             </button>
           </div>
         </div>

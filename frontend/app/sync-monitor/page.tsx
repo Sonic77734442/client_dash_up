@@ -814,7 +814,7 @@ export default function SyncMonitorPage() {
                   title="Можно оставить аккаунты без клиента и распределить позже"
                 >
                   <option value="">Назначить позже</option>
-                  {clients.map((c) => (
+                  {clients.filter((c) => c.status === "active").map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
                     </option>

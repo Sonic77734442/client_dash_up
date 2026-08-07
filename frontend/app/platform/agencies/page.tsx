@@ -48,9 +48,31 @@ function fmtDate(v?: string | null) {
 }
 
 function agencyRoleLabel(v: "owner" | "manager" | "member") {
-  if (v === "owner") return "agency_admin";
-  if (v === "manager") return "agency_manager";
-  return "agency_member";
+  if (v === "owner") return "Владелец";
+  if (v === "manager") return "Менеджер";
+  return "Участник";
+}
+
+function agencyStatusLabel(v: string) {
+  return v === "active" ? "Активно" : v === "suspended" ? "Приостановлено" : v;
+}
+
+function memberStatusLabel(v: string) {
+  return v === "active" ? "активен" : v === "inactive" ? "неактивен" : v;
+}
+
+function inviteStatusLabel(v: string) {
+  if (v === "pending") return "ожидает";
+  if (v === "accepted") return "принято";
+  if (v === "expired") return "истекло";
+  if (v === "revoked") return "отозвано";
+  return v;
+}
+
+function userRoleLabel(v: UserItem["role"]) {
+  if (v === "admin") return "Администратор";
+  if (v === "agency") return "Агентство";
+  return "Клиент";
 }
 
 export default function PlatformAgenciesPage() {
@@ -140,7 +162,7 @@ export default function PlatformAgenciesPage() {
   useEffect(() => {
     if (!ready) return;
     void reloadAll().catch((err) => {
-      setWarning(err instanceof Error ? err.message : "Failed to load platform admin data");
+      setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные управления платформой");
     });
   }, [ready, reloadAll]);
 
@@ -151,7 +173,7 @@ export default function PlatformAgenciesPage() {
       return;
     }
     void loadAgencyDetails(selectedAgencyId).catch((err) => {
-      setWarning(err instanceof Error ? err.message : "Failed to load agency details");
+      setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные агентства");
     });
   }, [selectedAgencyId, loadAgencyDetails]);
 
@@ -178,7 +200,7 @@ export default function PlatformAgenciesPage() {
 
   async function createAgency() {
     if (!createName.trim()) {
-      push("Agency name is required", "error");
+      push("Укажите название агентства", "error");
       return;
     }
     try {
@@ -200,9 +222,9 @@ export default function PlatformAgenciesPage() {
       setCreateAllowClientInvites(true);
       await loadAgencies();
       setSelectedAgencyId(created.id);
-      push("Agency created", "success");
+      push("Агентство создано", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Create agency failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось создать агентство", "error");
     } finally {
       setCreateLoading(false);
     }
@@ -216,9 +238,9 @@ export default function PlatformAgenciesPage() {
         body: JSON.stringify({ status }),
       });
       await loadAgencies();
-      push(`Agency ${status}`, "success");
+      push(`Статус агентства: ${agencyStatusLabel(status)}`, "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Update agency failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось обновить агентство", "error");
     }
   }
 
@@ -230,15 +252,15 @@ export default function PlatformAgenciesPage() {
         body: JSON.stringify({ allow_client_invites: allow }),
       });
       await loadAgencies();
-      push(allow ? "Client invites enabled" : "Client invites disabled", "success");
+      push(allow ? "Приглашения клиентов включены" : "Приглашения клиентов отключены", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Update agency failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось обновить агентство", "error");
     }
   }
 
   async function deleteAgency() {
     if (!selectedAgency) return;
-    if (!window.confirm(`Delete agency ${selectedAgency.name}? Members will be detached, not deleted.`)) return;
+    if (!window.confirm(`Удалить агентство ${selectedAgency.name}? Участники будут отвязаны, но не удалены.`)) return;
     try {
       await req<{ status: string }>(`/platform/agencies/${selectedAgency.id}`, {
         method: "DELETE",
@@ -246,9 +268,9 @@ export default function PlatformAgenciesPage() {
       await loadAgencies();
       setMembers([]);
       setInvites([]);
-      push("Agency deleted", "success");
+      push("Агентство удалено", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Delete agency failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось удалить агентство", "error");
     }
   }
 
@@ -260,15 +282,15 @@ export default function PlatformAgenciesPage() {
         body: JSON.stringify({ user_id: memberUserId, role: memberRole, status: memberStatus }),
       });
       await loadAgencyDetails(selectedAgency.id);
-      push("Member updated", "success");
+      push("Участник обновлён", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Member update failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось обновить участника", "error");
     }
   }
 
   async function issueInvite() {
     if (!selectedAgency || !inviteEmail.trim()) {
-      push("Invite email is required", "error");
+      push("Укажите email для приглашения", "error");
       return;
     }
     try {
@@ -283,9 +305,9 @@ export default function PlatformAgenciesPage() {
       setLastInviteUrl(issued.accept_url);
       await loadAgencyDetails(selectedAgency.id);
       setInviteEmail("");
-      push("Invite issued", "success");
+      push("Приглашение создано", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Issue invite failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось создать приглашение", "error");
     }
   }
 
@@ -293,9 +315,9 @@ export default function PlatformAgenciesPage() {
     if (!lastInviteUrl) return;
     try {
       await navigator.clipboard.writeText(lastInviteUrl);
-      push("Invite link copied", "success");
+      push("Ссылка приглашения скопирована", "success");
     } catch {
-      push("Copy failed", "error");
+      push("Не удалось скопировать ссылку", "error");
     }
   }
 
@@ -306,9 +328,9 @@ export default function PlatformAgenciesPage() {
         method: "POST",
       });
       await loadAgencyDetails(selectedAgency.id);
-      push("Member deactivated", "success");
+      push("Участник отключён", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Deactivate failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось отключить участника", "error");
     }
   }
 
@@ -319,9 +341,9 @@ export default function PlatformAgenciesPage() {
         method: "DELETE",
       });
       await loadAgencyDetails(selectedAgency.id);
-      push("Member removed", "success");
+      push("Участник удалён из агентства", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Remove failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось удалить участника", "error");
     }
   }
 
@@ -332,9 +354,9 @@ export default function PlatformAgenciesPage() {
         method: "POST",
       });
       await loadAgencyDetails(selectedAgency.id);
-      push("Invite revoked", "success");
+      push("Приглашение отозвано", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Revoke invite failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось отозвать приглашение", "error");
     }
   }
 
@@ -347,9 +369,9 @@ export default function PlatformAgenciesPage() {
       });
       setLastInviteUrl(issued.accept_url);
       await loadAgencyDetails(selectedAgency.id);
-      push("Invite resent", "success");
+      push("Приглашение отправлено повторно", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Resend invite failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось отправить приглашение повторно", "error");
     }
   }
 
@@ -357,7 +379,7 @@ export default function PlatformAgenciesPage() {
     const user = usersById.get(userId);
     if (!selectedAgency || !user) return;
     if (user.role !== "agency") {
-      push("Select an agency user to open agency workspace", "error");
+      push("Выберите пользователя агентства, чтобы открыть его рабочее пространство", "error");
       return;
     }
     try {
@@ -373,7 +395,7 @@ export default function PlatformAgenciesPage() {
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       router.push("/");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Open agency workspace failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось открыть рабочее пространство агентства", "error");
     }
   }
 
@@ -392,31 +414,31 @@ export default function PlatformAgenciesPage() {
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="platform_admin" subtitle="Internal Admin" />
+        <AppSidebar active="platform_admin" subtitle="Управление платформой" />
 
         <main className="content">
           <header className="topbar">
             <div className="topbar-left">
               <AppTopTabs active="platform_admin" />
-              <div className="topbar-title">Platform Admin: Agencies</div>
-              <div className="panel-subtitle">Provision agencies, attach members, and grant tenant access.</div>
+              <div className="topbar-title">Управление агентствами</div>
+              <div className="panel-subtitle">Создавайте агентства, добавляйте участников и управляйте доступом.</div>
             </div>
             <div className="session-controls">
-              <a className="ghost-btn" href="/platform/users">Users</a>
-              <a className="ghost-btn" href="/platform/alerts">Alerts</a>
+              <a className="ghost-btn" href="/platform/users">Пользователи</a>
+              <a className="ghost-btn" href="/platform/alerts">Инциденты</a>
               {tokenLoginEnabled ? (
                 <>
                   <input
                     type="text"
                     value={session.apiBase}
                     onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))}
-                    placeholder="API base"
+                    placeholder="Адрес API"
                   />
                   <input
                     type="password"
                     value={session.token}
                     onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))}
-                    placeholder="Session token"
+                    placeholder="Токен сессии"
                   />
                   <button
                     className="ghost-btn"
@@ -426,45 +448,45 @@ export default function PlatformAgenciesPage() {
                       setSession(next);
                       try {
                         await reloadAll();
-                        push("Session saved", "success");
+                        push("Сессия сохранена", "success");
                       } catch (err) {
-                        setWarning(err instanceof Error ? err.message : "Load failed");
+                        setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные");
                       }
                     }}
                     disabled={!ready}
                   >
-                    Save
+                    Сохранить
                   </button>
                 </>
               ) : null}
-              <button className="primary-btn" onClick={() => setCreateOpen(true)} disabled={adminOnly === true}>Create Agency</button>
+              <button className="primary-btn" onClick={() => setCreateOpen(true)} disabled={adminOnly === true}>Создать агентство</button>
             </div>
           </header>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
-          {adminOnly ? <div className="warning" style={{ marginTop: 10 }}>This screen is internal/admin-only.</div> : null}
+          {adminOnly ? <div className="warning" style={{ marginTop: 10 }}>Этот раздел доступен только администраторам.</div> : null}
 
           <section className="agency-flow" style={{ marginTop: 12 }}>
-            <div className="agency-flow-step">1. Select agency</div>
-            <div className="agency-flow-step">2. Add member and role</div>
-            <div className="agency-flow-step">3. Invite agency user</div>
+            <div className="agency-flow-step">1. Выберите агентство</div>
+            <div className="agency-flow-step">2. Добавьте участника и роль</div>
+            <div className="agency-flow-step">3. Пригласите пользователя агентства</div>
           </section>
 
           <section className="agency-stats" style={{ marginTop: 12 }}>
             <article className="agency-stat-card">
-              <div className="agency-stat-label">Agencies</div>
+              <div className="agency-stat-label">Агентства</div>
               <div className="agency-stat-value">{kpis.total}</div>
             </article>
             <article className="agency-stat-card good">
-              <div className="agency-stat-label">Active</div>
+              <div className="agency-stat-label">Активные</div>
               <div className="agency-stat-value">{kpis.active}</div>
             </article>
             <article className="agency-stat-card bad">
-              <div className="agency-stat-label">Suspended</div>
+              <div className="agency-stat-label">Приостановленные</div>
               <div className="agency-stat-value">{kpis.suspended}</div>
             </article>
             <article className="agency-stat-card">
-              <div className="agency-stat-label">Members</div>
+              <div className="agency-stat-label">Участники</div>
               <div className="agency-stat-value">{kpis.totalMembers}</div>
             </article>
           </section>
@@ -473,10 +495,10 @@ export default function PlatformAgenciesPage() {
             <article className="panel agencies-main">
               <div className="panel-head budgets-toolbar">
                 <div>
-                  <h3>Agencies Registry</h3>
-                  <div className="panel-subtitle">Select an agency to open details and manage access.</div>
+                  <h3>Список агентств</h3>
+                  <div className="panel-subtitle">Выберите агентство, чтобы посмотреть детали и настроить доступ.</div>
                 </div>
-                <button className="ghost-btn" onClick={() => void loadAgencies()} disabled={adminOnly === true}>Refresh</button>
+                <button className="ghost-btn" onClick={() => void loadAgencies()} disabled={adminOnly === true}>Обновить</button>
               </div>
               <div className="agencies-cards">
                 {agencies.map((agency) => {
@@ -485,77 +507,77 @@ export default function PlatformAgenciesPage() {
                     <button key={agency.id} className={`agency-card ${active ? "active" : ""}`} onClick={() => setSelectedAgencyId(agency.id)}>
                       <div className="agency-card-head">
                         <div className="agency-name">{agency.name}</div>
-                        <span className={`badge ${agency.status === "active" ? "good" : "bad"}`}>{agency.status}</span>
+                        <span className={`badge ${agency.status === "active" ? "good" : "bad"}`}>{agencyStatusLabel(agency.status)}</span>
                       </div>
                       <div className="agency-meta">
-                        <span>Slug: {agency.slug}</span>
-                        <span>Plan: {agency.plan}</span>
+                        <span>Адрес: {agency.slug}</span>
+                        <span>Тариф: {agency.plan}</span>
                       </div>
                       <div className="agency-meta">
-                        <span>Client invites: {agency.allow_client_invites ? "enabled" : "disabled"}</span>
+                        <span>Приглашения клиентов: {agency.allow_client_invites ? "включены" : "отключены"}</span>
                       </div>
-                      <div className="agency-meta muted">Updated: {fmtDate(agency.updated_at)}</div>
+                      <div className="agency-meta muted">Обновлено: {fmtDate(agency.updated_at)}</div>
                     </button>
                   );
                 })}
-                {agencies.length === 0 ? <div className="muted">No agencies yet.</div> : null}
+                {agencies.length === 0 ? <div className="muted">Агентств пока нет.</div> : null}
               </div>
             </article>
 
             <aside className="panel agencies-drawer">
               <div className="panel-head">
                 <div>
-                  <h3>{selectedAgency ? selectedAgency.name : "Agency Details"}</h3>
-                  <div className="panel-subtitle">{selectedAgency ? `${selectedAgency.slug} · ${selectedAgency.plan}` : "Select agency from left list"}</div>
+                  <h3>{selectedAgency ? selectedAgency.name : "Данные агентства"}</h3>
+                  <div className="panel-subtitle">{selectedAgency ? `${selectedAgency.slug} · ${selectedAgency.plan}` : "Выберите агентство в списке слева"}</div>
                 </div>
                 <div className="session-controls">
-                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canActivate} onClick={() => void setAgencyStatus("active")}>Activate</button>
-                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canSuspend} onClick={() => void setAgencyStatus("suspended")}>Suspend</button>
+                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canActivate} onClick={() => void setAgencyStatus("active")}>Активировать</button>
+                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true || !canSuspend} onClick={() => void setAgencyStatus("suspended")}>Приостановить</button>
                   <button
                     className="mini-btn"
                     disabled={!selectedAgency || adminOnly === true}
                     onClick={() => void setClientInvitesAllowed(!selectedAgency?.allow_client_invites)}
                   >
-                    {selectedAgency?.allow_client_invites ? "Disable Client Invites" : "Enable Client Invites"}
+                    {selectedAgency?.allow_client_invites ? "Отключить приглашения клиентов" : "Включить приглашения клиентов"}
                   </button>
-                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true} onClick={() => void deleteAgency()}>Delete</button>
+                  <button className="mini-btn" disabled={!selectedAgency || adminOnly === true} onClick={() => void deleteAgency()}>Удалить</button>
                 </div>
               </div>
 
               <section className="drawer-kpis">
                 <article className="kpi-card">
-                  <div className="kpi-title">Members</div>
+                  <div className="kpi-title">Участники</div>
                   <div className="kpi-value">{selectedStats.totalMembers}</div>
                 </article>
                 <article className="kpi-card good">
-                  <div className="kpi-title">Active Members</div>
+                  <div className="kpi-title">Активные участники</div>
                   <div className="kpi-value">{selectedStats.activeMembers}</div>
                 </article>
               </section>
 
               <div className="panel drawer-section">
-                <h3>Step 2: Add Member</h3>
-                <div className="panel-subtitle">User from `agency/admin` roles, plus access role inside agency.</div>
+                <h3>Шаг 2. Добавьте участника</h3>
+                <div className="panel-subtitle">Выберите пользователя платформы и назначьте его роль внутри агентства.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)}>
-                    <option value="">Select user</option>
+                    <option value="">Выберите пользователя</option>
                     {users.map((u) => (
-                      <option key={u.id} value={u.id}>{u.name} ({u.role})</option>
+                      <option key={u.id} value={u.id}>{u.name} ({userRoleLabel(u.role)})</option>
                     ))}
                   </select>
                   <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as "owner" | "manager" | "member")}>
-                    <option value="owner">agency_admin</option>
-                    <option value="manager">agency_manager</option>
-                    <option value="member">agency_member</option>
+                    <option value="owner">Владелец</option>
+                    <option value="manager">Менеджер</option>
+                    <option value="member">Участник</option>
                   </select>
                   <select value={memberStatus} onChange={(e) => setMemberStatus(e.target.value as "active" | "inactive")}>
-                    <option value="active">active</option>
-                    <option value="inactive">inactive</option>
+                    <option value="active">Активен</option>
+                    <option value="inactive">Неактивен</option>
                   </select>
                 </div>
                 <div className="alert-actions" style={{ marginTop: 8 }}>
                   <button className="primary-btn" disabled={!selectedAgency || !memberUserId || adminOnly === true} onClick={() => void upsertMember()}>
-                    Save Member
+                    Сохранить участника
                   </button>
                 </div>
                 <div className="drawer-list">
@@ -564,36 +586,36 @@ export default function PlatformAgenciesPage() {
                     return (
                       <div key={m.id} className="activity-item">
                         <div><strong>{user?.name || m.user_id.slice(0, 8)}</strong></div>
-                        <div className="muted">{agencyRoleLabel(m.role)} | {m.status} | {fmtDate(m.updated_at)}</div>
+                        <div className="muted">{agencyRoleLabel(m.role)} | {memberStatusLabel(m.status)} | {fmtDate(m.updated_at)}</div>
                         <div className="alert-actions" style={{ marginTop: 6 }}>
                           <button
                             className="mini-btn"
                             disabled={adminOnly === true || user?.role !== "agency" || m.status !== "active"}
                             onClick={() => void openAsAgencyUser(m.user_id)}
                           >
-                            Open As
+                            Войти от имени
                           </button>
                           <button
                             className="mini-btn"
                             disabled={!canManageMembers || m.status !== "active"}
                             onClick={() => void deactivateMember(m.id)}
                           >
-                            Deactivate
+                            Отключить
                           </button>
                           <button className="mini-btn" disabled={!canManageMembers} onClick={() => void removeMember(m.id)}>
-                            Remove
+                            Удалить
                           </button>
                         </div>
                       </div>
                     );
                   })}
-                  {members.length === 0 ? <div className="muted">No members yet.</div> : null}
+                  {members.length === 0 ? <div className="muted">Участников пока нет.</div> : null}
                 </div>
               </div>
 
               <div className="panel drawer-section">
-                <h3>Step 3: Invite Agency User</h3>
-                <div className="panel-subtitle">Issue one-time invite link. User accepts invite on login page.</div>
+                <h3>Шаг 3. Пригласите пользователя агентства</h3>
+                <div className="panel-subtitle">Создайте одноразовую ссылку: пользователь примет приглашение на странице входа.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <input
                     type="email"
@@ -604,15 +626,15 @@ export default function PlatformAgenciesPage() {
                 </div>
                 <div className="alert-actions" style={{ marginTop: 8 }}>
                   <button className="primary-btn" disabled={!selectedAgency || !inviteEmail || !canManageMembers} onClick={() => void issueInvite()}>
-                    Issue Invite
+                    Создать приглашение
                   </button>
                   <button className="ghost-btn" disabled={!lastInviteUrl} onClick={() => void copyInviteUrl()}>
-                    Copy Last Link
+                    Скопировать последнюю ссылку
                   </button>
                 </div>
                 {lastInviteUrl ? (
                   <div className="muted" style={{ marginTop: 8, wordBreak: "break-all" }}>
-                    Last invite: {lastInviteUrl}
+                    Последнее приглашение: {lastInviteUrl}
                   </div>
                 ) : null}
                 <div className="drawer-list">
@@ -620,7 +642,7 @@ export default function PlatformAgenciesPage() {
                     <div key={inv.id} className="activity-item">
                       <div><strong>{inv.email}</strong></div>
                       <div className="muted">
-                        {agencyRoleLabel(inv.member_role)} | {inv.status} | exp {fmtDate(inv.expires_at)}
+                        {agencyRoleLabel(inv.member_role)} | {inviteStatusLabel(inv.status)} | действует до {fmtDate(inv.expires_at)}
                       </div>
                       <div className="alert-actions" style={{ marginTop: 6 }}>
                         <button
@@ -628,19 +650,19 @@ export default function PlatformAgenciesPage() {
                           disabled={!canManageMembers || inv.status === "accepted"}
                           onClick={() => void resendInvite(inv.id)}
                         >
-                          Resend
+                          Отправить повторно
                         </button>
                         <button
                           className="mini-btn"
                           disabled={!canManageMembers || inv.status === "accepted" || inv.status === "expired"}
                           onClick={() => void revokeInvite(inv.id)}
                         >
-                          Revoke
+                          Отозвать
                         </button>
                       </div>
                     </div>
                   ))}
-                  {invites.length === 0 ? <div className="muted">No invites yet.</div> : null}
+                  {invites.length === 0 ? <div className="muted">Приглашений пока нет.</div> : null}
                 </div>
               </div>
             </aside>
@@ -652,39 +674,39 @@ export default function PlatformAgenciesPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3>Create Agency</h3>
-              <div className="panel-subtitle">Internal provisioning object for agency access management.</div>
+              <h3>Новое агентство</h3>
+              <div className="panel-subtitle">Создайте пространство агентства и настройте доступ.</div>
             </div>
-            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Close</button>
+            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Закрыть</button>
           </div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label>
-              Name
-              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="North Star Agency" />
+              Название
+              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Название агентства" />
             </label>
             <label>
-              Slug (optional)
+              Короткий адрес (необязательно)
               <input value={createSlug} onChange={(e) => setCreateSlug(e.target.value)} placeholder="north-star" />
             </label>
             <label>
-              Plan
+              Тариф
               <input value={createPlan} onChange={(e) => setCreatePlan(e.target.value)} placeholder="starter" />
             </label>
             <label>
-              Client Portal Invites
+              Приглашения в кабинет клиента
               <select
                 value={createAllowClientInvites ? "enabled" : "disabled"}
                 onChange={(e) => setCreateAllowClientInvites(e.target.value === "enabled")}
               >
-                <option value="enabled">enabled</option>
-                <option value="disabled">disabled</option>
+                <option value="enabled">Включены</option>
+                <option value="disabled">Отключены</option>
               </select>
             </label>
           </div>
           <div className="modal-actions" style={{ marginTop: 12 }}>
-            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Cancel</button>
+            <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Отмена</button>
             <button className="primary-btn" onClick={() => void createAgency()} disabled={createLoading || !createName.trim()}>
-              {createLoading ? "Creating..." : "Create"}
+              {createLoading ? "Создаём…" : "Создать"}
             </button>
           </div>
         </div>

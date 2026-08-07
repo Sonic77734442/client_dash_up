@@ -27,8 +27,9 @@ function fmtDate(v?: string) {
 }
 
 function roleLabel(role: "admin" | "agency" | "client") {
-  if (role === "client") return "solo_client";
-  return role;
+  if (role === "admin") return "Администратор";
+  if (role === "agency") return "Агентство";
+  return "Клиент";
 }
 
 export default function PlatformUsersPage() {
@@ -60,12 +61,12 @@ export default function PlatformUsersPage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadUsers().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load users"));
+    void loadUsers().catch((err) => setWarning(err instanceof Error ? err.message : "Не удалось загрузить пользователей"));
   }, [ready, loadUsers]);
 
   async function createUser() {
     if (!createName.trim()) {
-      push("Name is required", "error");
+      push("Укажите имя", "error");
       return;
     }
     try {
@@ -83,9 +84,9 @@ export default function PlatformUsersPage() {
       setCreateRole("client");
       setCreateStatus("active");
       await loadUsers();
-      push("User created", "success");
+      push("Пользователь создан", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Create user failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось создать пользователя", "error");
     }
   }
 
@@ -96,23 +97,23 @@ export default function PlatformUsersPage() {
         body: JSON.stringify(patch),
       });
       await loadUsers();
-      push("User updated", "success");
+      push("Пользователь обновлён", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "User update failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось обновить пользователя", "error");
     }
   }
 
   async function deleteUser(user: UserItem) {
     const label = user.email || user.name || user.id;
-    if (!window.confirm(`Delete user ${label}? This is permanent.`)) return;
+    if (!window.confirm(`Удалить пользователя ${label}? Это действие нельзя отменить.`)) return;
     try {
       await req<{ status: string }>(`/auth/internal/users/${user.id}`, {
         method: "DELETE",
       });
       await loadUsers();
-      push("User deleted", "success");
+      push("Пользователь удалён", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "User delete failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось удалить пользователя", "error");
     }
   }
 
@@ -125,21 +126,21 @@ export default function PlatformUsersPage() {
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="platform_admin" subtitle="Platform Administration" />
+        <AppSidebar active="platform_admin" subtitle="Управление платформой" />
 
         <main className="content">
           <header className="topbar">
             <div className="topbar-left">
               <AppTopTabs active="platform_admin" />
-              <div className="topbar-title">Platform Users</div>
+              <div className="topbar-title">Пользователи платформы</div>
             </div>
             <div className="session-controls">
-              <a className="ghost-btn" href="/platform/agencies">Go To Agencies</a>
-              <a className="ghost-btn" href="/platform/alerts">Go To Alerts</a>
+              <a className="ghost-btn" href="/platform/agencies">Агентства</a>
+              <a className="ghost-btn" href="/platform/alerts">Инциденты</a>
               {tokenLoginEnabled ? (
                 <>
-                <input value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base" />
-                <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Session token" />
+                <input value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="Адрес API" />
+                <input type="password" value={session.token} onChange={(e) => setSession((s) => ({ ...s, token: e.target.value }))} placeholder="Токен сессии" />
                 <button
                   className="ghost-btn"
                   onClick={async () => {
@@ -147,10 +148,10 @@ export default function PlatformUsersPage() {
                     persist(next);
                     setSession(next);
                     await loadUsers();
-                    push("Session saved", "success");
+                    push("Сессия сохранена", "success");
                   }}
                 >
-                  Save
+                  Сохранить
                 </button>
                 </>
               ) : null}
@@ -162,41 +163,41 @@ export default function PlatformUsersPage() {
           <section className="panel" style={{ marginTop: 12 }}>
             <div className="panel-head">
               <div>
-                <h3 style={{ margin: 0 }}>Create User</h3>
-                <div className="panel-subtitle">Create platform user with global role.</div>
+                <h3 style={{ margin: 0 }}>Новый пользователь</h3>
+                <div className="panel-subtitle">Создайте пользователя и назначьте ему роль на платформе.</div>
               </div>
             </div>
             <div className="session-controls" style={{ marginTop: 10 }}>
-              <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)} placeholder="email@company.com (optional)" />
-              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Full name" />
+              <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)} placeholder="email@company.com (необязательно)" />
+              <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Имя и фамилия" />
               <select value={createRole} onChange={(e) => setCreateRole(e.target.value as "admin" | "agency" | "client")}>
-                <option value="client">solo_client</option>
-                <option value="agency">agency</option>
-                <option value="admin">admin</option>
+                <option value="client">Клиент</option>
+                <option value="agency">Агентство</option>
+                <option value="admin">Администратор</option>
               </select>
               <select value={createStatus} onChange={(e) => setCreateStatus(e.target.value as "active" | "inactive")}>
-                <option value="active">active</option>
-                <option value="inactive">inactive</option>
+                <option value="active">Активен</option>
+                <option value="inactive">Неактивен</option>
               </select>
-              <button className="primary-btn" onClick={() => void createUser()}>Create</button>
+              <button className="primary-btn" onClick={() => void createUser()}>Создать</button>
             </div>
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
             <div className="chip-row" style={{ marginTop: 0 }}>
-              <input className="clientops-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name/email/role/status" />
-              <button className="ghost-btn" onClick={() => void loadUsers()}>Refresh</button>
+              <input className="clientops-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Поиск по имени, email, роли или статусу" />
+              <button className="ghost-btn" onClick={() => void loadUsers()}>Обновить</button>
             </div>
             <div className="budgets-table-wrap" style={{ marginTop: 10 }}>
               <table className="budgets-table">
                 <thead>
                   <tr>
-                    <th>Name</th>
+                    <th>Имя</th>
                     <th>Email</th>
-                    <th>Role</th>
-                    <th>Status</th>
-                    <th>Updated</th>
-                    <th>Actions</th>
+                    <th>Роль</th>
+                    <th>Статус</th>
+                    <th>Обновлён</th>
+                    <th>Действия</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -213,8 +214,8 @@ export default function PlatformUsersPage() {
                       </td>
                       <td>
                         <select value={u.status} onChange={(e) => void patchUser(u.id, { status: e.target.value as UserItem["status"] })}>
-                          <option value="active">active</option>
-                          <option value="inactive">inactive</option>
+                          <option value="active">Активен</option>
+                          <option value="inactive">Неактивен</option>
                         </select>
                       </td>
                       <td>{fmtDate(u.updated_at || u.created_at)}</td>
@@ -224,14 +225,14 @@ export default function PlatformUsersPage() {
                             className="mini-btn"
                             onClick={() => void patchUser(u.id, { status: u.status === "active" ? "inactive" : "active" })}
                           >
-                            {u.status === "active" ? "Deactivate" : "Activate"}
+                            {u.status === "active" ? "Отключить" : "Активировать"}
                           </button>
                           <button
                             className="mini-btn"
                             disabled={u.id === currentUserId}
                             onClick={() => void deleteUser(u)}
                           >
-                            Delete
+                            Удалить
                           </button>
                         </div>
                       </td>
@@ -239,7 +240,7 @@ export default function PlatformUsersPage() {
                   ))}
                   {!filtered.length ? (
                     <tr>
-                      <td colSpan={6} className="muted-note">No users.</td>
+                      <td colSpan={6} className="muted-note">Пользователи не найдены.</td>
                     </tr>
                   ) : null}
                 </tbody>

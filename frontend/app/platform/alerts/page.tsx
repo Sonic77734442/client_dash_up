@@ -88,7 +88,7 @@ export default function PlatformAlertsPage() {
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="platform_admin" subtitle="Platform Administration" />
+        <AppSidebar active="platform_admin" subtitle="Управление платформой" />
         <main className="content">
           <header className="topbar">
             <div className="topbar-left">
