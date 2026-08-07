@@ -206,6 +206,26 @@ test("client and agency sessions cannot cross workspace boundaries", async ({ br
   await agencyContext.close();
 });
 
+test("temporary auth outage keeps the requested page instead of logging the user out", async ({ page }) => {
+  await page.route("**/api/backend/auth/me", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "temporarily_unavailable", message: "Backend is restarting" },
+      }),
+    });
+  });
+
+  await page.goto("/accounts");
+
+  await expect(page).toHaveURL(/\/accounts$/);
+  await expect(page.getByRole("heading", { name: "Платформа обновляется" })).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByRole("button", { name: "Повторить проверку" })).toBeVisible();
+});
+
 test("admin settings renders provider config envelopes without crashing", async ({ page, context, request }) => {
   const token = await createAdminSession(request);
   await attachSession(page, context, token);

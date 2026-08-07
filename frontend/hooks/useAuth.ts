@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { AuthMeResponse } from "../lib/types";
-import { fetchJson } from "../lib/api";
+import { ApiRequestError, fetchJson } from "../lib/api";
 import { resolveApiBase } from "../lib/apiBase";
 import { isAppRole } from "../lib/authRedirect";
 import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
@@ -14,24 +14,45 @@ export function useAuth(defaultApiBase: string) {
   const [authenticated, setAuthenticated] = useState(false);
   const [role, setRole] = useState<"admin" | "agency" | "client" | null>(null);
   const [me, setMe] = useState<AuthMeResponse | null>(null);
+  const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
     const apiBase = resolveApiBase(defaultApiBase);
     const token = getSessionToken();
+    setReady(false);
+    setError("");
 
-    try {
-      const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
-      const nextRole = isAppRole(body.session.role) ? body.session.role : null;
-      setMe(body);
-      setRole(nextRole);
-      setAuthenticated(Boolean(body.session.valid && nextRole));
-      setReady(true);
-    } catch {
-      setAuthenticated(false);
-      setRole(null);
-      setMe(null);
-      setReady(true);
+    const retryDelays = [0, 500, 1_500];
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+      if (retryDelays[attempt]) {
+        await new Promise((resolve) => window.setTimeout(resolve, retryDelays[attempt]));
+      }
+      try {
+        const body = await fetchJson<AuthMeResponse>(apiBase, "/auth/me", token);
+        const nextRole = isAppRole(body.session.role) ? body.session.role : null;
+        setMe(body);
+        setRole(nextRole);
+        setAuthenticated(Boolean(body.session.valid && nextRole));
+        setError("");
+        setReady(true);
+        return;
+      } catch (err) {
+        if (err instanceof ApiRequestError && err.status === 401) {
+          setAuthenticated(false);
+          setRole(null);
+          setMe(null);
+          setError("");
+          setReady(true);
+          return;
+        }
+        lastError = err;
+      }
     }
+
+    const message = lastError instanceof Error ? lastError.message : "Сервис временно недоступен";
+    setError(message);
+    setReady(true);
   }, [defaultApiBase]);
 
   const logout = useCallback(async () => {
@@ -48,6 +69,7 @@ export function useAuth(defaultApiBase: string) {
     setAuthenticated(false);
     setRole(null);
     setMe(null);
+    setError("");
   }, [defaultApiBase]);
 
   useEffect(() => {
@@ -62,5 +84,5 @@ export function useAuth(defaultApiBase: string) {
     };
   }, [refresh]);
 
-  return { ready, authenticated, role, me, refresh, logout };
+  return { ready, authenticated, role, me, error, refresh, logout };
 }
