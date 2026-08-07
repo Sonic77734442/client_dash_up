@@ -104,6 +104,7 @@ export default function AccountsPage() {
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
+  const [dataLoading, setDataLoading] = useState(true);
   const [accounts, setAccounts] = useState<AdAccount[]>([]);
   const [clients, setClients] = useState<ClientOut[]>([]);
   const [syncJobs, setSyncJobs] = useState<AdAccountSyncJob[]>([]);
@@ -190,13 +191,24 @@ export default function AccountsPage() {
   ]);
 
   useEffect(() => {
-    if (!ready || agencyContext.loading) return;
-    void loadData().catch((err) =>
-      setWarning(err instanceof Error ? err.message : "Не удалось загрузить рекламные аккаунты")
-    );
+    let active = true;
+    if (!ready || agencyContext.loading) {
+      setDataLoading(true);
+      return () => { active = false; };
+    }
+    setDataLoading(true);
+    void loadData()
+      .catch((err) => {
+        if (active) setWarning(err instanceof Error ? err.message : "Не удалось загрузить рекламные аккаунты");
+      })
+      .finally(() => {
+        if (active) setDataLoading(false);
+      });
+    return () => { active = false; };
   }, [agencyContext.loading, ready, loadData]);
 
   useEffect(() => {
+    setDataLoading(true);
     setAccounts([]);
     setClients([]);
     setSyncJobs([]);
@@ -575,15 +587,15 @@ export default function AccountsPage() {
           <DataSourcesNav active="accounts" />
 
           <section className="kpi-grid" style={{ marginTop: 12 }}>
-            <article className="kpi-card"><div className="kpi-title">Всего в реестре</div><div className="kpi-value">{kpis.total}</div><div className="kpi-meta">Все статусы: активные, неактивные и архивные</div></article>
-            <article className="kpi-card good"><div className="kpi-title">Привязаны к клиентам</div><div className="kpi-value">{kpis.mapped}</div></article>
-            <article className="kpi-card warn"><div className="kpi-title">Без клиента</div><div className="kpi-value">{kpis.unmapped}</div></article>
-            <article className={`kpi-card ${kpis.dataIssues ? "bad" : "good"}`}><div className="kpi-title">Проблемы данных</div><div className="kpi-value">{kpis.dataIssues}</div><div className="kpi-meta">Ошибки, устаревшие или ещё не загруженные данные</div></article>
-            <article className={`kpi-card ${kpis.conflicted ? "bad" : "good"}`}>
+            <article className="kpi-card"><div className="kpi-title">Всего в реестре</div><div className="kpi-value">{dataLoading ? "—" : kpis.total}</div><div className="kpi-meta">Все статусы: активные, неактивные и архивные</div></article>
+            <article className="kpi-card good"><div className="kpi-title">Привязаны к клиентам</div><div className="kpi-value">{dataLoading ? "—" : kpis.mapped}</div></article>
+            <article className="kpi-card warn"><div className="kpi-title">Без клиента</div><div className="kpi-value">{dataLoading ? "—" : kpis.unmapped}</div></article>
+            <article className={`kpi-card ${dataLoading ? "" : kpis.dataIssues ? "bad" : "good"}`}><div className="kpi-title">Проблемы данных</div><div className="kpi-value">{dataLoading ? "—" : kpis.dataIssues}</div><div className="kpi-meta">Ошибки, устаревшие или ещё не загруженные данные</div></article>
+            <article className={`kpi-card ${dataLoading ? "" : kpis.conflicted ? "bad" : "good"}`}>
               <div className="kpi-title">Конфликты привязки</div>
-              <div className="kpi-value">{kpis.conflicted}</div>
+              <div className="kpi-value">{dataLoading ? "—" : kpis.conflicted}</div>
               <div className="kpi-meta">Эти аккаунты исключены из обновления и отчётов до выбора правильного клиента</div>
-              {kpis.conflicted ? (
+              {!dataLoading && kpis.conflicted ? (
                 <button
                   className="mini-btn"
                   style={{ marginTop: 10 }}
@@ -604,19 +616,26 @@ export default function AccountsPage() {
                   Один кабинет найден у нескольких клиентов. Пока владелец не выбран, его данные не обновляются и не попадают в отчёты.
                 </div>
               </div>
-              <span className={`badge ${conflicts.count ? "bad" : "good"}`}>
-                {conflicts.count ? `Нужно разобрать: ${conflicts.count}` : "Всё в порядке"}
+              <span className={`badge ${dataLoading ? "" : conflicts.count ? "bad" : "good"}`}>
+                {dataLoading ? "Загружаем…" : conflicts.count ? `Нужно разобрать: ${conflicts.count}` : "Всё в порядке"}
               </span>
             </div>
 
-            {!canManageConflicts && agencyContext.role === "agency" ? (
+            {dataLoading ? (
+              <div className="data-empty-state compact" role="status" style={{ marginTop: 12 }}>
+                <strong>Загружаем рекламные аккаунты</strong>
+                <span>Проверяем владельцев, последние обновления и возможные конфликты.</span>
+              </div>
+            ) : null}
+
+            {!dataLoading && !canManageConflicts && agencyContext.role === "agency" ? (
               <div className="data-empty-state compact" style={{ marginTop: 12 }}>
                 <strong>Нужны права владельца или менеджера агентства</strong>
                 <span>Участник команды может видеть данные, но не может менять владельца рекламного аккаунта.</span>
               </div>
             ) : null}
 
-            {canManageConflicts && conflicts.count === 0 ? (
+            {!dataLoading && canManageConflicts && conflicts.count === 0 ? (
               <div className="data-empty-state compact" style={{ marginTop: 12 }}>
                 <strong>Конфликтов владения нет</strong>
                 <span>Каждый рекламный аккаунт закреплён только за одним клиентом.</span>
@@ -848,7 +867,7 @@ export default function AccountsPage() {
                     {!rows.length ? (
                       <tr>
                         <td colSpan={7} className="muted-note">
-                          По выбранным фильтрам аккаунтов нет.
+                          {dataLoading ? "Загружаем рекламные аккаунты…" : "По выбранным фильтрам аккаунтов нет."}
                         </td>
                       </tr>
                     ) : null}
