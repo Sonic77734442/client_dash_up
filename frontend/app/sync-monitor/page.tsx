@@ -1,21 +1,30 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
 import { DataSourcesNav } from "../../components/DataSourcesNav";
 import { ToastHost } from "../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
+import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
+import { scopeIntegrationsOverview } from "../../lib/agencyScope";
+import {
+  DataFreshnessState,
+  dataFreshnessMeta,
+  diagnosticDataFreshness,
+  providerDataFreshness,
+  syncRunFeedback,
+} from "../../lib/dataFreshness";
 import {
   AdAccount,
   AdAccountDiscoverResponse,
-  AdAccountSyncDiagnostic,
   AdAccountSyncDiagnosticsResponse,
   AdAccountSyncJob,
   AdAccountSyncRunResponse,
-  AuthMeResponse,
   ClientOut,
   IntegrationConnection,
   IntegrationsOverview,
@@ -33,17 +42,12 @@ function statusClass(status: string) {
   return status === "success" ? "good" : "bad";
 }
 
-function syncStateClass(state: AdAccountSyncDiagnostic["sync_state"]) {
-  if (state === "healthy") return "good";
-  if (state === "retry_scheduled" || state === "never_synced") return "warn";
-  return "bad";
+function syncStateClass(state: DataFreshnessState) {
+  return dataFreshnessMeta(state).tone;
 }
 
-function syncStateLabel(state: AdAccountSyncDiagnostic["sync_state"]) {
-  if (state === "healthy") return "Работает";
-  if (state === "retry_scheduled") return "Повтор запланирован";
-  if (state === "never_synced") return "Ещё не обновлялся";
-  return "Ошибка";
+function syncStateLabel(state: DataFreshnessState) {
+  return dataFreshnessMeta(state).label;
 }
 
 function authStateLabel(state?: string | null) {
@@ -66,10 +70,8 @@ function providerLabel(v: string) {
   return v;
 }
 
-function providerStatusClass(status: IntegrationProvider["status"]) {
-  if (status === "healthy") return "good";
-  if (status === "warning") return "warn";
-  return "bad";
+function providerStatusClass(provider: IntegrationProvider) {
+  return dataFreshnessMeta(providerDataFreshness(provider)).tone;
 }
 
 function asSyncPlatform(provider: string): "meta" | "google" | "tiktok" | null {
@@ -185,6 +187,8 @@ export default function SyncMonitorPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -202,11 +206,11 @@ export default function SyncMonitorPage() {
   const [selectedId, setSelectedId] = useState("");
   const [syncLoading, setSyncLoading] = useState(false);
   const [discoverClientId, setDiscoverClientId] = useState("");
-  const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
   const [connectProviderName, setConnectProviderName] = useState<"google" | "facebook" | null>(null);
   const [connectMode, setConnectMode] = useState<"add" | "overwrite">("add");
   const [overwriteConnectionKey, setOverwriteConnectionKey] = useState("");
   const [historyProgress, setHistoryProgress] = useState("");
+  const currentRole = agencyContext.role || "unknown";
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -214,6 +218,22 @@ export default function SyncMonitorPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
+    if (
+      agencyContext.role === "agency"
+      && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
+    ) {
+      setJobs([]);
+      setAccounts([]);
+      setClients([]);
+      setConnections([]);
+      setDiagnostics(null);
+      throw new Error(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : agencyContext.portfolioError || agencyContext.error || "Для пользователя не найдено активное агентство.",
+      );
+    }
     const diagParams = new URLSearchParams({ status: "active", limit: "500" });
     if (discoverClientId) diagParams.set("client_id", discoverClientId);
     const [jobRows, accRows, clientRows, integrationsRows, diagnosticsRows, connectionsRows] = await Promise.all([
@@ -224,7 +244,7 @@ export default function SyncMonitorPage() {
       req<AdAccountSyncDiagnosticsResponse>(`/ad-accounts/sync/diagnostics?${diagParams.toString()}`),
       req<{ items: IntegrationConnection[] }>("/me/integration-connections?status=all"),
     ]);
-    const me = await req<AuthMeResponse>("/auth/me");
+    if (!isCurrentRequest()) return;
     if (
       !integrationsRows ||
       !integrationsRows.summary ||
@@ -240,21 +260,98 @@ export default function SyncMonitorPage() {
     ) {
       throw new Error("Диагностика: сервис вернул некорректные данные");
     }
-    setCurrentRole(me?.user?.role || "unknown");
-    setJobs(requireItems<AdAccountSyncJob>(jobRows, "История синхронизации"));
-    setAccounts(requireItems<AdAccount>(accRows, "Рекламные аккаунты"));
-    setClients(requireItems<ClientOut>(clientRows, "Клиенты"));
-    setIntegrations(integrationsRows);
-    setDiagnostics(diagnosticsRows);
-    setConnections(requireItems<IntegrationConnection>(connectionsRows, "Подключения"));
-  }, [req, discoverClientId]);
+    const allJobs = requireItems<AdAccountSyncJob>(jobRows, "История синхронизации");
+    const allAccounts = requireItems<AdAccount>(accRows, "Рекламные аккаунты");
+    const allClients = requireItems<ClientOut>(clientRows, "Клиенты");
+    const allConnections = requireItems<IntegrationConnection>(connectionsRows, "Подключения");
+    const allowedClientIds = agencyContext.role === "agency"
+      ? new Set(agencyContext.clientIds)
+      : null;
+    const visibleClients = allowedClientIds
+      ? allClients.filter((client) => allowedClientIds.has(client.id))
+      : allClients;
+    const visibleAccounts = allowedClientIds
+      ? allAccounts.filter((account) => allowedClientIds.has(account.client_id))
+      : allAccounts;
+    const visibleAccountIds = new Set(visibleAccounts.map((account) => account.id));
+    const visibleJobs = allowedClientIds
+      ? allJobs.filter((job) => visibleAccountIds.has(job.ad_account_id))
+      : allJobs;
+    const visibleDiagnosticItems = allowedClientIds
+      ? diagnosticsRows.items.filter((item) => allowedClientIds.has(item.client_id))
+      : diagnosticsRows.items;
+    const visibleDiagnostics: AdAccountSyncDiagnosticsResponse = allowedClientIds
+      ? {
+          summary: {
+            total_accounts: visibleDiagnosticItems.length,
+            healthy: visibleDiagnosticItems.filter((item) => item.sync_state === "healthy").length,
+            error: visibleDiagnosticItems.filter((item) => item.sync_state === "error").length,
+            retry_scheduled: visibleDiagnosticItems.filter((item) => item.sync_state === "retry_scheduled").length,
+            never_synced: visibleDiagnosticItems.filter((item) => item.sync_state === "never_synced").length,
+          },
+          items: visibleDiagnosticItems,
+        }
+      : diagnosticsRows;
+    const visibleConnections = allowedClientIds
+      ? allConnections.filter((connection) => (
+          (connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
+          || (connection.scope_type === "client" && !!connection.scope_id && allowedClientIds.has(connection.scope_id))
+        ))
+      : allConnections;
+
+    const scopedIntegrationData = allowedClientIds
+      ? scopeIntegrationsOverview(
+          integrationsRows,
+          allAccounts,
+          allConnections,
+          agencyContext.selectedAgencyId,
+          agencyContext.clientIds,
+        )
+      : null;
+    setJobs(visibleJobs);
+    setAccounts(visibleAccounts);
+    setClients(visibleClients);
+    setIntegrations(scopedIntegrationData?.overview || integrationsRows);
+    setDiagnostics(visibleDiagnostics);
+    setConnections(scopedIntegrationData?.connections || visibleConnections);
+    setWarning("");
+  }, [
+    agencyContext.clientIds,
+    agencyContext.error,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectedAgencyId,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+    discoverClientId,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    setDiscoverClientId("");
+    setSelectedId("");
+    setJobs([]);
+    setAccounts([]);
+    setClients([]);
+    setIntegrations(null);
+    setConnections([]);
+    setDiagnostics(null);
+    setLastRun(null);
+  }, [agencyContext.selectedAgencyId]);
+
+  useEffect(() => {
+    if (!ready || agencyContext.loading) return;
     void loadData().catch((err) =>
       setWarning(err instanceof Error ? err.message : "Не удалось загрузить состояние синхронизации")
     );
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
+
+  useEffect(() => {
+    if (discoverClientId && !clients.some((client) => client.id === discoverClientId)) {
+      setDiscoverClientId("");
+    }
+  }, [clients, discoverClientId]);
 
   useEffect(() => {
     if (!discoverClientId && clients.length === 1) {
@@ -302,6 +399,27 @@ export default function SyncMonitorPage() {
       .sort((a, b) => new Date(b.last_sync_at || 0).getTime() - new Date(a.last_sync_at || 0).getTime());
   }, [diagnostics, provider, search, clientMap]);
 
+  const diagnosticStateCounts = useMemo(() => {
+    const counts: Record<DataFreshnessState, number> = {
+      current: 0,
+      stale: 0,
+      never_synced: 0,
+      insufficient_data: 0,
+      retry_scheduled: 0,
+      error: 0,
+    };
+    for (const row of diagnostics?.items || []) counts[diagnosticDataFreshness(row)] += 1;
+    return counts;
+  }, [diagnostics]);
+  const assignmentConflictCount = useMemo(
+    () => new Set(
+      (diagnostics?.items || [])
+        .filter((item) => item.error_code === "assignment_conflict")
+        .map((item) => item.ad_account_id),
+    ).size,
+    [diagnostics],
+  );
+
   useEffect(() => {
     if (!rows.length) {
       setSelectedId("");
@@ -317,6 +435,7 @@ export default function SyncMonitorPage() {
     () => (selected?.ad_account_id ? diagnosticsByAccount.get(selected.ad_account_id) || null : null),
     [selected?.ad_account_id, diagnosticsByAccount]
   );
+  const selectedDiagnosticState = selectedDiagnostic ? diagnosticDataFreshness(selectedDiagnostic) : null;
   const providerMap = useMemo(() => {
     const map = new Map<string, IntegrationProvider>();
     for (const p of integrations?.providers || []) {
@@ -344,6 +463,10 @@ export default function SyncMonitorPage() {
       push("Подключать платформы может агентство или администратор", "info");
       return;
     }
+    if (currentRole === "agency" && !agencyContext.selectedAgencyId) {
+      push(agencySelectionRequiredMessage(), "info");
+      return;
+    }
     setConnectProviderName(providerName);
     setConnectMode("add");
     setOverwriteConnectionKey("");
@@ -369,6 +492,10 @@ export default function SyncMonitorPage() {
 
   function startConnectProvider() {
     if (!connectProviderName) return;
+    if (currentRole === "agency" && !agencyContext.selectedAgencyId) {
+      push(agencySelectionRequiredMessage(), "info");
+      return;
+    }
     const key = overwriteConnectionKey.trim();
     if (connectMode === "overwrite" && !key) {
       push("Не удалось определить существующее подключение. Обновите страницу и попробуйте снова.", "info");
@@ -383,6 +510,9 @@ export default function SyncMonitorPage() {
     if (connectMode === "overwrite") {
       q.set("connection_key", key);
     }
+    if (currentRole === "agency") {
+      q.set("agency_id", agencyContext.selectedAgencyId);
+    }
     localStorage.setItem("ops_api_base", base);
     window.location.href = `${base}/auth/${connectProviderName}/start?${q.toString()}`;
   }
@@ -392,18 +522,37 @@ export default function SyncMonitorPage() {
       push("Обновлять данные может агентство или администратор", "info");
       return;
     }
-    if (!opts?.accountId && !discoverClientId) {
+    if (currentRole === "agency" && !agencyContext.portfolioReady) {
+      push(agencyContext.portfolioError || agencySelectionRequiredMessage(), "info");
+      return;
+    }
+    const selectedClientId = clients.some((client) => client.id === discoverClientId) ? discoverClientId : "";
+    if (opts?.accountId && !accounts.some((account) => account.id === opts.accountId)) {
+      push("Этот рекламный аккаунт не входит в выбранное агентство.", "error");
+      return;
+    }
+    if (!opts?.accountId && !selectedClientId) {
       push("Выберите клиента перед обновлением данных", "info");
       return;
     }
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { ...defaultSyncRangeLastDays(30) };
-      if (discoverClientId) payload.client_id = discoverClientId;
+      if (selectedClientId) payload.client_id = selectedClientId;
       if (opts?.platform) payload.platform = opts.platform;
       if (opts?.accountId) {
         payload.account_ids = [opts.accountId];
         payload.force = true;
+      } else if (currentRole === "agency") {
+        const scopedAccountIds = accounts
+          .filter((account) => account.client_id === selectedClientId)
+          .filter((account) => !opts?.platform || asSyncPlatform(account.platform) === opts.platform)
+          .map((account) => account.id);
+        if (!scopedAccountIds.length) {
+          push("У выбранного клиента нет рекламных аккаунтов для обновления.", "info");
+          return;
+        }
+        payload.account_ids = scopedAccountIds;
       }
       const runRes = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", {
         method: "POST",
@@ -411,10 +560,8 @@ export default function SyncMonitorPage() {
       });
       setLastRun(runRes);
       const scope = opts?.accountId ? "аккаунт" : opts?.platform ? providerLabel(opts.platform) : "все платформы";
-      push(
-        `Обновление завершено (${scope}): обработано ${runRes.processed}, успешно ${runRes.success}, с ошибкой ${runRes.failed}, пропущено ${runRes.skipped}`,
-        runRes.failed > 0 ? "info" : "success"
-      );
+      const feedback = syncRunFeedback(runRes);
+      push(`${scope}: ${feedback.message}`, feedback.tone);
       await loadData();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Не удалось обновить данные";
@@ -429,10 +576,23 @@ export default function SyncMonitorPage() {
       push("Искать рекламные аккаунты может агентство или администратор", "info");
       return;
     }
+    if (
+      currentRole === "agency"
+      && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
+    ) {
+      push(agencySelectionRequiredMessage(), "info");
+      return;
+    }
+    if (discoverClientId && !clients.some((client) => client.id === discoverClientId)) {
+      setDiscoverClientId("");
+      push("Выберите клиента из текущего агентства.", "info");
+      return;
+    }
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { upsert_existing: true };
       if (discoverClientId) payload.client_id = discoverClientId;
+      if (currentRole === "agency") payload.agency_id = agencyContext.selectedAgencyId;
       if (providerName) payload.provider = providerName;
       const res = await req<AdAccountDiscoverResponse>("/ad-accounts/discover", {
         method: "POST",
@@ -455,7 +615,12 @@ export default function SyncMonitorPage() {
       push("Загружать историю может агентство или администратор", "info");
       return;
     }
-    if (!discoverClientId) {
+    if (currentRole === "agency" && !agencyContext.portfolioReady) {
+      push(agencyContext.portfolioError || agencySelectionRequiredMessage(), "info");
+      return;
+    }
+    const selectedClientId = clients.some((client) => client.id === discoverClientId) ? discoverClientId : "";
+    if (!selectedClientId) {
       push("Выберите клиента перед загрузкой истории", "info");
       return;
     }
@@ -483,10 +648,20 @@ export default function SyncMonitorPage() {
         setHistoryProgress(`Загрузка истории ${i + 1} из ${batches.length}: ${b.date_from} — ${b.date_to}`);
         const payload: Record<string, unknown> = {
           force: true,
-          client_id: discoverClientId,
+          client_id: selectedClientId,
           date_from: b.date_from,
           date_to: b.date_to,
         };
+        if (currentRole === "agency") {
+          const scopedAccountIds = accounts
+            .filter((account) => account.client_id === selectedClientId)
+            .map((account) => account.id);
+          if (!scopedAccountIds.length) {
+            push("У выбранного клиента нет рекламных аккаунтов для загрузки истории.", "info");
+            return;
+          }
+          payload.account_ids = scopedAccountIds;
+        }
         const runRes = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", {
           method: "POST",
           body: JSON.stringify(payload),
@@ -497,8 +672,12 @@ export default function SyncMonitorPage() {
         totalSkipped += runRes.skipped || 0;
       }
       push(
-        `История загружена: обработано ${totalProcessed}, успешно ${totalSuccess}, с ошибкой ${totalFailed}, пропущено ${totalSkipped}`,
-        totalFailed > 0 ? "info" : "success"
+        `Загрузка истории завершена: обработано ${totalProcessed}, успешно ${totalSuccess}, с ошибкой ${totalFailed}, пропущено ${totalSkipped}`,
+        totalFailed > 0
+          ? (totalSuccess > 0 ? "info" : "error")
+          : totalProcessed === 0 || totalSuccess === 0 || totalSkipped > 0
+            ? "info"
+            : "success"
       );
       await loadData();
     } catch (err) {
@@ -599,6 +778,18 @@ export default function SyncMonitorPage() {
 
           <DataSourcesNav active="sync" />
 
+          {assignmentConflictCount > 0 ? (
+            <section className="alert-card high" style={{ marginTop: 12 }}>
+              <div className="alert-priority high">КОНФЛИКТЫ ПРИВЯЗКИ</div>
+              <div className="insight-text" style={{ marginTop: 8 }}>
+                Не обновляются рекламные аккаунты: {assignmentConflictCount}. Сначала укажите единственного клиента-владельца для каждого кабинета.
+              </div>
+              <Link className="primary-btn" href="/accounts#assignment-conflicts" style={{ marginTop: 10 }}>
+                Разобрать конфликты
+              </Link>
+            </section>
+          ) : null}
+
           <section className="kpi-grid" style={{ marginTop: 12 }}>
             <article className="kpi-card"><div className="kpi-title">Запусков</div><div className="kpi-value">{kpis.total}</div></article>
             <article className="kpi-card good"><div className="kpi-title">Успешно</div><div className="kpi-value">{kpis.success}</div></article>
@@ -630,7 +821,11 @@ export default function SyncMonitorPage() {
                   ))}
                 </select>
                 </label>
-                <button className="ghost-btn" onClick={() => void discoverAccounts()} disabled={syncLoading}>
+                <button
+                  className="ghost-btn"
+                  onClick={() => void discoverAccounts()}
+                  disabled={syncLoading || (currentRole === "agency" && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady))}
+                >
                   Найти аккаунты
                 </button>
                 <button className="primary-btn" onClick={() => openConnectProvider("google")}>Подключить Google Ads</button>
@@ -646,10 +841,12 @@ export default function SyncMonitorPage() {
               <div className="muted-note" style={{ marginTop: 8 }}>{historyProgress}</div>
             ) : null}
             <div className="kpi-grid" style={{ marginTop: 10 }}>
-              {(Array.isArray(integrations?.providers) ? integrations.providers : []).map((p) => (
-                <article key={p.provider} className={`kpi-card ${providerStatusClass(p.status)}`}>
+              {(Array.isArray(integrations?.providers) ? integrations.providers : []).map((p) => {
+                const freshness = dataFreshnessMeta(providerDataFreshness(p));
+                return (
+                <article key={p.provider} className={`kpi-card ${providerStatusClass(p)}`}>
                   <div className="kpi-title">{providerLabel(p.provider)}</div>
-                  <div className="kpi-value" style={{ fontSize: 22 }}>{p.sync_ready ? "Готово" : "Нужна настройка"}</div>
+                  <div className="kpi-value" style={{ fontSize: 22 }}>{p.sync_ready ? freshness.label : "Нужна настройка"}</div>
                   <div className="muted-note">
                     Авторизация: {(connectionsByProvider.get(asSyncPlatform(p.provider) || (p.provider || "").toLowerCase()) || [])
                       .filter((row) => row.status === "active")
@@ -657,7 +854,7 @@ export default function SyncMonitorPage() {
                       .join(", ") || "не подключена"}
                   </div>
                   <div className="muted-note">
-                    Аккаунтов: {p.linked_accounts_count}
+                    Аккаунтов: {p.linked_accounts_count} · {freshness.description}
                   </div>
                   <div style={{ marginTop: 8 }}>
                     {!p.sync_ready ? (
@@ -713,7 +910,8 @@ export default function SyncMonitorPage() {
                     )}
                   </div>
                 </article>
-              ))}
+                );
+              })}
             </div>
             <div className="data-sync-primary-actions">
               <button
@@ -745,20 +943,29 @@ export default function SyncMonitorPage() {
             </div>
             <div className="kpi-grid" style={{ marginTop: 10 }}>
               <article className="kpi-card">
-                <div className="kpi-title">Всего аккаунтов</div>
+                <div className="kpi-title">Активные в диагностике</div>
                 <div className="kpi-value">{diagnostics?.summary?.total_accounts || 0}</div>
+                <div className="kpi-meta">В реестре всех статусов: {accounts.length}; архивные и неактивные сюда не входят</div>
               </article>
               <article className="kpi-card good">
-                <div className="kpi-title">Работают</div>
-                <div className="kpi-value">{diagnostics?.summary?.healthy || 0}</div>
+                <div className="kpi-title">Актуальные</div>
+                <div className="kpi-value">{diagnosticStateCounts.current}</div>
               </article>
               <article className="kpi-card bad">
                 <div className="kpi-title">Ошибки</div>
-                <div className="kpi-value">{diagnostics?.summary?.error || 0}</div>
+                <div className="kpi-value">{diagnosticStateCounts.error}</div>
               </article>
               <article className="kpi-card warn">
-                <div className="kpi-title">Повтор запланирован</div>
-                <div className="kpi-value">{diagnostics?.summary?.retry_scheduled || 0}</div>
+                <div className="kpi-title">Устарели</div>
+                <div className="kpi-value">{diagnosticStateCounts.stale}</div>
+              </article>
+              <article className="kpi-card warn">
+                <div className="kpi-title">Ещё не загружались</div>
+                <div className="kpi-value">{diagnosticStateCounts.never_synced}</div>
+              </article>
+              <article className="kpi-card warn">
+                <div className="kpi-title">Недостаточно данных</div>
+                <div className="kpi-value">{diagnosticStateCounts.insufficient_data + diagnosticStateCounts.retry_scheduled}</div>
               </article>
             </div>
             {lastRun ? (
@@ -781,17 +988,35 @@ export default function SyncMonitorPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {diagnosticRows.slice(0, 100).map((d) => (
+                  {diagnosticRows.slice(0, 100).map((d) => {
+                    const state = diagnosticDataFreshness(d);
+                    const meta = dataFreshnessMeta(state);
+                    const reason = state === "error" || state === "retry_scheduled"
+                      ? safeErrorMessage(d.diagnostic_message) || meta.description
+                      : meta.description;
+                    const action = state === "current"
+                      ? "Действий не требуется."
+                      : state === "stale"
+                        ? "Запустите обновление данных."
+                        : state === "never_synced"
+                          ? "Запустите первую синхронизацию."
+                          : actionHintLabel(d.action_hint);
+                    return (
                     <tr key={d.ad_account_id}>
                       <td>{providerLabel(d.platform)}</td>
                       <td>{d.account_name}</td>
                       <td>{d.client_name || clientMap.get(d.client_id) || "--"}</td>
-                      <td><span className={`badge ${syncStateClass(d.sync_state)}`}>{syncStateLabel(d.sync_state)}</span></td>
-                      <td>{d.sync_state === "healthy" ? "Данные обновляются без ошибок." : safeErrorMessage(d.diagnostic_message)}</td>
-                      <td>{d.sync_state === "healthy" ? "Действий не требуется." : actionHintLabel(d.action_hint)}</td>
+                      <td><span className={`badge ${syncStateClass(state)}`}>{syncStateLabel(state)}</span></td>
+                      <td>{reason}</td>
+                      <td>
+                        {d.error_code === "assignment_conflict" ? (
+                          <Link href="/accounts#assignment-conflicts">Выбрать владельца</Link>
+                        ) : action}
+                      </td>
                       <td>{fmtDate(d.last_sync_at)}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {!diagnosticRows.length ? (
                     <tr>
                       <td colSpan={7} className="muted-note">Диагностических данных пока нет.</td>
@@ -961,11 +1186,21 @@ export default function SyncMonitorPage() {
                         </div>
                       </div>
                     ) : null}
-                    {selectedDiagnostic && selectedDiagnostic.sync_state !== "healthy" ? (
+                    {selectedDiagnostic && selectedDiagnosticState && selectedDiagnosticState !== "current" ? (
                       <div className="alert-card high" style={{ marginTop: 10 }}>
-                        <div className="alert-priority high">{syncStateLabel(selectedDiagnostic.sync_state).toUpperCase()}</div>
-                        <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>{safeErrorMessage(selectedDiagnostic.diagnostic_message)}</div>
-                        <div className="muted-note" style={{ marginTop: 8 }}>{actionHintLabel(selectedDiagnostic.action_hint)}</div>
+                        <div className="alert-priority high">{syncStateLabel(selectedDiagnosticState).toUpperCase()}</div>
+                        <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>
+                          {selectedDiagnosticState === "error" || selectedDiagnosticState === "retry_scheduled"
+                            ? safeErrorMessage(selectedDiagnostic.diagnostic_message) || dataFreshnessMeta(selectedDiagnosticState).description
+                            : dataFreshnessMeta(selectedDiagnosticState).description}
+                        </div>
+                        <div className="muted-note" style={{ marginTop: 8 }}>
+                          {selectedDiagnosticState === "stale"
+                            ? "Запустите обновление данных."
+                            : selectedDiagnosticState === "never_synced"
+                              ? "Запустите первую синхронизацию."
+                              : actionHintLabel(selectedDiagnostic.action_hint)}
+                        </div>
                       </div>
                     ) : selected.error_message ? (
                       <div className="alert-card high" style={{ marginTop: 10 }}>

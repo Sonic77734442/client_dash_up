@@ -39,7 +39,6 @@ function statusLabel(value: string | null | undefined) {
 }
 
 type ClientOperationsViewProps = {
-  clientOpsRows: ClientOpsRow[];
   filteredClientOpsRows: ClientOpsRow[];
   pagedClientOpsRows: ClientOpsRow[];
   clients: Client[];
@@ -64,7 +63,6 @@ type ClientOperationsViewProps = {
 };
 
 export function ClientOperationsView({
-  clientOpsRows,
   filteredClientOpsRows,
   pagedClientOpsRows,
   clients,

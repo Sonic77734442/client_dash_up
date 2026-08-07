@@ -164,6 +164,60 @@ def test_sync_receives_resolved_tenant_credentials():
     assert captured["credentials"]["refresh_token"] == "google-client-token"
 
 
+def test_admin_sync_and_discovery_can_use_bound_agency_credentials():
+    reset_state()
+    tenant = mk_client("Agency credential tenant")
+    unrelated = mk_client("Unrelated tenant")
+    account = mk_account(tenant["id"], "google", "1234567890")
+
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Credential Agency", "status": "active", "plan": "starter"},
+    ).json()
+    assert client.post(
+        f"/platform/agencies/{agency['id']}/clients",
+        json={"client_id": tenant["id"]},
+    ).status_code == 200
+    assert client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "google",
+            "scope_type": "agency",
+            "scope_id": agency["id"],
+            "credentials": {"refresh_token": "agency-refresh-token"},
+        },
+    ).status_code == 200
+
+    store = app.state.integration_credential_store
+    assert store.resolve_for_client(provider="google", client_id=UUID(unrelated["id"])) is None
+
+    captured = {"sync": None, "discovery": None}
+
+    def fake_fetcher(external_id, date_from, date_to, creds=None):
+        captured["sync"] = creds
+        return [{"date": date_to}]
+
+    def fake_discoverer(creds=None):
+        captured["discovery"] = creds
+        return [{"external_account_id": "0987654321", "name": "Agency Google", "currency": "USD"}]
+
+    app.state.ad_account_sync_service.provider_fetchers = {"google": fake_fetcher}
+    app.state.ad_account_discovery_service.discoverers = {"google": fake_discoverer}
+
+    synced = client.post("/ad-accounts/sync/run", json={"account_ids": [account["id"]], "force": True})
+    discovered = client.post(
+        "/ad-accounts/discover",
+        json={"provider": "google", "client_id": tenant["id"]},
+    )
+
+    assert synced.status_code == 200
+    assert synced.json()["success"] == 1
+    assert captured["sync"]["refresh_token"] == "agency-refresh-token"
+    assert discovered.status_code == 200
+    assert discovered.json()["created"] == 1
+    assert captured["discovery"]["refresh_token"] == "agency-refresh-token"
+
+
 def test_integration_credentials_support_multiple_connection_keys_per_scope():
     reset_state()
     c = mk_client("Multi")
@@ -212,3 +266,88 @@ def test_integration_credentials_support_multiple_connection_keys_per_scope():
     token_by_key = {row.connection_key: row.credentials.get("refresh_token") for row in resolved_many}
     assert token_by_key["google:mcc-111"] == "rt-111-updated"
     assert token_by_key["google:mcc-222"] == "rt-222"
+
+
+def test_only_agency_owner_or_manager_can_archive_shared_connection():
+    reset_state()
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Credential role guard", "status": "active", "plan": "starter"},
+    ).json()
+
+    actors = {}
+    for role in ("owner", "manager", "member"):
+        user = client.post(
+            "/auth/internal/users",
+            json={
+                "email": f"credential-{role}@test.local",
+                "name": role,
+                "role": "agency",
+                "status": "active",
+            },
+        ).json()
+        assert client.post(
+            f"/platform/agencies/{agency['id']}/members",
+            json={"user_id": user["id"], "role": role, "status": "active"},
+        ).status_code == 200
+        token = client.post(
+            "/auth/internal/sessions/issue",
+            json={"user_id": user["id"], "ttl_minutes": 60},
+        ).json()["token"]
+        actors[role] = {"Authorization": f"Bearer {token}"}
+
+    credential_ids = []
+    for connection_key in ("role-guard-manager", "role-guard-owner"):
+        created = client.post(
+            "/platform/integration-credentials",
+            json={
+                "provider": "meta",
+                "scope_type": "agency",
+                "scope_id": agency["id"],
+                "connection_key": connection_key,
+                "credentials": {"access_token": f"token-{connection_key}"},
+            },
+        )
+        assert created.status_code == 200
+        credential_ids.append(created.json()["id"])
+
+    denied = client.delete(
+        f"/me/integration-connections/{credential_ids[0]}",
+        headers=actors["member"],
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "agency_manage_forbidden"
+
+    assert client.delete(
+        f"/me/integration-connections/{credential_ids[0]}",
+        headers=actors["manager"],
+    ).status_code == 200
+    assert client.delete(
+        f"/me/integration-connections/{credential_ids[1]}",
+        headers=actors["owner"],
+    ).status_code == 200
+
+
+def test_agency_resolution_never_inherits_platform_global_credentials():
+    reset_state()
+    tenant = mk_client("Global isolation")
+    created = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "meta",
+            "scope_type": "global",
+            "credentials": {"access_token": "platform-secret"},
+        },
+    )
+    assert created.status_code == 200
+
+    store = app.state.integration_credential_store
+    trusted = store.resolve_many_for_client(provider="meta", client_id=UUID(tenant["id"]), user_id=None)
+    agency_request = store.resolve_many_for_client(
+        provider="meta",
+        client_id=UUID(tenant["id"]),
+        user_id=UUID("00000000-0000-0000-0000-000000000123"),
+    )
+
+    assert [row.scope_type for row in trusted] == ["global"]
+    assert agency_request == []

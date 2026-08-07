@@ -368,55 +368,63 @@ class SqliteBudgetStore:
         return self._to_budget(row) if row else None
 
     def patch(self, budget_id: UUID, payload: BudgetPatch) -> BudgetOut:
-        existing = self.get(budget_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Budget not found")
-
-        data = existing.model_dump()
         patch = payload.model_dump(exclude_unset=True)
         changed_by = patch.pop("changed_by", None)
-        for key, value in patch.items():
-            data[key] = value
-
-        if not patch:
-            return existing
-
-        _validate_period(data["start_date"], data["end_date"])
-        _validate_scope(data["scope"], data["account_id"])
-
-        candidate_normalized = {
-            "client_id": data["client_id"],
-            "scope": data["scope"],
-            "account_id": data["account_id"],
-            "amount": _q_money(Decimal(str(data["amount"]))),
-            "currency": data["currency"],
-            "period_type": data["period_type"],
-            "start_date": data["start_date"],
-            "end_date": data["end_date"],
-            "status": data["status"],
-            "note": data["note"],
-            "created_by": data["created_by"],
-        }
-        existing_normalized = {
-            "client_id": existing.client_id,
-            "scope": existing.scope,
-            "account_id": existing.account_id,
-            "amount": _q_money(Decimal(str(existing.amount))),
-            "currency": existing.currency,
-            "period_type": existing.period_type,
-            "start_date": existing.start_date,
-            "end_date": existing.end_date,
-            "status": existing.status,
-            "note": existing.note,
-            "created_by": existing.created_by,
-        }
-        if candidate_normalized == existing_normalized:
-            return existing
-
-        now = _utcnow().isoformat()
-        new_version = int(existing.version) + 1
         with sqlite_conn(self.db_path) as conn:
+            # The read, merge, validation, write, version bump, and history row
+            # are one serialized operation. Reading before this lock allows two
+            # concurrent partial patches to overwrite each other with the same
+            # stale snapshot and version.
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(budget_id),)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Budget not found")
+            existing = self._to_budget(row)
+
+            if not patch:
+                conn.commit()
+                return existing
+
+            data = existing.model_dump()
+            for key, value in patch.items():
+                data[key] = value
+
+            _validate_period(data["start_date"], data["end_date"])
+            _validate_scope(data["scope"], data["account_id"])
+
+            candidate_normalized = {
+                "client_id": data["client_id"],
+                "scope": data["scope"],
+                "account_id": data["account_id"],
+                "amount": _q_money(Decimal(str(data["amount"]))),
+                "currency": data["currency"],
+                "period_type": data["period_type"],
+                "start_date": data["start_date"],
+                "end_date": data["end_date"],
+                "status": data["status"],
+                "note": data["note"],
+                "created_by": data["created_by"],
+            }
+            if candidate_normalized["amount"] < 0:
+                raise HTTPException(status_code=400, detail="Budget amount cannot be negative")
+
+            existing_normalized = {
+                "client_id": existing.client_id,
+                "scope": existing.scope,
+                "account_id": existing.account_id,
+                "amount": _q_money(Decimal(str(existing.amount))),
+                "currency": existing.currency,
+                "period_type": existing.period_type,
+                "start_date": existing.start_date,
+                "end_date": existing.end_date,
+                "status": existing.status,
+                "note": existing.note,
+                "created_by": existing.created_by,
+            }
+            if candidate_normalized == existing_normalized:
+                conn.commit()
+                return existing
+
             if data["status"] == "active":
                 self._assert_no_overlap(
                     conn=conn,
@@ -439,6 +447,8 @@ class SqliteBudgetStore:
                     exclude_budget_id=budget_id,
                 )
 
+            now = _utcnow().isoformat()
+            new_version = int(existing.version) + 1
             conn.execute(
                 """
                 UPDATE budgets
@@ -464,10 +474,13 @@ class SqliteBudgetStore:
                 ),
             )
             previous_values = json.dumps(existing.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=True)
-            new_values_obj = dict(data)
-            new_values_obj["version"] = new_version
-            new_values_obj["updated_at"] = now
-            new_values = json.dumps(BudgetOut(**new_values_obj, id=budget_id, created_at=existing.created_at).model_dump(mode="json"), separators=(",", ":"), ensure_ascii=True)
+            updated_row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(budget_id),)).fetchone()
+            updated = self._to_budget(updated_row)
+            new_values = json.dumps(
+                updated.model_dump(mode="json"),
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
             conn.execute(
                 """
                 INSERT INTO budget_history (budget_id, changed_at, changed_by, previous_values, new_values)
@@ -482,8 +495,7 @@ class SqliteBudgetStore:
                 ),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(budget_id),)).fetchone()
-        return self._to_budget(row)
+        return updated
 
     def archive(self, budget_id: UUID) -> BudgetOut:
         existing = self.get(budget_id)
@@ -501,28 +513,82 @@ class SqliteBudgetStore:
         return self._to_budget(row)
 
     def transfer(self, source_budget_id: UUID, payload: BudgetTransferRequest) -> BudgetTransferResponse:
-        source_existing = self.get(source_budget_id)
-        if not source_existing:
-            raise HTTPException(status_code=404, detail="Budget not found")
-        if source_existing.scope != "account" or not source_existing.account_id:
-            raise HTTPException(status_code=400, detail="Transfer is supported only for account-scope budgets")
-        if source_existing.status != "active":
-            raise HTTPException(status_code=400, detail="Source budget must be active")
-        if source_existing.account_id == payload.target_account_id:
-            raise HTTPException(status_code=400, detail="target_account_id must differ from source account_id")
-
         transfer_amount = _q_money(payload.amount)
-        source_amount = _q_money(Decimal(str(source_existing.amount)))
-        if transfer_amount > source_amount:
-            raise HTTPException(status_code=400, detail="Transfer amount exceeds source budget amount")
+        if transfer_amount <= 0:
+            raise HTTPException(status_code=400, detail="Transfer amount must be positive")
 
-        now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             source_row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(source_budget_id),)).fetchone()
             if not source_row:
                 raise HTTPException(status_code=404, detail="Budget not found")
             source_current = self._to_budget(source_row)
+            if source_current.scope != "account" or not source_current.account_id:
+                raise HTTPException(status_code=400, detail="Transfer is supported only for account-scope budgets")
+            if source_current.status != "active":
+                raise HTTPException(status_code=400, detail="Source budget must be active")
+            if source_current.account_id == payload.target_account_id:
+                raise HTTPException(status_code=400, detail="target_account_id must differ from source account_id")
+
+            source_amount = _q_money(Decimal(str(source_current.amount)))
+            if source_amount < 0:
+                raise HTTPException(status_code=409, detail="Source budget has an invalid negative amount")
+            if transfer_amount > source_amount:
+                raise HTTPException(status_code=400, detail="Transfer amount exceeds source budget amount")
+
+            client_row = conn.execute(
+                "SELECT id, status, default_currency FROM clients WHERE id=?",
+                (str(source_current.client_id),),
+            ).fetchone()
+            if not client_row or client_row["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "client_not_active", "message": "Source client is not active"},
+                )
+            if str(client_row["default_currency"]).upper() != source_current.currency.upper():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "currency_mismatch", "message": "Source budget currency must match client currency"},
+                )
+
+            source_account_row = conn.execute(
+                "SELECT id, client_id, status, currency FROM ad_accounts WHERE id=?",
+                (str(source_current.account_id),),
+            ).fetchone()
+            if not source_account_row or source_account_row["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "account_not_active", "message": "Source advertising account is not active"},
+                )
+            if source_account_row["client_id"] != str(source_current.client_id):
+                raise HTTPException(status_code=409, detail="Source account does not belong to the budget client")
+            if str(source_account_row["currency"]).upper() != source_current.currency.upper():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "currency_mismatch", "message": "Source account currency must match budget currency"},
+                )
+
+            target_account_row = conn.execute(
+                "SELECT id, client_id, status, currency FROM ad_accounts WHERE id=?",
+                (str(payload.target_account_id),),
+            ).fetchone()
+            if not target_account_row:
+                raise HTTPException(status_code=404, detail="Target advertising account not found")
+            if target_account_row["client_id"] != str(source_current.client_id):
+                raise HTTPException(status_code=400, detail="target account must belong to same client as source budget")
+            if target_account_row["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "account_not_active", "message": "Target advertising account is not active"},
+                )
+            if str(target_account_row["currency"]).upper() != source_current.currency.upper():
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "currency_mismatch",
+                        "message": "Budget transfer requires source and target accounts to use the same currency",
+                    },
+                )
 
             target_row = conn.execute(
                 """
@@ -544,8 +610,13 @@ class SqliteBudgetStore:
                 ),
             ).fetchone()
 
+            now = _utcnow().isoformat()
             source_prev_json = json.dumps(source_current.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=True)
-            new_source_amount = _q_money(_q_money(Decimal(str(source_current.amount))) - transfer_amount)
+            new_source_amount = _q_money(source_amount - transfer_amount)
+            if new_source_amount < 0:
+                # Defensive assertion in addition to the locked current-balance
+                # check and SQLite invariant.
+                raise HTTPException(status_code=409, detail="Transfer would make source budget negative")
             new_source_version = int(source_current.version) + 1
             conn.execute(
                 """
@@ -578,8 +649,27 @@ class SqliteBudgetStore:
 
             if target_row:
                 target_current = self._to_budget(target_row)
+                if target_current.currency.upper() != source_current.currency.upper():
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "currency_mismatch", "message": "Target budget currency must match source budget currency"},
+                    )
                 target_prev_json = json.dumps(target_current.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=True)
-                target_new_amount = _q_money(_q_money(Decimal(str(target_current.amount))) + transfer_amount)
+                target_amount = _q_money(Decimal(str(target_current.amount)))
+                if target_amount < 0:
+                    raise HTTPException(status_code=409, detail="Target budget has an invalid negative amount")
+                target_new_amount = _q_money(target_amount + transfer_amount)
+                self._assert_client_account_allocation_limit(
+                    conn=conn,
+                    scope="account",
+                    client_id=source_current.client_id,
+                    account_id=target_current.account_id,
+                    amount=target_new_amount,
+                    start_date=target_current.start_date,
+                    end_date=target_current.end_date,
+                    status="active",
+                    exclude_budget_id=target_current.id,
+                )
                 target_new_version = int(target_current.version) + 1
                 conn.execute(
                     """
@@ -612,6 +702,24 @@ class SqliteBudgetStore:
             else:
                 new_target_id = str(uuid4())
                 target_new_amount = transfer_amount
+                self._assert_no_overlap(
+                    conn=conn,
+                    scope="account",
+                    client_id=source_current.client_id,
+                    account_id=payload.target_account_id,
+                    start_date=source_current.start_date,
+                    end_date=source_current.end_date,
+                )
+                self._assert_client_account_allocation_limit(
+                    conn=conn,
+                    scope="account",
+                    client_id=source_current.client_id,
+                    account_id=payload.target_account_id,
+                    amount=target_new_amount,
+                    start_date=source_current.start_date,
+                    end_date=source_current.end_date,
+                    status="active",
+                )
                 conn.execute(
                     """
                     INSERT INTO budgets

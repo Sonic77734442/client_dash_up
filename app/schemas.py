@@ -52,7 +52,7 @@ class BudgetBase(BaseModel):
         None,
         description="Required when scope='account'. Must be null when scope='client'.",
     )
-    amount: Decimal = Field(..., decimal_places=2, max_digits=14)
+    amount: Decimal = Field(..., decimal_places=2, max_digits=14, ge=0)
     currency: str = "USD"
     period_type: Literal["monthly", "custom"]
     start_date: date
@@ -85,7 +85,7 @@ class BudgetPatch(BaseModel):
         description="If set to 'account' account_id is required; if 'client' account_id must be null.",
     )
     account_id: Optional[UUID] = Field(None, description="Target account for account-scoped budget.")
-    amount: Optional[Decimal] = Field(None, decimal_places=2, max_digits=14)
+    amount: Optional[Decimal] = Field(None, decimal_places=2, max_digits=14, ge=0)
     currency: Optional[str] = None
     period_type: Optional[Literal["monthly", "custom"]] = None
     start_date: Optional[date] = None
@@ -243,6 +243,86 @@ class AdAccountOut(BaseModel):
     updated_at: datetime
 
 
+class AssignmentConflictLatestStatOut(BaseModel):
+    date: date
+    spend: float
+    impressions: int
+    clicks: int
+    conversions: float
+
+
+class AssignmentConflictCandidateOut(BaseModel):
+    account_id: UUID
+    client_id: UUID
+    client_name: str
+    client_status: Literal["active", "inactive", "archived"]
+    account_name: str
+    account_status: Literal["active", "inactive", "archived"]
+    platform: str
+    external_account_id: str
+    currency: str
+    latest_stat: Optional[AssignmentConflictLatestStatOut] = None
+    active_budget_count: int = 0
+
+
+class AssignmentConflictGroupSummaryOut(BaseModel):
+    candidate_count: int
+    active_candidate_count: int
+    client_count: int
+    active_budget_count: int
+    latest_stat_date: Optional[date] = None
+
+
+class AssignmentConflictGroupOut(BaseModel):
+    group_id: str
+    group_version: str
+    platform: str
+    canonical_external_account_id: str
+    account_ids: List[UUID]
+    candidates: List[AssignmentConflictCandidateOut]
+    summary: AssignmentConflictGroupSummaryOut
+
+
+class AssignmentConflictListSummaryOut(BaseModel):
+    conflict_groups: int
+    conflicted_accounts: int
+    active_budgets: int
+
+
+class AssignmentConflictListResponse(BaseModel):
+    items: List[AssignmentConflictGroupOut]
+    count: int
+    summary: AssignmentConflictListSummaryOut
+
+
+class AssignmentConflictResolveRequest(BaseModel):
+    winner_account_id: UUID
+    expected_account_ids: List[UUID] = Field(..., min_length=2)
+    group_version: str = Field(..., min_length=20, max_length=80)
+    loser_budget_policy: Literal["reject", "archive"] = "reject"
+    note: Optional[str] = Field(None, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_expected_group(self):
+        if len(set(self.expected_account_ids)) != len(self.expected_account_ids):
+            raise ValueError("expected_account_ids must be unique")
+        if self.winner_account_id not in self.expected_account_ids:
+            raise ValueError("winner_account_id must be included in expected_account_ids")
+        return self
+
+
+class AssignmentConflictResolveResponse(BaseModel):
+    status: Literal["resolved"] = "resolved"
+    group_id: str
+    winner_account_id: UUID
+    loser_account_ids: List[UUID]
+    archived_budget_ids: List[UUID]
+    before: AssignmentConflictGroupOut
+    after: AssignmentConflictGroupOut
+    sync_required: bool = True
+    resolved_at: datetime
+
+
 class AdAccountSyncRunRequest(BaseModel):
     account_ids: Optional[List[UUID]] = None
     client_id: Optional[UUID] = None
@@ -260,6 +340,13 @@ class AdAccountDiscoverRequest(BaseModel):
     client_id: Optional[UUID] = Field(
         default=None,
         description="Optional target internal client for imported ad accounts. If omitted, discovery uses inbox fallback.",
+    )
+    agency_id: Optional[UUID] = Field(
+        default=None,
+        description=(
+            "Agency tenant context for agency users. Required when the current user has more than one active "
+            "agency membership; automatically selected when exactly one active agency is available."
+        ),
     )
     upsert_existing: bool = Field(
         default=True,
@@ -349,6 +436,17 @@ class IntegrationProviderOut(BaseModel):
     sync_readiness_reason: Optional[str] = None
     scopes: List[str] = Field(default_factory=list)
     linked_accounts_count: int = 0
+    active_accounts_count: int = 0
+    successfully_synced_accounts_count: int = 0
+    accounts_with_data_count: int = 0
+    error_accounts_count: int = 0
+    never_synced_accounts_count: int = 0
+    stale_accounts_count: int = 0
+    assignment_conflict_accounts_count: int = 0
+    coverage_percent: float = 0.0
+    rows_present: bool = False
+    latest_data_date: Optional[date] = None
+    stale_days: Optional[int] = None
     affected_clients_count: int = 0
     last_heartbeat_at: Optional[datetime] = None
     last_successful_sync_at: Optional[datetime] = None
@@ -427,6 +525,7 @@ class SpendAggregateOut(BaseModel):
 class OverviewResponse(BaseModel):
     range: Dict[str, object]
     scope: Dict[str, Optional[str]]
+    data_quality: Dict[str, object] = Field(default_factory=dict)
     spend_summary: Dict[str, object]
     budget_summary: Dict[str, object]
     breakdowns: Dict[str, object]
@@ -454,6 +553,7 @@ class OperationalInsightOut(BaseModel):
 class OperationalInsightsResponse(BaseModel):
     range: Dict[str, object]
     scope: Dict[str, Optional[str]]
+    data_quality: Dict[str, object] = Field(default_factory=dict)
     items: List[OperationalInsightOut]
 
 
@@ -658,6 +758,20 @@ class AgencyInviteAcceptResponse(BaseModel):
     session: SessionIssueResponse
 
 
+class BrowserSessionOut(BaseModel):
+    session_id: UUID
+    user_id: UUID
+    expires_at: datetime
+
+
+class AgencyInviteAcceptPublicResponse(BaseModel):
+    invite: AgencyInviteOut
+    agency: AgencyOut
+    member: AgencyMemberOut
+    user: UserOut
+    session: BrowserSessionOut
+
+
 class ClientInviteCreate(BaseModel):
     email: str
     expires_in_days: int = Field(7, ge=1, le=30)
@@ -691,6 +805,13 @@ class ClientInviteAcceptResponse(BaseModel):
     client: ClientOut
     user: UserOut
     session: SessionIssueResponse
+
+
+class ClientInviteAcceptPublicResponse(BaseModel):
+    invite: ClientInviteOut
+    client: ClientOut
+    user: UserOut
+    session: BrowserSessionOut
 
 
 class SessionValidationResponse(BaseModel):

@@ -94,13 +94,97 @@ export async function createAgencySessionWithAccess(request: APIRequestContext) 
   const email = `agency-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}@test.local`;
   const user = await createUser(request, "agency", email);
 
-  const grantRes = await postWithRateLimitRetry(request, `${API_BASE}/auth/internal/access`, {
+  const agencyRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies`, {
     headers: adminAuth,
-    data: { user_id: user.id, client_id: client.id, role: "agency" },
+    data: { name: `smoke-agency-${Date.now()}`, status: "active", plan: "starter" },
   });
-  if (!grantRes.ok()) throw new Error(`assign_access_failed:${grantRes.status()}`);
+  if (!agencyRes.ok()) throw new Error(`create_agency_failed:${agencyRes.status()}`);
+  const agency = (await agencyRes.json()) as { id: string };
+
+  const memberRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies/${agency.id}/members`, {
+    headers: adminAuth,
+    data: { user_id: user.id, role: "owner", status: "active" },
+  });
+  if (!memberRes.ok()) throw new Error(`assign_member_failed:${memberRes.status()}`);
+
+  const bindingRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies/${agency.id}/clients`, {
+    headers: adminAuth,
+    data: { client_id: client.id },
+  });
+  if (!bindingRes.ok()) throw new Error(`assign_client_failed:${bindingRes.status()}`);
 
   return issueToken(request, user.id);
+}
+
+export async function createMultiAgencySessionWithAccess(request: APIRequestContext) {
+  const adminToken = await createAdminSession(request);
+  const adminAuth = { Authorization: `Bearer ${adminToken}` };
+  const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const user = await createUser(request, "agency", `multi-agency-${stamp}@test.local`);
+  const fixtures: Array<{
+    agencyId: string;
+    agencyName: string;
+    clientId: string;
+    clientName: string;
+    accountId: string;
+    accountName: string;
+  }> = [];
+
+  for (const label of ["North", "South"]) {
+    const clientName = `${label} client ${stamp}`;
+    const clientRes = await postWithRateLimitRetry(request, `${API_BASE}/clients`, {
+      headers: adminAuth,
+      data: { name: clientName, status: "active", default_currency: "USD" },
+    });
+    if (!clientRes.ok()) throw new Error(`create_client_failed:${clientRes.status()}`);
+    const client = (await clientRes.json()) as { id: string };
+
+    const agencyName = `${label} agency ${stamp}`;
+    const agencyRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies`, {
+      headers: adminAuth,
+      data: { name: agencyName, status: "active", plan: "starter" },
+    });
+    if (!agencyRes.ok()) throw new Error(`create_agency_failed:${agencyRes.status()}`);
+    const agency = (await agencyRes.json()) as { id: string };
+
+    const memberRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies/${agency.id}/members`, {
+      headers: adminAuth,
+      data: { user_id: user.id, role: "owner", status: "active" },
+    });
+    if (!memberRes.ok()) throw new Error(`assign_member_failed:${memberRes.status()}`);
+
+    const bindingRes = await postWithRateLimitRetry(request, `${API_BASE}/platform/agencies/${agency.id}/clients`, {
+      headers: adminAuth,
+      data: { client_id: client.id },
+    });
+    if (!bindingRes.ok()) throw new Error(`assign_client_failed:${bindingRes.status()}`);
+
+    const accountName = `${label} Ads ${stamp}`;
+    const accountRes = await postWithRateLimitRetry(request, `${API_BASE}/ad-accounts`, {
+      headers: adminAuth,
+      data: {
+        client_id: client.id,
+        platform: "meta",
+        external_account_id: `act_${label.toLowerCase()}_${stamp}`,
+        name: accountName,
+        currency: "USD",
+        status: "active",
+      },
+    });
+    if (!accountRes.ok()) throw new Error(`create_account_failed:${accountRes.status()}`);
+    const account = (await accountRes.json()) as { id: string };
+
+    fixtures.push({
+      agencyId: agency.id,
+      agencyName,
+      clientId: client.id,
+      clientName,
+      accountId: account.id,
+      accountName,
+    });
+  }
+
+  return { token: await issueToken(request, user.id), fixtures };
 }
 
 export async function createClientSessionForExistingClient(request: APIRequestContext, clientId: string) {

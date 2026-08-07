@@ -90,6 +90,37 @@ def test_sync_blocked_alert_open_and_resolve():
     assert any(x["fingerprint"] == blocked["fingerprint"] for x in resolved.json())
 
 
+def test_open_alert_feed_excludes_archived_clients_but_keeps_history():
+    reset_state()
+    admin_token = bootstrap_admin_token()
+    tenant = mk_client(admin_token)
+    account = mk_account(admin_token, tenant["id"], "google", "2234567890")
+
+    app.state.ad_account_sync_service.provider_fetchers = {
+        "google": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail="customer_not_enabled")
+        )
+    }
+    run = client.post(
+        "/ad-accounts/sync/run",
+        json={"account_ids": [account["id"]], "force": True},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert run.status_code == 200
+    assert client.get("/alerts", headers={"Authorization": f"Bearer {admin_token}"}).json()
+
+    archived = client.delete(
+        f"/clients/{tenant['id']}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert archived.status_code == 200
+
+    assert client.get("/alerts", headers={"Authorization": f"Bearer {admin_token}"}).json() == []
+    historical = client.get("/alerts?status=all", headers={"Authorization": f"Bearer {admin_token}"})
+    assert historical.status_code == 200
+    assert any(row["client_id"] == tenant["id"] for row in historical.json())
+
+
 def test_discovery_auth_alert_open_and_resolve():
     reset_state()
     admin_token = bootstrap_admin_token()

@@ -4,7 +4,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
 import { ToastHost } from "../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
 import { useSession } from "../../hooks/useSession";
+import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
 import { AdAccount, AdStat, Client } from "../../lib/types";
@@ -237,6 +239,10 @@ export default function TrafficPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const agencyScopeKey = agencyContext.selectedAgencyId || agencyContext.role || "unknown";
+  const beginReferenceRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginStatsRequest = useScopeRequestGuard(agencyScopeKey);
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -267,21 +273,44 @@ export default function TrafficPage() {
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
 
   const loadReferenceData = useCallback(async () => {
+    const isCurrentRequest = beginReferenceRequest();
+    if (agencyContext.role === "agency" && !agencyContext.portfolioReady) {
+      throw new Error(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
+      );
+    }
     const [accountPayload, clientPayload] = await Promise.all([
       req<{ items: AdAccount[] }>("/ad-accounts?status=active"),
       req<{ items: Client[] }>("/clients?status=active"),
     ]);
-    setAccounts(accountPayload.items || []);
-    setClients(clientPayload.items || []);
-  }, [req]);
+    if (!isCurrentRequest()) return;
+    const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    setAccounts((accountPayload.items || []).filter((account) => !allowedClientIds || allowedClientIds.has(account.client_id)));
+    setClients((clientPayload.items || []).filter((client) => !allowedClientIds || allowedClientIds.has(client.id)));
+    setWarning("");
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectionRequired,
+    beginReferenceRequest,
+    req,
+  ]);
 
   const loadStats = useCallback(async () => {
+    const isCurrentRequest = beginStatsRequest();
+    if (agencyContext.role === "agency" && !agencyContext.portfolioReady) return;
     const p = new URLSearchParams({ date_from: dateFrom, date_to: dateTo });
     const all = await req<{ items: AdStat[] }>(`/ad-stats?${p.toString()}`);
+    if (!isCurrentRequest()) return;
     const rows = all.items || [];
     const byPlatform = (target: "meta" | "google" | "tiktok", selectedAccountId?: string) =>
       rows.filter((row) => {
         const rowAccountId = String(row.ad_account_id || "");
+        if (!accountMap.has(rowAccountId)) return false;
         if (selectedAccountId && rowAccountId !== selectedAccountId) return false;
         if (clientId && accountMap.get(rowAccountId)?.client_id !== clientId) return false;
         const mappedPlatform = normalizePlatform(accountMap.get(rowAccountId)?.platform);
@@ -292,12 +321,40 @@ export default function TrafficPage() {
     setMetaRows(byPlatform("meta", metaAccount || undefined));
     setGoogleRows(byPlatform("google", googleAccount || undefined));
     setTiktokRows(byPlatform("tiktok", tiktokAccount || undefined));
-  }, [dateFrom, dateTo, clientId, metaAccount, googleAccount, tiktokAccount, req, accountMap]);
+  }, [
+    accountMap,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    beginStatsRequest,
+    clientId,
+    dateFrom,
+    dateTo,
+    googleAccount,
+    metaAccount,
+    req,
+    tiktokAccount,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void loadReferenceData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load accounts"));
-  }, [ready, loadReferenceData]);
+  }, [agencyContext.loading, ready, loadReferenceData]);
+
+  useEffect(() => {
+    setClientId("");
+    setAccounts([]);
+    setClients([]);
+    setMetaAccount("");
+    setGoogleAccount("");
+    setTiktokAccount("");
+    setMetaRows([]);
+    setGoogleRows([]);
+    setTiktokRows([]);
+  }, [agencyContext.selectedAgencyId]);
+
+  useEffect(() => {
+    if (clientId && !clients.some((client) => client.id === clientId)) setClientId("");
+  }, [clientId, clients]);
 
   useEffect(() => {
     setMetaAccount("");
@@ -306,9 +363,15 @@ export default function TrafficPage() {
   }, [clientId]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (metaAccount && !metaAccounts.some((account) => account.id === metaAccount)) setMetaAccount("");
+    if (googleAccount && !googleAccounts.some((account) => account.id === googleAccount)) setGoogleAccount("");
+    if (tiktokAccount && !tiktokAccounts.some((account) => account.id === tiktokAccount)) setTiktokAccount("");
+  }, [googleAccount, googleAccounts, metaAccount, metaAccounts, tiktokAccount, tiktokAccounts]);
+
+  useEffect(() => {
+    if (!ready || agencyContext.loading) return;
     void loadStats().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load traffic data"));
-  }, [ready, loadStats]);
+  }, [agencyContext.loading, ready, loadStats]);
 
   const metaSummary = useMemo(() => summarize(metaRows, accountMap), [metaRows, accountMap]);
   const googleSummary = useMemo(() => summarize(googleRows, accountMap), [googleRows, accountMap]);

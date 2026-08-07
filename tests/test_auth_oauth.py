@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import app.services.oauth as oauth_module
 from app.main import _oauth_provider_config_or_400, app
-from app.schemas import AuthIdentityLink, ClientCreate, UserCreate
+from app.schemas import AuthIdentityLink, ClientCreate, SessionIssueRequest, UserCreate
 from app.services.oauth import (
     ExternalIdentityPayload,
     FacebookOAuthAdapter,
@@ -122,6 +122,22 @@ def test_oauth_redirect_uri_environment_override(monkeypatch):
     monkeypatch.setenv("GOOGLE_REDIRECT_URI", expected)
     resolved = _oauth_provider_config_or_400("google")
     assert resolved.redirect_uri == expected
+
+
+def test_google_oauth_works_from_environment_without_database_config(monkeypatch):
+    reset_state()
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-google-client")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-google-secret")
+    monkeypatch.setenv(
+        "GOOGLE_REDIRECT_URI",
+        "https://dashboard.example/api/backend/auth/google/callback",
+    )
+
+    resolved = _oauth_provider_config_or_400("google", intent="login")
+
+    assert resolved.client_id == "env-google-client"
+    assert resolved.client_secret == "env-google-secret"
+    assert resolved.redirect_uri == "https://dashboard.example/api/backend/auth/google/callback"
 
 
 def test_facebook_oauth_uses_separate_environment_credentials(monkeypatch):
@@ -547,7 +563,7 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
         "state",
     )
     facebook_login = parse_qs(urlparse(facebook_login_url).query)
-    assert urlparse(facebook_login_url).path == "/v26.0/dialog/oauth"
+    assert urlparse(facebook_login_url).path == "/v25.0/dialog/oauth"
     assert set(facebook_login["scope"][0].split(",")) == {"public_profile", "email"}
     assert facebook_login["response_type"] == ["code"]
     assert "config_id" not in facebook_login
@@ -558,7 +574,7 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
         "state",
     )
     facebook_connect = parse_qs(urlparse(facebook_connect_url).query)
-    assert urlparse(facebook_connect_url).path == "/v26.0/dialog/oauth"
+    assert urlparse(facebook_connect_url).path == "/v25.0/dialog/oauth"
     assert facebook_connect["config_id"] == ["business-config-id"]
     assert facebook_connect["response_type"] == ["code"]
     assert facebook_connect["override_default_response_type"] == ["true"]
@@ -999,3 +1015,43 @@ def test_oauth_connect_requires_an_existing_session_and_provider_denial_redirect
     missing_state = client.get("/auth/google/callback?error=access_denied", follow_redirects=False)
     assert missing_state.status_code == 302
     assert parse_qs(urlparse(missing_state.headers["location"]).query)["oauth_error"] == ["provider_error"]
+
+
+def test_oauth_connect_callback_rejects_session_switch():
+    reset_state()
+    app.state.oauth_adapters = {"google": FakeGoogleAdapter()}
+    first = app.state.auth_store.create_user(
+        UserCreate(email="first-admin@example.com", name="First", role="admin", status="active")
+    )
+    second = app.state.auth_store.create_user(
+        UserCreate(email="second-admin@example.com", name="Second", role="admin", status="active")
+    )
+    first_token = app.state.auth_store.issue_session(
+        SessionIssueRequest(user_id=first.id, ttl_minutes=60)
+    ).token
+    second_token = app.state.auth_store.issue_session(
+        SessionIssueRequest(user_id=second.id, ttl_minutes=60)
+    ).token
+    configured = client.post(
+        "/auth/provider-configs",
+        json={
+            "provider": "google",
+            "client_id": "g-client",
+            "client_secret": "g-secret",
+            "redirect_uri": "https://dashboard.example/auth/google/callback",
+            "enabled": True,
+        },
+    )
+    assert configured.status_code == 200
+
+    client.cookies.set("ops_session", first_token)
+    start = client.get("/auth/google/start?next=/sync-monitor&intent=connect", follow_redirects=False)
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+
+    client.cookies.set("ops_session", second_token)
+    callback = client.get(f"/auth/google/callback?code=ok-code&state={state}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["session_mismatch"]
+    assert app.state.integration_credential_store.list(status="all") == []

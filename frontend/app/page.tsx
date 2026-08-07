@@ -8,7 +8,9 @@ import { AppSidebar } from "../components/AppSidebar";
 import { AppTopTabs } from "../components/AppTopTabs";
 import { ClientOperationsView } from "../components/views/ClientOperationsView";
 import { DashboardView } from "../components/views/DashboardView";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../hooks/useAgencyContext";
 import { useSession } from "../hooks/useSession";
+import { useScopeRequestGuard } from "../hooks/useScopeRequestGuard";
 import { useOperationalActions } from "../hooks/useOperationalActions";
 import { useToast } from "../hooks/useToast";
 import { fetchJson, getQuery } from "../lib/api";
@@ -17,7 +19,9 @@ import {
   normalizeOverviewPayload,
 } from "../lib/analyticsPayload";
 import { isAppRole } from "../lib/authRedirect";
+import { dataFreshnessMeta, metricRowsFreshness, overviewDataFreshness } from "../lib/dataFreshness";
 import { hasStringFields, normalizeListPayload } from "../lib/listPayload";
+import { calculateClientRiskScore } from "../lib/riskScore";
 import {
   AdStat,
   AgencyOverview,
@@ -127,6 +131,12 @@ export default function HomePage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const agencyScopeKey = agencyContext.selectedAgencyId || agencyContext.role || "unknown";
+  const beginClientsRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginOverviewRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginClientOpsRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginActionRequest = useScopeRequestGuard(agencyScopeKey);
   const router = useRouter();
   const { toasts, push } = useToast();
   const { executeAction, listActions } = useOperationalActions(session.apiBase, session.token);
@@ -223,15 +233,51 @@ export default function HomePage() {
   }, [req]);
 
   const loadClients = useCallback(async () => {
+    const isCurrentRequest = beginClientsRequest();
+    if (
+      agencyContext.role === "agency"
+      && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
+    ) {
+      setClients([]);
+      throw new Error(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : agencyContext.portfolioError || agencyContext.error || "Не удалось загрузить портфель агентства.",
+      );
+    }
     const payload = await req<unknown>("/clients?status=active");
-    setClients(normalizeListPayload(payload, isClientItem, "клиентов"));
-  }, [req]);
+    if (!isCurrentRequest()) return;
+    const rows = normalizeListPayload(payload, isClientItem, "клиентов");
+    const allowedIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    setClients(allowedIds ? rows.filter((client) => allowedIds.has(client.id)) : rows);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.error,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectedAgencyId,
+    agencyContext.selectionRequired,
+    beginClientsRequest,
+    req,
+  ]);
 
   const buildOverviewQuery = useCallback(() => {
     return getQuery({ date_from: dateFrom, date_to: dateTo, client_id: clientId || undefined });
   }, [dateFrom, dateTo, clientId]);
 
   const loadOverviewData = useCallback(async () => {
+    const isCurrentRequest = beginOverviewRequest();
+    if (
+      agencyContext.role === "agency"
+      && (
+        !agencyContext.portfolioReady
+        || !clientId
+        || !agencyContext.clientIds.includes(clientId)
+      )
+    ) {
+      return;
+    }
     const query = buildOverviewQuery();
     const statsQuery = getQuery({
       date_from: dateFrom,
@@ -250,13 +296,29 @@ export default function HomePage() {
     const nextInsights = normalizeListPayload(ops, isInsightItem, "рекомендаций");
     const nextActions = normalizeListPayload(acts, isActionItem, "действий");
 
+    if (!isCurrentRequest()) return;
+
     setOverview(nextOverview);
     setDailyRows(nextStats);
     setOperationalInsights(nextInsights);
     setRecentActions(nextActions);
-  }, [req, buildOverviewQuery, clientId, listActions, dateFrom, dateTo, platform]);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    req,
+    buildOverviewQuery,
+    clientId,
+    listActions,
+    dateFrom,
+    dateTo,
+    platform,
+    beginOverviewRequest,
+  ]);
 
   const loadClientOpsData = useCallback(async () => {
+    const isCurrentRequest = beginClientOpsRequest();
+    if (agencyContext.role === "agency" && !agencyContext.portfolioReady) return;
     const query = getQuery({ date_from: dateFrom, date_to: dateTo });
     const [agency, bgs] = await Promise.all([
       req<unknown>(`/agency/overview${query}`),
@@ -264,16 +326,31 @@ export default function HomePage() {
     ]);
     const nextAgencyOverview = normalizeAgencyOverviewPayload(agency);
     const nextBudgets = normalizeListPayload(bgs, isBudgetItem, "бюджетов");
-    setAgencyOverview(nextAgencyOverview);
-    setBudgets(nextBudgets);
-  }, [req, dateFrom, dateTo]);
+    if (!isCurrentRequest()) return;
+    const allowedIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    const visibleAgencyOverview = allowedIds
+      ? {
+          ...nextAgencyOverview,
+          totals: {
+            ...nextAgencyOverview.totals,
+            spend: (nextAgencyOverview.per_client || [])
+              .filter((row) => allowedIds.has(row.client_id))
+              .reduce((sum, row) => sum + Number(row.spend || 0), 0),
+          },
+          per_client: (nextAgencyOverview.per_client || []).filter((row) => allowedIds.has(row.client_id)),
+          per_account: (nextAgencyOverview.per_account || []).filter((row) => allowedIds.has(row.client_id)),
+        }
+      : nextAgencyOverview;
+    setAgencyOverview(visibleAgencyOverview);
+    setBudgets(allowedIds ? nextBudgets.filter((budget) => allowedIds.has(budget.client_id)) : nextBudgets);
+  }, [agencyContext.clientIds, agencyContext.portfolioReady, agencyContext.role, beginClientOpsRequest, req, dateFrom, dateTo]);
 
   const refresh = useCallback(async () => {
     try {
       setWarning("");
       await Promise.all([loadOverviewData(), loadClientOpsData()]);
     } catch (err) {
-      setWarning(err instanceof Error ? err.message : "Failed to load data");
+      setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные");
     }
   }, [loadOverviewData, loadClientOpsData]);
 
@@ -282,7 +359,7 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void resolveAuth()
       .then((role) => {
         if (role === "client") {
@@ -296,13 +373,24 @@ export default function HomePage() {
         void loadClients();
       })
       .catch((err) => {
-        setWarning(err instanceof Error ? err.message : "Failed to resolve session");
+        setWarning(err instanceof Error ? err.message : "Не удалось проверить сессию");
         setAuthResolved(true);
       });
-  }, [ready, resolveAuth, router, loadClients]);
+  }, [agencyContext.loading, ready, resolveAuth, router, loadClients]);
 
-useEffect(() => {
-    if (clientId) return;
+  useEffect(() => {
+    setClientId("");
+    setClients([]);
+    setOverview(null);
+    setDailyRows([]);
+    setOperationalInsights([]);
+    setRecentActions([]);
+    setAgencyOverview(null);
+    setBudgets([]);
+  }, [agencyContext.selectedAgencyId]);
+
+  useEffect(() => {
+    if (clientId && clients.some((client) => client.id === clientId)) return;
     if (currentRole === "agency" && clients.length > 0) {
       setClientId(clients[0].id);
       return;
@@ -314,9 +402,10 @@ useEffect(() => {
 
   useEffect(() => {
     if (currentRole === "agency" && !clientId) return;
+    if (currentRole === "agency" && !agencyContext.portfolioReady) return;
     if (!ready || !authResolved || (currentRole !== "admin" && currentRole !== "agency")) return;
     void refresh();
-  }, [ready, authResolved, currentRole, dateFrom, dateTo, clientId, platform, refresh]);
+  }, [agencyContext.portfolioReady, ready, authResolved, currentRole, dateFrom, dateTo, clientId, platform, refresh]);
 
   useEffect(() => {
     const from = new Date(`${dateFrom}T00:00:00`);
@@ -455,6 +544,14 @@ useEffect(() => {
     [effectiveOverview]
   );
 
+  const dashboardDataState = useMemo(
+    () => platform === "all"
+      ? overviewDataFreshness(effectiveOverview)
+      : metricRowsFreshness(dailyRows.filter((row) => row.platform === platform)),
+    [dailyRows, effectiveOverview, platform]
+  );
+  const dashboardDataMeta = dataFreshnessMeta(dashboardDataState);
+
   const clientOpsRows = useMemo(() => {
     if (!agencyOverview) return [] as ClientOpsRow[];
     const clientBudgetMap = new Map<string, Budget>();
@@ -467,6 +564,9 @@ useEffect(() => {
     const spendByClient = new Map<string, { spend: number }>();
     for (const row of agencyOverview.per_client || []) spendByClient.set(row.client_id, row);
     const maxSpend = Math.max(1, ...(agencyOverview.per_client || []).map((x) => Number(x.spend || 0)));
+    const hasMixedClientCurrencies = new Set(
+      clients.map((client) => currencyByClient.get(client.id) || "USD"),
+    ).size > 1;
 
     const lastActionByClient = new Map<string, OperationalAction>();
     for (const a of recentActions || []) {
@@ -480,8 +580,7 @@ useEffect(() => {
         const currency = currencyByClient.get(c.id) || "USD";
         const usage = budget > 0 ? (spend / budget) * 100 : null;
         const pace: ClientOpsRow["pace"] = usage == null ? "no_budget" : usage >= 90 ? "critical" : usage >= 70 ? "warning" : "stable";
-        const riskBase = usage == null ? 58 : usage;
-        const riskScore = Math.max(1, Math.min(99, Math.round(riskBase + (spend / maxSpend) * 12)));
+        const riskScore = calculateClientRiskScore(usage, spend, maxSpend, !hasMixedClientCurrencies);
         const owner = (c.name || "NA")
           .split(" ")
           .map((x) => x[0] || "")
@@ -551,6 +650,17 @@ useEffect(() => {
 
   const runInsightAction = useCallback(
     async (row: OperationalInsight) => {
+      const scopedClientId = row.scope === "client"
+        ? row.scope_id
+        : overview?.scope?.client_id || clientId;
+      if (
+        currentRole === "agency"
+        && (!agencyContext.portfolioReady || !scopedClientId || !agencyContext.clientIds.includes(scopedClientId))
+      ) {
+        push("Действие недоступно: клиент не входит в выбранное агентство.", "error");
+        return;
+      }
+      const isCurrentRequest = beginActionRequest();
       try {
         const payload: Record<string, unknown> = {
           action: row.action,
@@ -575,17 +685,35 @@ useEffect(() => {
           account_id: payload.account_id as string | undefined,
         });
         const acts = await listActions({ clientId: clientId || undefined });
-        setRecentActions(Array.isArray(acts) ? acts : []);
+        if (isCurrentRequest()) setRecentActions(Array.isArray(acts) ? acts : []);
         push("Задача добавлена в очередь. Рекламный кабинет автоматически не изменён.", "success");
       } catch (error) {
         push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
       }
     },
-    [executeAction, listActions, overview, clientId, push]
+    [
+      agencyContext.clientIds,
+      agencyContext.portfolioReady,
+      beginActionRequest,
+      clientId,
+      currentRole,
+      executeAction,
+      listActions,
+      overview,
+      push,
+    ]
   );
 
   const runClientAlertAction = useCallback(
     async (row: ClientOpsRow, action: "cap" | "review") => {
+      if (
+        currentRole === "agency"
+        && (!agencyContext.portfolioReady || !agencyContext.clientIds.includes(row.id))
+      ) {
+        push("Действие недоступно: клиент не входит в выбранное агентство.", "error");
+        return;
+      }
+      const isCurrentRequest = beginActionRequest();
       try {
         await executeAction({
           action,
@@ -597,13 +725,13 @@ useEffect(() => {
           client_id: row.id,
         });
         const acts = await listActions({ clientId: clientId || undefined });
-        setRecentActions(Array.isArray(acts) ? acts : []);
+        if (isCurrentRequest()) setRecentActions(Array.isArray(acts) ? acts : []);
         push(`Задача для ${row.name} добавлена в очередь`, "success");
       } catch (error) {
         push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
       }
     },
-    [executeAction, listActions, clientId, push]
+    [agencyContext.clientIds, agencyContext.portfolioReady, beginActionRequest, clientId, currentRole, executeAction, listActions, push]
   );
 
   const runAccountAction = useCallback(
@@ -614,6 +742,19 @@ useEffect(() => {
           : label.toLocaleLowerCase("ru").includes("огранич")
           ? "cap"
           : "review";
+      if (
+        currentRole === "agency"
+        && (
+          !agencyContext.portfolioReady
+          || !clientId
+          || !agencyContext.clientIds.includes(clientId)
+          || !overview?.breakdowns?.accounts?.some((account) => account.account_id === accountId && account.client_id === clientId)
+        )
+      ) {
+        push("Действие недоступно: аккаунт не входит в выбранное агентство.", "error");
+        return;
+      }
+      const isCurrentRequest = beginActionRequest();
       try {
         await executeAction({
           action,
@@ -626,13 +767,23 @@ useEffect(() => {
           account_id: accountId,
         });
         const acts = await listActions({ clientId: clientId || undefined });
-        setRecentActions(Array.isArray(acts) ? acts : []);
+        if (isCurrentRequest()) setRecentActions(Array.isArray(acts) ? acts : []);
         push("Задача добавлена в очередь. Изменение ещё не применено к рекламной платформе.", "success");
       } catch (error) {
         push(error instanceof Error ? error.message : "Не удалось создать задачу", "error");
       }
     },
-    [clientId, executeAction, listActions, push]
+    [
+      agencyContext.clientIds,
+      agencyContext.portfolioReady,
+      beginActionRequest,
+      clientId,
+      currentRole,
+      executeAction,
+      listActions,
+      overview,
+      push,
+    ]
   );
 
   const asOfText = overview ? `Данные на ${overview.range.as_of_date} • ${overview.range.timezone_policy}` : "Данные обновляются";
@@ -745,6 +896,8 @@ useEffect(() => {
           {view === "dashboard" ? (
             <DashboardView
               overview={effectiveOverview}
+              dataState={dashboardDataState}
+              dataNotice={dashboardDataMeta.description}
               platform={platform}
               platformRows={platformRows}
               riskRows={riskRows}
@@ -762,7 +915,6 @@ useEffect(() => {
             />
           ) : (
             <ClientOperationsView
-              clientOpsRows={clientOpsRows}
               filteredClientOpsRows={filteredClientOpsRows}
               pagedClientOpsRows={pagedClientOpsRows}
               clients={clients}

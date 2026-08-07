@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -16,8 +17,8 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from app.db import init_sqlite, sqlite_conn
-from app.schemas import AdAccountPatch, AdAccountSyncJobOut, AdStatWrite, AdStatsIngestRequest
-from app.services.ad_accounts import AdAccountStore
+from app.schemas import AdAccountOut, AdAccountPatch, AdAccountSyncJobOut, AdStatWrite, AdStatsIngestRequest
+from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
 from app.services.date_utils import meta_safe_date_from
 from app.services.providers import google_ads, meta, tiktok
 from app.services.ad_stats import AdStatsStore
@@ -27,6 +28,9 @@ class AdAccountSyncJobStore(Protocol):
     def create(self, job: AdAccountSyncJobOut) -> AdAccountSyncJobOut: ...
     def list(self, *, account_id: Optional[UUID] = None, status: Optional[str] = None, limit: int = 50) -> List[AdAccountSyncJobOut]: ...
     def latest_by_account_ids(self, account_ids: List[UUID]) -> Dict[UUID, AdAccountSyncJobOut]: ...
+    def acquire_lease(self, *, lease_key: str, now: datetime, ttl_seconds: int) -> Optional[str]: ...
+    def renew_lease(self, *, lease_key: str, lease_token: str, now: datetime, ttl_seconds: int) -> bool: ...
+    def release_lease(self, *, lease_key: str, lease_token: str) -> None: ...
 
 
 class SqliteAdAccountSyncJobStore:
@@ -119,10 +123,65 @@ class SqliteAdAccountSyncJobStore:
                     out[account_id] = self._to_job(row)
         return out
 
+    def acquire_lease(self, *, lease_key: str, now: datetime, ttl_seconds: int) -> Optional[str]:
+        lease_token = str(uuid4())
+        lease_until = now + timedelta(seconds=max(30, int(ttl_seconds)))
+        with sqlite_conn(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT lease_until FROM ad_account_sync_leases WHERE lease_key=?",
+                (lease_key,),
+            ).fetchone()
+            if row and row["lease_until"]:
+                try:
+                    active_until = datetime.fromisoformat(row["lease_until"])
+                except Exception:
+                    active_until = now
+                if active_until > now:
+                    conn.rollback()
+                    return None
+            conn.execute(
+                """
+                INSERT INTO ad_account_sync_leases (lease_key, lease_token, lease_until, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(lease_key) DO UPDATE SET
+                  lease_token=excluded.lease_token,
+                  lease_until=excluded.lease_until,
+                  updated_at=excluded.updated_at
+                """,
+                (lease_key, lease_token, lease_until.isoformat(), now.isoformat()),
+            )
+            conn.commit()
+        return lease_token
+
+    def release_lease(self, *, lease_key: str, lease_token: str) -> None:
+        with sqlite_conn(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM ad_account_sync_leases WHERE lease_key=? AND lease_token=?",
+                (lease_key, lease_token),
+            )
+            conn.commit()
+
+    def renew_lease(self, *, lease_key: str, lease_token: str, now: datetime, ttl_seconds: int) -> bool:
+        lease_until = now + timedelta(seconds=max(30, int(ttl_seconds)))
+        with sqlite_conn(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ad_account_sync_leases
+                SET lease_until=?, updated_at=?
+                WHERE lease_key=? AND lease_token=?
+                """,
+                (lease_until.isoformat(), now.isoformat(), lease_key, lease_token),
+            )
+            conn.commit()
+        return int(cursor.rowcount or 0) == 1
+
 
 class InMemoryAdAccountSyncJobStore:
     def __init__(self):
         self.items: Dict[UUID, AdAccountSyncJobOut] = {}
+        self.leases: Dict[str, tuple[str, datetime]] = {}
+        self._lease_lock = threading.Lock()
 
     def create(self, job: AdAccountSyncJobOut) -> AdAccountSyncJobOut:
         self.items[job.id] = job
@@ -146,6 +205,32 @@ class InMemoryAdAccountSyncJobStore:
                 result[row.ad_account_id] = row
         return result
 
+    def acquire_lease(self, *, lease_key: str, now: datetime, ttl_seconds: int) -> Optional[str]:
+        with self._lease_lock:
+            existing = self.leases.get(lease_key)
+            if existing and existing[1] > now:
+                return None
+            lease_token = str(uuid4())
+            self.leases[lease_key] = (lease_token, now + timedelta(seconds=max(30, int(ttl_seconds))))
+            return lease_token
+
+    def release_lease(self, *, lease_key: str, lease_token: str) -> None:
+        with self._lease_lock:
+            existing = self.leases.get(lease_key)
+            if existing and existing[0] == lease_token:
+                self.leases.pop(lease_key, None)
+
+    def renew_lease(self, *, lease_key: str, lease_token: str, now: datetime, ttl_seconds: int) -> bool:
+        with self._lease_lock:
+            existing = self.leases.get(lease_key)
+            if not existing or existing[0] != lease_token:
+                return False
+            self.leases[lease_key] = (
+                lease_token,
+                now + timedelta(seconds=max(30, int(ttl_seconds))),
+            )
+            return True
+
 
 @dataclass
 class SyncRunResult:
@@ -160,8 +245,44 @@ class SyncRunResult:
     finished_at: datetime
 
 
+@dataclass
+class DueSyncRunResult:
+    lease_acquired: bool
+    selected_account_ids: List[UUID]
+    sync_result: Optional[SyncRunResult]
+    started_at: datetime
+    finished_at: datetime
+
+
+class ProviderPayloadValidationError(ValueError):
+    """Raised when provider metrics cannot be safely assigned to the requested window."""
+
+
+class MissingScopedCredentialsError(RuntimeError):
+    """A tenant-scoped sync has no tenant-owned provider credentials."""
+
+
 class AdAccountSyncService:
     DEFAULT_INITIAL_LOOKBACK_DAYS = 180
+    PROVIDER_DATE_FIELDS = ("date", "date_start", "day", "stat_time_day")
+    ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+    def _eligible_active_accounts(self) -> List[AdAccountOut]:
+        """Return active accounts whose parent client is also active.
+
+        Client archival is intentionally reversible, so child rows stay intact.
+        They must not, however, continue consuming provider quota or appearing in
+        scheduled work while their parent client is archived/inactive.
+        """
+        accounts = self.account_store.list(status="active")
+        client_store = getattr(self.account_store, "client_store", None)
+        if client_store is None:
+            eligible = accounts
+        else:
+            active_client_ids = {client.id for client in client_store.list(status="active")}
+            eligible = [account for account in accounts if account.client_id in active_client_ids]
+        conflict_ids = active_assignment_conflict_ids(self.account_store)
+        return [account for account in eligible if account.id not in conflict_ids]
 
     def __init__(
         self,
@@ -185,22 +306,86 @@ class AdAccountSyncService:
             )
         except Exception:
             self.initial_lookback_days = self.DEFAULT_INITIAL_LOOKBACK_DAYS
+        try:
+            self.incremental_overlap_days = max(
+                1,
+                min(30, int(str(os.getenv("AD_SYNC_INCREMENTAL_OVERLAP_DAYS", "3")))),
+            )
+        except Exception:
+            self.incremental_overlap_days = 3
         self.provider_fetchers = provider_fetchers or {
             "meta": self._fetch_meta_daily,
             "google": self._fetch_google_daily,
             "tiktok": self._fetch_tiktok_daily,
         }
 
-    @staticmethod
-    def _row_date_or_default(row: Dict[str, object], fallback: str) -> str:
-        value = (
-            row.get("date")
-            or row.get("date_start")
-            or row.get("day")
-            or row.get("stat_time_day")
-            or fallback
-        )
-        return str(value).strip() or fallback
+    @classmethod
+    def _validated_provider_rows(
+        cls,
+        rows: List[Dict[str, object]],
+        *,
+        requested_from: str,
+        requested_to: str,
+    ) -> List[Dict[str, object]]:
+        """Validate every row before ingesting any of them.
+
+        Provider payloads are untrusted. In particular, assigning a missing or
+        malformed date to the request boundary fabricates fresh metrics. Accept
+        only an exact ISO calendar date from a known provider field and require
+        it to be inside the requested inclusive range.
+        """
+        range_from = date.fromisoformat(requested_from)
+        range_to = date.fromisoformat(requested_to)
+        validated: List[Dict[str, object]] = []
+
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ProviderPayloadValidationError(
+                    f"Provider payload row {index} is not an object"
+                )
+
+            parsed_fields: List[tuple[str, date]] = []
+            for field in cls.PROVIDER_DATE_FIELDS:
+                raw_value = row.get(field)
+                if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                    continue
+                if not isinstance(raw_value, str):
+                    raise ProviderPayloadValidationError(
+                        f"Provider payload row {index} has a non-string {field}"
+                    )
+                value = raw_value.strip()
+                if not cls.ISO_DATE_PATTERN.fullmatch(value):
+                    raise ProviderPayloadValidationError(
+                        f"Provider payload row {index} has invalid ISO date in {field}"
+                    )
+                try:
+                    parsed_value = date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ProviderPayloadValidationError(
+                        f"Provider payload row {index} has invalid calendar date in {field}"
+                    ) from exc
+                parsed_fields.append((field, parsed_value))
+
+            if not parsed_fields:
+                raise ProviderPayloadValidationError(
+                    f"Provider payload row {index} is missing a date"
+                )
+
+            row_date = parsed_fields[0][1]
+            if any(candidate != row_date for _, candidate in parsed_fields[1:]):
+                raise ProviderPayloadValidationError(
+                    f"Provider payload row {index} contains conflicting dates"
+                )
+            if row_date < range_from or row_date > range_to:
+                raise ProviderPayloadValidationError(
+                    f"Provider payload row {index} date is outside the requested range"
+                )
+
+            normalized = dict(row)
+            normalized["date"] = row_date.isoformat()
+            validated.append(normalized)
+
+        return validated
 
     @staticmethod
     def _to_int(value: object) -> int:
@@ -229,7 +414,6 @@ class AdAccountSyncService:
         account_id: UUID,
         platform: str,
         rows: List[Dict[str, object]],
-        default_date: str,
     ) -> int:
         if not rows:
             return 0
@@ -237,7 +421,7 @@ class AdAccountSyncService:
             rows=[
                 AdStatWrite(
                     ad_account_id=account_id,
-                    date=self._row_date_or_default(row, default_date),
+                    date=str(row["date"]),
                     platform=platform,
                     impressions=self._to_int(row.get("impressions")),
                     clicks=self._to_int(row.get("clicks")),
@@ -261,6 +445,10 @@ class AdAccountSyncService:
 
     @staticmethod
     def _classify_error(exc: Exception) -> tuple[str, str, bool]:
+        if isinstance(exc, ProviderPayloadValidationError):
+            return ("provider_payload_invalid", "validation", False)
+        if isinstance(exc, MissingScopedCredentialsError):
+            return ("provider_credentials_missing", "configuration", False)
         raw = AdAccountSyncService._to_error_message(exc).lower()
         if isinstance(exc, HTTPException):
             status = int(exc.status_code or 0)
@@ -330,11 +518,17 @@ class AdAccountSyncService:
             from_date = explicit_from
         else:
             if backfill_completed_at:
-                last_sync = self._parse_last_sync_date(getattr(account, "last_sync_at", None))
-                if not last_sync:
-                    last_sync = self._parse_last_sync_date(meta.get("last_sync_at"))
-                if last_sync:
-                    from_date = last_sync
+                latest_data_date = self._parse_last_sync_date(meta.get("latest_data_date"))
+                if not latest_data_date:
+                    latest_data_date = self._parse_last_sync_date(meta.get("last_data_at"))
+                if not latest_data_date:
+                    # Legacy fallback only. New writers persist the exact newest
+                    # metric date separately from the request heartbeat.
+                    latest_data_date = self._parse_last_sync_date(getattr(account, "last_sync_at", None))
+                if not latest_data_date:
+                    latest_data_date = self._parse_last_sync_date(meta.get("last_sync_at"))
+                if latest_data_date:
+                    from_date = latest_data_date - timedelta(days=self.incremental_overlap_days - 1)
                 else:
                     from_date = explicit_to - timedelta(days=self.initial_lookback_days - 1)
             else:
@@ -389,7 +583,7 @@ class AdAccountSyncService:
         started_at = _utcnow()
         sync_to = date_to or started_at.date()
 
-        accounts = self.account_store.list(status="all")
+        accounts = self._eligible_active_accounts()
         if account_ids is not None:
             wanted = set(account_ids)
             accounts = [a for a in accounts if a.id in wanted]
@@ -406,6 +600,11 @@ class AdAccountSyncService:
         for account in accounts:
             s_at = _utcnow()
             provider = str(account.platform or "").lower().strip()
+            account_meta = account.metadata or {}
+            is_initial_backfill = (
+                date_from is None
+                and self._parse_last_sync_date(account_meta.get("history_backfill_completed_at")) is None
+            )
             from_str, to_str = self._resolve_date_range_for_account(
                 account=account,
                 explicit_from=date_from,
@@ -436,33 +635,49 @@ class AdAccountSyncService:
                 retryable = False
                 next_retry_at = None
                 used_credential_id: Optional[str] = None
+                provider_rows_count = 0
+                latest_data_date: Optional[str] = None
             else:
                 used_credential_id = None
+                provider_rows_count = 0
+                latest_data_date = None
                 try:
-                    credential_candidates: List[Dict[str, object]] = []
+                    credential_candidates: List[Optional[Dict[str, object]]] = []
                     if self.credential_candidates_resolver:
                         credential_candidates = self.credential_candidates_resolver(provider, account.client_id, user_id) or []
                     elif self.credential_resolver:
                         single = self.credential_resolver(provider, account.client_id, user_id)
-                        if single:
+                        if single is not None:
                             credential_candidates = [single]
+                    if user_id is not None:
+                        credential_candidates = [
+                            candidate for candidate in credential_candidates if candidate is not None
+                        ]
                     if not credential_candidates:
-                        credential_candidates = [{}]
+                        if user_id is None:
+                            # Admin/scheduler runs may intentionally use the
+                            # platform-owned legacy environment credential path.
+                            credential_candidates = [None]
+                        else:
+                            raise MissingScopedCredentialsError(
+                                "Provider credentials are missing or incomplete."
+                            )
 
                     preferred_credential_id = str((account.metadata or {}).get("integration_credential_id") or "").strip()
                     if preferred_credential_id:
-                        preferred = [c for c in credential_candidates if str(c.get("__credential_id") or "") == preferred_credential_id]
-                        remaining = [c for c in credential_candidates if str(c.get("__credential_id") or "") != preferred_credential_id]
+                        preferred = [c for c in credential_candidates if str((c or {}).get("__credential_id") or "") == preferred_credential_id]
+                        remaining = [c for c in credential_candidates if str((c or {}).get("__credential_id") or "") != preferred_credential_id]
                         credential_candidates = [*preferred, *remaining]
 
                     used_credential_id: Optional[str] = None
                     last_exc: Optional[Exception] = None
                     rows: List[Dict[str, object]] = []
                     for candidate in credential_candidates:
-                        used_credential_id = str(candidate.get("__credential_id") or "").strip() or None
-                        provider_credentials = dict(candidate)
-                        provider_credentials.pop("__credential_id", None)
-                        provider_credentials.pop("__connection_key", None)
+                        used_credential_id = str((candidate or {}).get("__credential_id") or "").strip() or None
+                        provider_credentials = None if candidate is None else dict(candidate)
+                        if provider_credentials is not None:
+                            provider_credentials.pop("__credential_id", None)
+                            provider_credentials.pop("__connection_key", None)
                         try:
                             try:
                                 rows = fetcher(account.external_account_id, from_str, to_str, provider_credentials)
@@ -476,12 +691,20 @@ class AdAccountSyncService:
                             continue
                     if last_exc is not None:
                         raise last_exc
+                    rows = list(rows or [])
+                    provider_rows_count = len(rows)
+                    rows = self._validated_provider_rows(
+                        rows,
+                        requested_from=from_str,
+                        requested_to=to_str,
+                    )
+                    if rows:
+                        latest_data_date = max(str(row["date"]) for row in rows)
                     status = "success"
                     records = self._ingest_provider_rows(
                         account_id=account.id,
                         platform=provider,
                         rows=rows,
-                        default_date=from_str,
                     )
                     error_message = None
                     error_code = None
@@ -512,7 +735,13 @@ class AdAccountSyncService:
                     retryable=retryable,
                     attempt=attempt,
                     next_retry_at=next_retry_at,
-                    request_meta={"date_from": from_str, "date_to": to_str},
+                    request_meta={
+                        "date_from": from_str,
+                        "date_to": to_str,
+                        "provider_rows_received": provider_rows_count,
+                        "empty_response": status == "success" and provider_rows_count == 0,
+                        "latest_data_date": latest_data_date,
+                    },
                     created_by=created_by,
                     created_at=f_at,
                 )
@@ -520,7 +749,7 @@ class AdAccountSyncService:
             jobs.append(job)
 
             next_meta = dict(account.metadata or {})
-            next_meta["last_sync_at"] = f_at.isoformat()
+            next_meta["last_sync_attempt_at"] = s_at.isoformat()
             next_meta["sync_status"] = status
             next_meta["sync_error"] = error_message
             next_meta["sync_error_code"] = error_code
@@ -529,10 +758,25 @@ class AdAccountSyncService:
             next_meta["sync_next_retry_at"] = next_retry_at.isoformat() if next_retry_at else None
             next_meta["sync_attempt"] = attempt
             next_meta["last_sync_job_id"] = str(job.id)
+            next_meta["sync_data_status"] = (
+                "received" if status == "success" and provider_rows_count > 0 else "empty" if status == "success" else "error"
+            )
             if status == "success":
+                next_meta["last_sync_success_at"] = f_at.isoformat()
+                if provider_rows_count > 0:
+                    # Keep the legacy last_sync_at field, but only advance it when the
+                    # provider actually returned metric rows. Empty API responses no
+                    # longer make account data look fresh.
+                    next_meta["last_sync_at"] = f_at.isoformat()
+                    next_meta["last_data_at"] = latest_data_date
+                    next_meta["latest_data_date"] = latest_data_date
                 if used_credential_id:
                     next_meta["integration_credential_id"] = used_credential_id
-                if not next_meta.get("history_backfill_completed_at"):
+                if (
+                    provider_rows_count > 0
+                    and is_initial_backfill
+                    and not next_meta.get("history_backfill_completed_at")
+                ):
                     next_meta["history_backfill_completed_at"] = f_at.isoformat()
                     next_meta["history_backfill_window_days"] = self.initial_lookback_days
             self.account_store.patch(account.id, AdAccountPatch(metadata=next_meta))
@@ -556,6 +800,156 @@ class AdAccountSyncService:
             started_at=started_at,
             finished_at=finished_at,
         )
+
+    def run_sync_exclusive(
+        self,
+        *,
+        account_ids: Optional[List[UUID]] = None,
+        platform: Optional[str] = None,
+        date_from: Optional[date] = None,
+        date_to: Optional[date] = None,
+        created_by: Optional[UUID] = None,
+        user_id: Optional[UUID] = None,
+        force: bool = False,
+    ) -> SyncRunResult:
+        """Serialize all automatic, login and manual provider sync runs.
+
+        A renewable database lease prevents duplicate provider load and SQLite
+        races across Render instances. The heartbeat keeps long batches from
+        outliving a fixed lease TTL.
+        """
+        started_at = _utcnow()
+        try:
+            lease_seconds = max(60, int(os.getenv("AD_SYNC_RUN_LEASE_SECONDS", "1800")))
+        except (TypeError, ValueError):
+            lease_seconds = 1800
+        lease_key = "ad-account-sync-run"
+        lease_token = self.job_store.acquire_lease(
+            lease_key=lease_key,
+            now=started_at,
+            ttl_seconds=lease_seconds,
+        )
+        if not lease_token:
+            requested = len(account_ids or [])
+            return SyncRunResult(
+                requested=requested,
+                processed=0,
+                skipped=requested,
+                success=0,
+                failed=0,
+                retry_scheduled=0,
+                jobs=[],
+                started_at=started_at,
+                finished_at=_utcnow(),
+            )
+
+        stop_heartbeat = threading.Event()
+
+        def renew_while_running() -> None:
+            interval = max(10, lease_seconds // 3)
+            while not stop_heartbeat.wait(interval):
+                renewed = self.job_store.renew_lease(
+                    lease_key=lease_key,
+                    lease_token=lease_token,
+                    now=_utcnow(),
+                    ttl_seconds=lease_seconds,
+                )
+                if not renewed:
+                    return
+
+        heartbeat = threading.Thread(
+            target=renew_while_running,
+            name="ad-account-sync-lease-heartbeat",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            return self.run_sync(
+                account_ids=account_ids,
+                platform=platform,
+                date_from=date_from,
+                date_to=date_to,
+                created_by=created_by,
+                user_id=user_id,
+                force=force,
+            )
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(timeout=1)
+            self.job_store.release_lease(lease_key=lease_key, lease_token=lease_token)
+
+    def run_due_sync(
+        self,
+        *,
+        batch_size: int = 10,
+        stale_after_hours: int = 24,
+        lease_seconds: int = 900,
+    ) -> DueSyncRunResult:
+        """Run one idempotent batch for active accounts that are actually due.
+
+        Retryable errors are selected only after ``next_retry_at``. Non-retryable
+        errors require a human/configuration fix and are deliberately not hammered
+        by the scheduler. Successful accounts are selected again after the stale
+        interval, and accounts with no job are selected for their initial sync.
+        """
+
+        started_at = _utcnow()
+        lease_key = "ad-account-sync-due"
+        lease_token = self.job_store.acquire_lease(
+            lease_key=lease_key,
+            now=started_at,
+            ttl_seconds=max(30, int(lease_seconds)),
+        )
+        if not lease_token:
+            return DueSyncRunResult(
+                lease_acquired=False,
+                selected_account_ids=[],
+                sync_result=None,
+                started_at=started_at,
+                finished_at=_utcnow(),
+            )
+
+        try:
+            accounts = self._eligible_active_accounts()
+            latest = self.job_store.latest_by_account_ids([a.id for a in accounts])
+            stale_cutoff = started_at - timedelta(hours=max(1, int(stale_after_hours)))
+            due: List[tuple[int, datetime, object]] = []
+
+            for account in accounts:
+                job = latest.get(account.id)
+                if not job:
+                    due.append((1, datetime.min, account))
+                    continue
+                if job.status == "error":
+                    if job.retryable and (not job.next_retry_at or job.next_retry_at <= started_at):
+                        due.append((0, job.next_retry_at or job.started_at, account))
+                    continue
+                completed_at = job.finished_at or job.started_at
+                if completed_at <= stale_cutoff:
+                    due.append((2, completed_at, account))
+
+            due.sort(key=lambda item: (item[0], item[1], str(item[2].id)))
+            selected = [item[2] for item in due[: max(1, min(int(batch_size), 100))]]
+            selected_ids = [account.id for account in selected]
+            if not selected_ids:
+                return DueSyncRunResult(
+                    lease_acquired=True,
+                    selected_account_ids=[],
+                    sync_result=None,
+                    started_at=started_at,
+                    finished_at=_utcnow(),
+                )
+
+            sync_result = self.run_sync_exclusive(account_ids=selected_ids, force=False)
+            return DueSyncRunResult(
+                lease_acquired=True,
+                selected_account_ids=selected_ids,
+                sync_result=sync_result,
+                started_at=started_at,
+                finished_at=_utcnow(),
+            )
+        finally:
+            self.job_store.release_lease(lease_key=lease_key, lease_token=lease_token)
 
     def list_jobs(self, *, account_id: Optional[UUID] = None, status: Optional[str] = None, limit: int = 50) -> List[AdAccountSyncJobOut]:
         return self.job_store.list(account_id=account_id, status=status, limit=limit)

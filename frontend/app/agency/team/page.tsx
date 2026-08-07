@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
 import { ToastHost } from "../../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../../hooks/useAgencyContext";
+import { useScopeRequestGuard } from "../../../hooks/useScopeRequestGuard";
 import { useSession } from "../../../hooks/useSession";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson } from "../../../lib/api";
@@ -11,21 +13,24 @@ import {
   AgencyInviteIssueResponse,
   AgencyInviteOut,
   AgencyMemberOut,
-  AgencyOut,
   AuthUser,
 } from "../../../lib/types";
 
 export default function AgencyTeamPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { session, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
   const { toasts, push } = useToast();
-  const [agency, setAgency] = useState<AgencyOut | null>(null);
+  const agency = agencyContext.selectedAgency;
   const [members, setMembers] = useState<AgencyMemberOut[]>([]);
   const [invites, setInvites] = useState<AgencyInviteOut[]>([]);
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [email, setEmail] = useState("");
   const [memberRole, setMemberRole] = useState<"owner" | "manager" | "member">("member");
   const [warning, setWarning] = useState("");
+  const canManageTeam = agencyContext.currentMember?.role === "owner" || agencyContext.currentMember?.role === "manager";
+  const canInviteOwner = agencyContext.currentMember?.role === "owner";
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -33,42 +38,73 @@ export default function AgencyTeamPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
     try {
-      const agencies = await req<{ items: AgencyOut[] }>("/platform/agencies?status=active");
-      const currentAgency = agencies.items?.[0] || null;
-      setAgency(currentAgency);
-      if (!currentAgency) {
+      const currentAgency = agencyContext.selectedAgency;
+      if (!currentAgency || !agencyContext.portfolioReady) {
         setMembers([]);
         setInvites([]);
-        setWarning("Для пользователя не найдено агентство.");
+        setWarning(
+          agencyContext.selectionRequired
+            ? agencySelectionRequiredMessage()
+            : agencyContext.portfolioError || agencyContext.error || "Для пользователя не найдено активное агентство.",
+        );
         return;
       }
       const [memberRows, inviteRows] = await Promise.all([
         req<AgencyMemberOut[]>(`/platform/agencies/${currentAgency.id}/members`),
         req<AgencyInviteOut[]>(`/platform/agencies/${currentAgency.id}/invites?status=all`),
       ]);
+      if (!isCurrentRequest()) return;
       setMembers(memberRows || []);
       setInvites(inviteRows || []);
       try {
         const userRows = await req<{ items: AuthUser[] }>("/auth/internal/users");
-        setUsers(userRows.items || []);
+        if (isCurrentRequest()) setUsers(userRows.items || []);
       } catch {
-        setUsers([]);
+        if (isCurrentRequest()) setUsers([]);
       }
-      setWarning("");
+      if (isCurrentRequest()) setWarning("");
     } catch (error) {
       setWarning(error instanceof Error ? error.message : "Не удалось загрузить команду");
     }
-  }, [req]);
+  }, [
+    agencyContext.error,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.selectedAgency,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    setMembers([]);
+    setInvites([]);
+    setUsers([]);
+    setMemberRole("member");
+  }, [agencyContext.selectedAgencyId]);
+
+  useEffect(() => {
+    if (!canInviteOwner && memberRole === "owner") setMemberRole("member");
+  }, [canInviteOwner, memberRole]);
+
+  useEffect(() => {
+    if (!ready || agencyContext.loading) return;
     void loadData();
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
 
   const usersById = useMemo(() => new Map(users.map((item) => [item.id, item])), [users]);
 
   async function inviteMember() {
+    if (!canManageTeam) {
+      push("Приглашать сотрудников может владелец или менеджер агентства", "error");
+      return;
+    }
+    if (memberRole === "owner" && !canInviteOwner) {
+      push("Назначать владельцев может только владелец агентства", "error");
+      return;
+    }
     if (!agency || !email.trim()) {
       push("Введите email сотрудника", "error");
       return;
@@ -102,7 +138,7 @@ export default function AgencyTeamPage() {
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
 
-          <section className="panel access-assign-panel">
+          {canManageTeam ? <section className="panel access-assign-panel">
             <div>
               <h3>Пригласить сотрудника</h3>
               <div className="panel-subtitle">Доступ появится после принятия приглашения.</div>
@@ -117,12 +153,17 @@ export default function AgencyTeamPage() {
                 <select value={memberRole} onChange={(event) => setMemberRole(event.target.value as typeof memberRole)}>
                   <option value="member">Сотрудник</option>
                   <option value="manager">Менеджер</option>
-                  <option value="owner">Владелец</option>
+                  {canInviteOwner ? <option value="owner">Владелец</option> : null}
                 </select>
               </label>
               <button className="primary-btn" onClick={() => void inviteMember()} disabled={!agency}>Отправить приглашение</button>
             </div>
-          </section>
+          </section> : (
+            <section className="panel">
+              <h3>Команда агентства</h3>
+              <div className="panel-subtitle">У вас доступ к просмотру. Приглашения отправляют владелец или менеджер агентства.</div>
+            </section>
+          )}
 
           <section className="role-dashboard-grid">
             <article className="panel">

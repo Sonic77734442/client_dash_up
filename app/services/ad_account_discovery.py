@@ -14,6 +14,7 @@ from fastapi import HTTPException
 
 from app.schemas import AdAccountCreate, AdAccountDiscoverResponse, AdAccountOut, AdAccountPatch
 from app.services.ad_accounts import AdAccountStore
+from app.services.clients import ClientStore
 from app.services.providers import google_ads, meta, tiktok
 
 
@@ -87,11 +88,17 @@ class AdAccountDiscoveryService:
         self,
         account_store: AdAccountStore,
         *,
+        client_store: Optional[ClientStore] = None,
         discoverers: Optional[Dict[str, AccountDiscoverer]] = None,
-        credential_resolver: Optional[Callable[[str, UUID, Optional[UUID]], Optional[Dict[str, object]]]] = None,
-        credential_candidates_resolver: Optional[Callable[[str, UUID, Optional[UUID]], List[Dict[str, object]]]] = None,
+        credential_resolver: Optional[
+            Callable[[str, UUID, Optional[UUID], Optional[UUID]], Optional[Dict[str, object]]]
+        ] = None,
+        credential_candidates_resolver: Optional[
+            Callable[[str, UUID, Optional[UUID], Optional[UUID]], List[Dict[str, object]]]
+        ] = None,
     ):
         self.account_store = account_store
+        self.client_store = client_store or getattr(account_store, "client_store", None)
         self.credential_resolver = credential_resolver
         self.credential_candidates_resolver = credential_candidates_resolver
         self.discoverers: Dict[str, AccountDiscoverer] = discoverers or {
@@ -104,17 +111,18 @@ class AdAccountDiscoveryService:
     def _discover_meta_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
             rows = meta.list_accounts(credentials)
-            if rows:
+            if rows or credentials:
                 return rows
         except Exception:
-            pass
+            if credentials:
+                raise
         return _fallback_meta_accounts()
 
     @staticmethod
     def _discover_google_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
             rows = google_ads.list_accounts(credentials)
-            if rows:
+            if rows or credentials:
                 return rows
         except Exception:
             # If tenant-scoped credentials are provided, surface provider errors to caller
@@ -127,10 +135,11 @@ class AdAccountDiscoveryService:
     def _discover_tiktok_accounts(credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]:
         try:
             rows = tiktok.list_accounts(credentials)
-            if rows:
+            if rows or credentials:
                 return rows
         except Exception:
-            pass
+            if credentials:
+                raise
         return _fallback_tiktok_accounts()
 
     @staticmethod
@@ -142,12 +151,20 @@ class AdAccountDiscoveryService:
             return str(detail)
         return str(exc) or "Provider discovery failed"
 
+    @staticmethod
+    def _is_assignment_conflict(exc: HTTPException) -> bool:
+        detail = exc.detail
+        if isinstance(detail, dict):
+            return str(detail.get("code") or "").strip().lower() == "assignment_conflict"
+        return "assignment_conflict" in str(detail or "").lower()
+
     def discover(
         self,
         *,
         provider: Optional[str],
         client_id: UUID,
         user_id: Optional[UUID] = None,
+        agency_id: Optional[UUID] = None,
         upsert_existing: bool = True,
         expected_currency: Optional[str] = None,
     ) -> DiscoveryResult:
@@ -159,14 +176,30 @@ class AdAccountDiscoveryService:
                 raise HTTPException(status_code=400, detail="Unsupported provider for discovery")
             providers = [provider_filter]
 
+        all_accounts = self.account_store.list(status="all")
         existing = {
             (
                 str(a.client_id),
                 (a.platform or "").lower().strip(),
                 _canonical_external_id((a.platform or "").lower().strip(), a.external_account_id),
             ): a
-            for a in self.account_store.list(client_id=client_id, status="all")
+            for a in all_accounts
+            if a.client_id == client_id
         }
+        active_client_ids = (
+            {client.id for client in self.client_store.list(status="active")}
+            if self.client_store is not None
+            else None
+        )
+        active_assignments: Dict[tuple[str, str], List[AdAccountOut]] = {}
+        for account in all_accounts:
+            if account.status != "active":
+                continue
+            if active_client_ids is not None and account.client_id not in active_client_ids:
+                continue
+            account_provider = (account.platform or "").lower().strip()
+            identity = (account_provider, _canonical_external_id(account_provider, account.external_account_id))
+            active_assignments.setdefault(identity, []).append(account)
         now_iso = _utcnow().isoformat()
 
         created = 0
@@ -189,20 +222,33 @@ class AdAccountDiscoveryService:
 
             candidate_credentials: List[Optional[Dict[str, object]]] = []
             if self.credential_candidates_resolver:
-                rows = self.credential_candidates_resolver(p, client_id, user_id)
+                rows = self.credential_candidates_resolver(p, client_id, user_id, agency_id)
                 candidate_credentials = rows if rows else []
             elif self.credential_resolver:
-                candidate_credentials = [self.credential_resolver(p, client_id, user_id)]
+                single = self.credential_resolver(p, client_id, user_id, agency_id)
+                candidate_credentials = [single] if single is not None else []
             else:
                 candidate_credentials = []
+            if user_id is not None:
+                candidate_credentials = [candidate for candidate in candidate_credentials if candidate is not None]
             if not candidate_credentials:
-                candidate_credentials = [None]
+                if user_id is None:
+                    # Platform-admin and scheduler runs may intentionally use the
+                    # legacy, platform-owned environment credentials.
+                    candidate_credentials = [None]
+                else:
+                    # A tenant-scoped run must never reinterpret an empty
+                    # credential resolution as permission to use platform-owned
+                    # environment secrets.
+                    providers_failed[p] = "Provider credentials are missing or incomplete."
+                    continue
 
             for candidate in candidate_credentials:
                 cred_id = str((candidate or {}).get("__credential_id") or "").strip() or None
-                provider_credentials = dict(candidate or {})
-                provider_credentials.pop("__credential_id", None)
-                provider_credentials.pop("__connection_key", None)
+                provider_credentials = None if candidate is None else dict(candidate)
+                if provider_credentials is not None:
+                    provider_credentials.pop("__credential_id", None)
+                    provider_credentials.pop("__connection_key", None)
                 try:
                     try:
                         rows = discoverer(provider_credentials) or []
@@ -232,6 +278,20 @@ class AdAccountDiscoveryService:
                         continue
                     key = (str(client_id), p, external_account_id)
                     existing_account = existing.get(key)
+                    conflicting_assignment = next(
+                        (
+                            account
+                            for account in active_assignments.get((p, external_account_id), [])
+                            if account.client_id != client_id
+                        ),
+                        None,
+                    )
+                    # Preserve legacy duplicates already active in the target client, but never
+                    # create/reactivate another active assignment under a different client.
+                    if conflicting_assignment and not (existing_account and existing_account.status == "active"):
+                        skipped += 1
+                        provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
+                        continue
                     discovery_meta = {
                         "discovered_at": now_iso,
                         "discovery_provider": p,
@@ -257,6 +317,8 @@ class AdAccountDiscoveryService:
                         try:
                             patched = self.account_store.patch(existing_account.id, patch)
                             existing[key] = patched
+                            if patched.status == "active":
+                                active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
                         except HTTPException as exc:
@@ -280,11 +342,16 @@ class AdAccountDiscoveryService:
                             )
                         )
                         existing[key] = created_row
+                        active_assignments.setdefault((p, external_account_id), []).append(created_row)
                         items.append(created_row)
                         created += 1
                     except HTTPException as exc:
                         # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
                         if exc.status_code == 409:
+                            if self._is_assignment_conflict(exc):
+                                skipped += 1
+                                provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
+                                continue
                             fallback_existing = existing.get(key)
                             if not fallback_existing:
                                 refreshed = self.account_store.list(client_id=client_id, status="all")
@@ -312,17 +379,13 @@ class AdAccountDiscoveryService:
                                 ),
                             )
                             existing[key] = patched
+                            if patched.status == "active":
+                                active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
                             continue
                         raise
-                    except HTTPException as exc:
-                        if exc.status_code == 409:
-                            skipped += 1
-                            provider_conflicts[p] = provider_conflicts.get(p, 0) + 1
-                            continue
-                        raise
-                
+
             if provider_errors and p not in providers_failed:
                 providers_failed[p] = provider_errors[-1]
 
@@ -337,7 +400,7 @@ class AdAccountDiscoveryService:
             }
 
         for p, count in provider_conflicts.items():
-            providers_failed[p] = f"conflict_skipped:{count}"
+            providers_failed[p] = f"assignment_conflict:{count}"
         for p, count in provider_currency_mismatches.items():
             existing_reason = providers_failed.get(p)
             mismatch_reason = f"currency_mismatch_skipped:{count}"

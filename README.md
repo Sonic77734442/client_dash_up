@@ -183,7 +183,7 @@ Prerequisites:
 
 1. `python3 -m venv .venv`
 2. `source .venv/bin/activate`
-3. `pip install -r requirements.txt`
+3. `pip install -r requirements-dev.txt` for development and tests (`requirements.txt` contains production-only dependencies)
 4. `cp .env.example .env`
 5. `cp accounts.example.json accounts.json` (only for external ad API endpoints)
 6. For production baseline config template:
@@ -332,9 +332,12 @@ Prerequisites:
 ## CI release gate
 - GitHub Actions workflow: `.github/workflows/ci.yml`
 - Enforced checks:
+  - Python and npm dependency vulnerability audits
   - migration sanity check
   - sqlite schema init check
   - `pytest -q`
+  - `frontend npm run lint`
+  - `frontend npm run typecheck`
   - `frontend npm run build`
 
 ## Backup / rollback

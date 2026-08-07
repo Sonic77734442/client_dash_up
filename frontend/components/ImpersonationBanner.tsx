@@ -33,7 +33,9 @@ export function ImpersonationBanner() {
   function returnToAdmin() {
     const { token, apiBase } = consumeImpersonationReturnSession();
     if (apiBase) localStorage.setItem(LS_API_BASE, apiBase);
-    if (token) setSessionToken(token);
+    // An empty return token means the administrator is authenticated by the
+    // HttpOnly cookie. Clear the impersonated bearer token in that case.
+    setSessionToken(token);
     setLabel("");
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
     router.replace("/platform/agencies");

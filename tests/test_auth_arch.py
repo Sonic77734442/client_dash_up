@@ -285,7 +285,10 @@ def test_session_validation_expired_and_inactive_user():
     class FutureDateTime:
         @staticmethod
         def utcnow():
-            return original_datetime.utcnow() + auth_arch_module.timedelta(minutes=2)
+            return (
+                original_datetime.now(auth_arch_module.timezone.utc).replace(tzinfo=None)
+                + auth_arch_module.timedelta(minutes=2)
+            )
 
         @staticmethod
         def fromisoformat(value):
@@ -352,3 +355,52 @@ def test_auth_session_refresh_extends_expiry():
     after_exp = refreshed.json()["expires_at"]
     assert after_exp
     assert after_exp > before_exp
+
+
+def test_deactivated_user_loses_existing_session_and_cannot_use_linked_oauth():
+    reset_state()
+    # Keep a second administrator so the first one may be deactivated safely.
+    admin = mk_user("disabled-admin@example.com", role="admin")
+    mk_user("backup-admin@example.com", role="admin")
+    issued = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": admin["id"], "ttl_minutes": 60},
+    ).json()
+    linked = client.post(
+        "/auth/internal/identities/link",
+        json={
+            "user_id": admin["id"],
+            "provider": "google",
+            "provider_user_id": "disabled-google-id",
+            "email": admin["email"],
+        },
+    )
+    assert linked.status_code == 200
+
+    disabled = client.patch(f"/auth/internal/users/{admin['id']}", json={"status": "inactive"})
+    assert disabled.status_code == 200
+
+    old_session = client.post(
+        "/auth/internal/facade/sessions/context",
+        json={"token": issued["token"]},
+    )
+    assert old_session.status_code == 200
+    assert old_session.json()["valid"] is False
+
+    new_session = client.post(
+        "/auth/internal/sessions/issue",
+        json={"user_id": admin["id"], "ttl_minutes": 60},
+    )
+    assert new_session.status_code == 400
+
+    oauth = client.post(
+        "/auth/internal/facade/external/resolve",
+        json={
+            "provider": "google",
+            "provider_user_id": "disabled-google-id",
+            "email": admin["email"],
+            "default_role": "client",
+            "issue_session": True,
+        },
+    )
+    assert oauth.status_code == 403

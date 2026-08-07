@@ -236,7 +236,7 @@ def test_agency_broad_sync_is_limited_to_assigned_clients_and_explicit_cross_ten
     hidden_account = mk_account(hidden_client["id"], "hidden-sync", admin_token)
 
     app.state.ad_account_sync_service.provider_fetchers = {
-        "meta": lambda external, date_from, date_to: [{"id": external}],
+        "meta": lambda external, date_from, date_to: [{"id": external, "date": date_from}],
     }
 
     agency = mk_user("agency-sync-scope@acl.local", "agency")

@@ -8,6 +8,7 @@ import { ToastHost } from "./ToastHost";
 import { useSession } from "../hooks/useSession";
 import { useToast } from "../hooks/useToast";
 import { fetchJson, getQuery } from "../lib/api";
+import { accountDataFreshness, aggregateAccountFreshness, dataFreshnessMeta, overviewDataFreshness } from "../lib/dataFreshness";
 import { normalizeOverviewPayload } from "../lib/analyticsPayload";
 import {
   hasOptionalStringFields,
@@ -23,7 +24,6 @@ import {
   OperationalAction,
   OperationalInsight,
   Overview,
-  SessionContext,
   TimelinePoint,
 } from "../lib/types";
 
@@ -250,10 +250,8 @@ function paceMeta(status?: string | null) {
 }
 
 function accountStatus(account: AdAccount) {
-  if (account.sync_status === "error") return { label: "Ошибка данных", tone: "bad" as Tone };
-  if (account.status !== "active") return { label: "Неактивен", tone: "warn" as Tone };
-  if (!account.last_sync_at) return { label: "Ожидает данных", tone: "warn" as Tone };
-  return { label: "Данные актуальны", tone: "good" as Tone };
+  const meta = dataFreshnessMeta(accountDataFreshness(account));
+  return { label: meta.label, tone: meta.tone as Tone, description: meta.description };
 }
 
 function MetricCard({
@@ -285,7 +283,6 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   const [periodDays, setPeriodDays] = useState(30);
   const [warning, setWarning] = useState("");
   const [loading, setLoading] = useState(false);
-  const [ctx, setCtx] = useState<SessionContext | null>(null);
   const [clients, setClients] = useState<ClientOut[]>([]);
   const [selectedClientId, setSelectedClientId] = useState("");
   const [activePlatform, setActivePlatform] = useState<PlatformKey>("google");
@@ -305,7 +302,6 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
 
   const loadContext = useCallback(async () => {
     const payload = await fetchJson<AuthMeResponse>(session.apiBase, "/auth/me", session.token);
-    setCtx(payload.session);
     return payload.session;
   }, [session.apiBase, session.token]);
 
@@ -334,9 +330,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       setClients(availableClients);
 
       const clientId =
-        selectedClientId && availableIds.includes(selectedClientId)
+        selectedClientId && availableClients.some((client) => client.id === selectedClientId)
           ? selectedClientId
-          : availableClients[0]?.id || availableIds[0] || "";
+          : availableClients[0]?.id || "";
       setSelectedClientId(clientId);
       if (!clientId) {
         setOverview(null);
@@ -519,7 +515,12 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   const advertisingInsightCopy = advertisingInsight ? insightCopy(advertisingInsight, currency) : null;
   const headlineAction =
     actions.find((action) => actionStatus(action.status).tone === "warn") || actions[0] || null;
-  const pace = paceMeta(overview?.budget_summary?.pace_status);
+  const dataState = overviewDataFreshness(overview);
+  const dataMeta = dataFreshnessMeta(dataState);
+  const rawPace = paceMeta(overview?.budget_summary?.pace_status);
+  const pace = dataState === "current"
+    ? rawPace
+    : { label: dataMeta.label, description: dataMeta.description, tone: dataMeta.tone as Tone };
   const totalSpend = Number(overview?.spend_summary?.spend || 0);
   const totalLeads = Number(overview?.spend_summary?.conversions || 0);
   const totalCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
@@ -532,7 +533,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     ? `${fmtShortDate(overview.range.date_from)} — ${fmtShortDate(overview.range.date_to)}`
     : `${periodDays} дней`;
 
-  const summaryText = totalSpend
+  const summaryText = dataState !== "current"
+    ? dataMeta.description
+    : totalSpend
     ? `За ${periodLabel} рекламные площадки зафиксировали ${fmtNum(totalLeads)} конверсий при расходе ${fmtMoney(
         totalSpend,
         currency
@@ -652,7 +655,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
               </select>
             </label>
             <div className="asof">
-              {overview ? `Обновлено: ${fmtShortDate(overview.range.as_of_date)}` : "Данные загружаются"}
+              {overview ? `${dataMeta.label} · срез на ${fmtShortDate(overview.range.as_of_date)}` : "Данные загружаются"}
             </div>
             <button className="ghost-btn" onClick={() => void loadData()} disabled={loading}>
               {loading ? "Обновляем…" : "Обновить"}
@@ -660,6 +663,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
           </section>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
+          {overview && dataState !== "current" ? (
+            <div className="warning">{dataMeta.description}</div>
+          ) : null}
 
           {activeTab === "overview" ? (
             <>
@@ -718,7 +724,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                 <aside className={`blueprint-note ${headlineInsight?.priority === "high" ? "bad" : ""}`.trim()}>
                   <h3>Главное за период</h3>
                   <p>{summaryText}</p>
-                  {headlineInsight ? (
+                  {dataState === "current" && headlineInsight ? (
                     <>
                       <p>
                         <strong>{headlineInsightCopy?.title}</strong>
@@ -729,8 +735,10 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                         {priorityMeta(headlineInsight.priority).label}
                       </span>
                     </>
-                  ) : (
+                  ) : dataState === "current" ? (
                     <p>Значимых отклонений по текущим правилам не обнаружено.</p>
+                  ) : (
+                    <p>Оценка отклонений приостановлена до подтверждённого обновления данных.</p>
                   )}
                 </aside>
               </section>
@@ -742,8 +750,10 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                     {PLATFORMS.map((platform) => {
                       const row = platformRows.find((item) => item.platform === platform.key);
                       const relatedAccounts = accounts.filter((account) => account.platform === platform.key);
-                      const hasError = relatedAccounts.some((account) => account.sync_status === "error");
-                      const tone: Tone = hasError ? "bad" : row || relatedAccounts.length ? "good" : "";
+                      const platformDataMeta = dataFreshnessMeta(
+                        aggregateAccountFreshness(relatedAccounts, { hasMetricRows: Boolean(row) })
+                      );
+                      const tone: Tone = relatedAccounts.length ? platformDataMeta.tone as Tone : "";
                       return (
                         <div className="decision-row" key={platform.key}>
                           <span className={`decision-dot badge ${tone}`.trim()} aria-hidden="true">•</span>
@@ -752,7 +762,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                             <div className="panel-subtitle">
                               {!relatedAccounts.length
                                 ? "Не подключено"
-                                : `${relatedAccounts.length} аккаунт(а) · ${fmtMoney(row?.spend || 0, currency)} · ${fmtNum(
+                                : `${platformDataMeta.label} · ${relatedAccounts.length} аккаунт(а) · ${fmtMoney(row?.spend || 0, currency)} · ${fmtNum(
                                     row?.conversions || 0
                                   )} конверсий`}
                             </div>
@@ -788,7 +798,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                               <td>{account.name || account.external_account_id}</td>
                               <td>{platformLabel(account.platform)}</td>
                               <td><span className={`badge ${status.tone}`}>{status.label}</span></td>
-                              <td>{fmtDate(account.last_sync_at || account.updated_at)}</td>
+                              <td>{fmtDate(account.last_sync_at)}</td>
                             </tr>
                           );
                         })}
@@ -1078,7 +1088,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                         );
                       })}
                       {!actionableInsights.length ? (
-                        <tr><td colSpan={5} className="muted-note">Значимых изменений не найдено.</td></tr>
+                        <tr><td colSpan={5} className="muted-note">{dataState === "current" ? "Значимых изменений не найдено." : "Недостаточно свежих данных для оценки изменений."}</td></tr>
                       ) : null}
                     </tbody>
                   </table>
@@ -1087,7 +1097,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
 
               <aside className={`blueprint-note ${headlineChange?.priority === "high" ? "bad" : ""}`.trim()}>
                 <h3>Текущее отклонение</h3>
-                {headlineChange ? (
+                {dataState === "current" && headlineChange ? (
                   <>
                     <p><strong>{headlineChangeCopy?.title}</strong></p>
                     <p>{headlineChangeCopy?.reason}</p>
@@ -1097,8 +1107,10 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                       {actionLabel(headlineChange.action)}
                     </p>
                   </>
-                ) : (
+                ) : dataState === "current" ? (
                   <p>Отклонений, требующих объяснения, сейчас нет.</p>
+                ) : (
+                  <p>{dataMeta.description}</p>
                 )}
               </aside>
             </section>
@@ -1161,8 +1173,10 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
               <div className="blueprint-note" style={{ marginTop: 16 }}>
                 <strong>Отчёт за {periodLabel}</strong>
                 <p>
-                  Этот отчёт собран из актуальных рекламных данных. Сохранённые версии и расписание отправки пока
-                  недоступны; кнопка «Скачать PDF» сохраняет текущий срез.
+                  {dataState === "current"
+                    ? "Этот отчёт собран из свежих подтверждённых рекламных данных."
+                    : `Отчёт сформирован при неполной готовности данных: ${dataMeta.description}`}
+                  {" "}Сохранённые версии и расписание отправки пока недоступны; кнопка «Скачать PDF» сохраняет текущий срез.
                 </p>
               </div>
 
@@ -1217,7 +1231,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                 <aside className="blueprint-note">
                   <h3>Вывод и следующие шаги</h3>
                   <p>{summaryText}</p>
-                  {headlineInsight ? (
+                  {dataState === "current" && headlineInsight ? (
                     <p>
                       <strong>{headlineInsightCopy?.title}</strong>
                       <br />

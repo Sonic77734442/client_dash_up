@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -313,23 +313,30 @@ class SqliteIntegrationCredentialStore:
             for row in agency_rows:
                 _push(row)
 
-            # 3) global credential.
-            global_rows = conn.execute(
-                """
-                SELECT * FROM integration_credentials
-                WHERE provider=? AND scope_type='global' AND status='active'
-                ORDER BY updated_at DESC, connection_key ASC
-                """,
-                (provider_norm,),
-            ).fetchall()
-            for row in global_rows:
-                _push(row)
+            # 3) Global credentials are platform-owned. They are available only
+            # to trusted admin/scheduler resolution (user_id=None), never to an
+            # agency request merely because that agency can see the client.
+            if user_id is None:
+                global_rows = conn.execute(
+                    """
+                    SELECT * FROM integration_credentials
+                    WHERE provider=? AND scope_type='global' AND status='active'
+                    ORDER BY updated_at DESC, connection_key ASC
+                    """,
+                    (provider_norm,),
+                ).fetchall()
+                for row in global_rows:
+                    _push(row)
         return out
 
 
 class InMemoryIntegrationCredentialStore:
-    def __init__(self):
+    def __init__(
+        self,
+        agency_access_resolver: Optional[Callable[[UUID, UUID, Optional[UUID]], bool]] = None,
+    ):
         self.items: Dict[UUID, IntegrationCredentialOut] = {}
+        self.agency_access_resolver = agency_access_resolver
 
     def upsert(self, payload: IntegrationCredentialCreate) -> IntegrationCredentialOut:
         provider = _normalize_provider(payload.provider)
@@ -437,9 +444,16 @@ class InMemoryIntegrationCredentialStore:
         rows = [x for x in self.items.values() if x.status == "active" and x.provider == p]
         client_rows = [x for x in rows if x.scope_type == "client" and x.scope_id == client_id]
         client_rows.sort(key=lambda x: x.updated_at, reverse=True)
-        agency_rows = [x for x in rows if x.scope_type == "agency"]
+        agency_rows = [
+            x
+            for x in rows
+            if x.scope_type == "agency"
+            and x.scope_id is not None
+            and self.agency_access_resolver is not None
+            and self.agency_access_resolver(x.scope_id, client_id, user_id)
+        ]
         agency_rows.sort(key=lambda x: x.updated_at, reverse=True)
-        global_rows = [x for x in rows if x.scope_type == "global"]
+        global_rows = [x for x in rows if x.scope_type == "global"] if user_id is None else []
         global_rows.sort(key=lambda x: x.updated_at, reverse=True)
         return [*client_rows, *agency_rows, *global_rows]
 

@@ -59,6 +59,18 @@ export type Overview = {
     platforms: PlatformBreakdown[];
     accounts: AccountBreakdown[];
   };
+  data_quality?: {
+    status: "insufficient_data" | "partial" | "stale" | "fresh";
+    rows_present: boolean;
+    row_count: number;
+    latest_data_date: string | null;
+    stale_days: number | null;
+    stale_after_days: number;
+    active_accounts_count: number;
+    accounts_with_data_count: number;
+    accounts_without_data_count: number;
+    coverage_percent: number;
+  };
 };
 
 export type AdStat = {
@@ -106,6 +118,66 @@ export type AdAccount = {
   sync_next_retry_at?: string | null;
   created_at?: string;
   updated_at?: string;
+};
+
+export type AssignmentConflictLatestStat = {
+  date: string;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  conversions: number;
+};
+
+export type AssignmentConflictCandidate = {
+  account_id: string;
+  client_id: string;
+  client_name: string;
+  client_status: "active" | "inactive" | "archived";
+  account_name: string;
+  account_status: "active" | "inactive" | "archived";
+  platform: string;
+  external_account_id: string;
+  currency: string;
+  latest_stat?: AssignmentConflictLatestStat | null;
+  active_budget_count: number;
+};
+
+export type AssignmentConflictGroup = {
+  group_id: string;
+  group_version: string;
+  platform: string;
+  canonical_external_account_id: string;
+  account_ids: string[];
+  candidates: AssignmentConflictCandidate[];
+  summary: {
+    candidate_count: number;
+    active_candidate_count: number;
+    client_count: number;
+    active_budget_count: number;
+    latest_stat_date?: string | null;
+  };
+};
+
+export type AssignmentConflictListResponse = {
+  items: AssignmentConflictGroup[];
+  count: number;
+  summary: {
+    conflict_groups: number;
+    conflicted_accounts: number;
+    active_budgets: number;
+  };
+};
+
+export type AssignmentConflictResolveResponse = {
+  status: "resolved";
+  group_id: string;
+  winner_account_id: string;
+  loser_account_ids: string[];
+  archived_budget_ids: string[];
+  before: AssignmentConflictGroup;
+  after: AssignmentConflictGroup;
+  sync_required: boolean;
+  resolved_at: string;
 };
 
 export type AdAccountSyncJob = {
@@ -196,6 +268,17 @@ export type IntegrationProvider = {
   sync_readiness_reason?: string | null;
   scopes: string[];
   linked_accounts_count: number;
+  active_accounts_count?: number;
+  successfully_synced_accounts_count?: number;
+  accounts_with_data_count?: number;
+  error_accounts_count?: number;
+  never_synced_accounts_count?: number;
+  stale_accounts_count?: number;
+  assignment_conflict_accounts_count?: number;
+  coverage_percent?: number;
+  rows_present?: boolean;
+  latest_data_date?: string | null;
+  stale_days?: number | null;
   affected_clients_count: number;
   last_heartbeat_at?: string | null;
   last_successful_sync_at?: string | null;
@@ -220,6 +303,7 @@ export type IntegrationsOverview = {
     warning_connections: number;
     critical_issues: number;
     active_nodes: number;
+    assignment_conflict_accounts?: number;
     total_errors_24h: number;
   };
   providers: IntegrationProvider[];

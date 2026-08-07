@@ -1,11 +1,12 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
 import { ToastHost } from "../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
 import { useSession } from "../../hooks/useSession";
+import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson, getQuery } from "../../lib/api";
 import { AdAccount, AdStat, Budget, Client } from "../../lib/types";
@@ -152,6 +153,10 @@ export default function BudgetsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const agencyScopeKey = agencyContext.selectedAgencyId || agencyContext.role || "unknown";
+  const beginScopedRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginTransferRequest = useScopeRequestGuard(agencyScopeKey);
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -192,6 +197,14 @@ export default function BudgetsPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
+    if (agencyContext.role === "agency" && !agencyContext.portfolioReady) {
+      throw new Error(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
+      );
+    }
     const range = rangeFromPreset(preset);
     const budgetQuery = getQuery({
       status,
@@ -210,16 +223,46 @@ export default function BudgetsPage() {
       req<{ items: Budget[] }>(`/budgets${budgetQuery}`),
       req<{ items: AdStat[] }>(`/ad-stats${statsQuery}`),
     ]);
-    setClients(c.items || []);
-    setAccounts(a.items || []);
-    setBudgets(b.items || []);
+    if (!isCurrentRequest()) return;
+    const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    setClients((c.items || []).filter((client) => !allowedClientIds || allowedClientIds.has(client.id)));
+    setAccounts((a.items || []).filter((account) => !allowedClientIds || allowedClientIds.has(account.client_id)));
+    setBudgets((b.items || []).filter((budget) => !allowedClientIds || allowedClientIds.has(budget.client_id)));
     setStats(statPayload.items || []);
-  }, [req, preset, status, clientId]);
+    setWarning("");
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+    preset,
+    status,
+    clientId,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load budgets"));
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
+
+  useEffect(() => {
+    setClientId("");
+    setClients([]);
+    setAccounts([]);
+    setBudgets([]);
+    setStats([]);
+    setSelectedBudgetId("");
+    setCreateOpen(false);
+    setTransferOpen(false);
+    setTransferHistory([]);
+  }, [agencyContext.selectedAgencyId]);
+
+  useEffect(() => {
+    if (clientId && !clients.some((client) => client.id === clientId)) setClientId("");
+  }, [clientId, clients]);
 
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
@@ -273,27 +316,31 @@ export default function BudgetsPage() {
   }, [rows, selectedBudgetId]);
 
   const selected = useMemo(() => rows.find((x) => x.id === selectedBudgetId) || null, [rows, selectedBudgetId]);
+  const selectedIsScoped = !!selected
+    && (agencyContext.role !== "agency"
+      || (agencyContext.portfolioReady && agencyContext.clientIds.includes(selected.client_id)));
 
   const loadTransferHistory = useCallback(async (budgetId: string, direction: "all" | "incoming" | "outgoing") => {
+    const isCurrentRequest = beginTransferRequest();
     setTransferHistoryLoading(true);
     try {
       const rows = await req<BudgetTransferOut[]>(`/budgets/${budgetId}/transfers${getQuery({ direction, limit: 20 })}`);
-      setTransferHistory(Array.isArray(rows) ? rows : []);
+      if (isCurrentRequest()) setTransferHistory(Array.isArray(rows) ? rows : []);
     } catch {
-      setTransferHistory([]);
+      if (isCurrentRequest()) setTransferHistory([]);
     } finally {
-      setTransferHistoryLoading(false);
+      if (isCurrentRequest()) setTransferHistoryLoading(false);
     }
-  }, [req]);
+  }, [beginTransferRequest, req]);
 
   useEffect(() => {
-    if (!selected?.id) {
+    if (!selected?.id || !selectedIsScoped) {
       setTransferHistory([]);
       setTransferHistoryLoading(false);
       return;
     }
     void loadTransferHistory(selected.id, transferDirection);
-  }, [selected?.id, transferDirection, loadTransferHistory]);
+  }, [selected?.id, selectedIsScoped, transferDirection, loadTransferHistory]);
 
   const pages = Math.max(1, Math.ceil(rows.length / rowsPerPage));
   const safePage = Math.max(1, Math.min(page, pages));
@@ -369,6 +416,20 @@ export default function BudgetsPage() {
   }
 
   async function createBudget() {
+    if (
+      agencyContext.role === "agency"
+      && (
+        !agencyContext.portfolioReady
+        || !agencyContext.clientIds.includes(createForm.client_id)
+        || (
+          createForm.scope === "account"
+          && !accounts.some((account) => account.id === createForm.account_id && account.client_id === createForm.client_id)
+        )
+      )
+    ) {
+      setCreateError("Клиент или аккаунт не входит в выбранное агентство.");
+      return;
+    }
     if (!isAmountValid) {
       setCreateError("Amount must be greater than 0.");
       return;
@@ -422,7 +483,7 @@ export default function BudgetsPage() {
   }
 
   async function adjustSelected(deltaFactor: number) {
-    if (!selected?.id) {
+    if (!selected?.id || !selectedIsScoped) {
       const msg = "Selected budget has no id. Reload list and try again.";
       setWarning(msg);
       push(msg, "error");
@@ -453,7 +514,7 @@ export default function BudgetsPage() {
   }
 
   async function archiveSelected() {
-    if (!selected?.id) {
+    if (!selected?.id || !selectedIsScoped) {
       const msg = "Selected budget has no id. Reload list and try again.";
       setWarning(msg);
       push(msg, "error");
@@ -478,7 +539,7 @@ export default function BudgetsPage() {
   }
 
   async function restoreSelected() {
-    if (!selected?.id) {
+    if (!selected?.id || !selectedIsScoped) {
       const msg = "Selected budget has no id. Reload list and try again.";
       setWarning(msg);
       push(msg, "error");
@@ -507,7 +568,7 @@ export default function BudgetsPage() {
   }
 
   function openTransferModal() {
-    if (!selected || selected.scope !== "account" || !selected.account_id || selected.status !== "active") return;
+    if (!selected || !selectedIsScoped || selected.scope !== "account" || !selected.account_id || selected.status !== "active") return;
     const preferredAmount = Math.max(0, Math.min(100, Number(selected.amount || 0)));
     setTransferError("");
     setTransferTargetAccountId("");
@@ -516,13 +577,19 @@ export default function BudgetsPage() {
   }
 
   async function submitTransfer() {
-    if (!selected?.id || selected.scope !== "account" || !selected.account_id) {
+    if (!selected?.id || !selectedIsScoped || selected.scope !== "account" || !selected.account_id) {
       setTransferError("Select an active account budget first.");
       return;
     }
     const amount = Number(transferAmount);
     if (!transferTargetAccountId) {
       setTransferError("Select target account.");
+      return;
+    }
+    if (!accounts.some(
+      (account) => account.id === transferTargetAccountId && account.client_id === selected.client_id,
+    )) {
+      setTransferError("Целевой аккаунт не входит в выбранное агентство.");
       return;
     }
     if (!Number.isFinite(amount) || amount <= 0) {

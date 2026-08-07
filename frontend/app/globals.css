@@ -1710,6 +1710,146 @@ th.sortable.active {
   gap: 12px;
 }
 
+.assignment-conflicts-panel {
+  scroll-margin-top: 18px;
+}
+
+.assignment-conflicts-head,
+.assignment-conflict-group-head,
+.assignment-conflict-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.assignment-conflicts-head h2 {
+  margin: 3px 0 4px;
+  font-size: 20px;
+}
+
+.assignment-conflict-group {
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 97%, var(--danger));
+}
+
+.assignment-conflict-group-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.assignment-conflict-group-head > div > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.assignment-conflict-candidates {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.assignment-conflict-candidates legend {
+  grid-column: 1 / -1;
+  width: 100%;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.assignment-conflict-candidate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 0.8fr) minmax(0, 1.2fr);
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.assignment-conflict-candidate:hover,
+.assignment-conflict-candidate.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.assignment-conflict-candidate input[type="radio"] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.assignment-conflict-candidate-main,
+.assignment-conflict-candidate-meta {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.assignment-conflict-candidate-main span,
+.assignment-conflict-candidate-meta span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.assignment-conflict-note {
+  display: grid;
+  gap: 7px;
+  margin-top: 14px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.assignment-conflict-note textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.assignment-conflict-budget-confirm {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  cursor: pointer;
+}
+
+.assignment-conflict-budget-confirm input {
+  margin-top: 3px;
+}
+
+.assignment-conflict-budget-confirm span {
+  display: grid;
+  gap: 3px;
+}
+
+.assignment-conflict-budget-confirm small {
+  color: var(--muted);
+}
+
+.assignment-conflict-error {
+  margin-top: 12px;
+}
+
+.assignment-conflict-actions {
+  align-items: center;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 .accounts-main {
   overflow: hidden;
 }
@@ -1744,9 +1884,27 @@ th.sortable.active {
   .accounts-grid {
     grid-template-columns: 1fr;
   }
+  .assignment-conflict-candidates {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 900px) {
+  .assignment-conflicts-head,
+  .assignment-conflict-group-head,
+  .assignment-conflict-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .assignment-conflict-candidate {
+    grid-template-columns: auto 1fr;
+  }
+
+  .assignment-conflict-candidate-meta {
+    grid-column: 2;
+  }
+
   .budgets-layout {
     display: none;
   }
@@ -1854,6 +2012,51 @@ textarea {
   color: var(--muted);
   font-size: 12px;
   font-weight: 430;
+  line-height: 1.35;
+}
+
+.agency-context-switcher {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 10px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #f8f9fb;
+}
+
+.agency-context-switcher label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 550;
+  line-height: 1.2;
+}
+
+.agency-context-switcher select {
+  width: 100%;
+  min-width: 0;
+  height: 29px;
+  padding: 3px 24px 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.agency-context-current {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agency-context-hint {
+  color: #8a6416;
+  font-size: 10px;
   line-height: 1.35;
 }
 

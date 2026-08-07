@@ -5,10 +5,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
 import { ToastHost } from "../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
+import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import { AgencyOut, AuthMeResponse, ClientOut } from "../../lib/types";
+import { ClientOut } from "../../lib/types";
 
 type ClientStatus = "active" | "inactive" | "archived" | "all";
 
@@ -56,7 +58,14 @@ function fmtDate(v?: string) {
   if (!v) return "--";
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return "--";
-  return d.toLocaleString();
+  return d.toLocaleString("ru-RU");
+}
+
+function clientStatusLabel(status?: string) {
+  if (status === "active") return "Активен";
+  if (status === "inactive") return "Неактивен";
+  if (status === "archived") return "В архиве";
+  return status || "Активен";
 }
 
 function isSupportedCurrency(value: string) {
@@ -74,11 +83,13 @@ export default function ClientsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
   const [items, setItems] = useState<ClientOut[]>([]);
-  const [statusFilter, setStatusFilter] = useState<ClientStatus>("all");
+  const [statusFilter, setStatusFilter] = useState<ClientStatus>("active");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<"name" | "status" | "updated_at">("updated_at");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
@@ -98,23 +109,55 @@ export default function ClientsPage() {
   );
 
   const loadClients = useCallback(async () => {
-    const [all, me] = await Promise.all([
-      req<{ items: ClientOut[] }>("/clients?status=all"),
-      req<AuthMeResponse>("/auth/me"),
-    ]);
-    setItems(all.items || []);
-    if (me.session?.role === "agency") {
-      const agencies = await req<{ items: AgencyOut[] }>("/platform/agencies?status=active");
-      setClientInvitesAllowed((agencies.items || []).every((agency) => agency.allow_client_invites !== false));
+    const isCurrentRequest = beginScopedRequest();
+    if (
+      agencyContext.role === "agency"
+      && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
+    ) {
+      setItems([]);
+      setClientInvitesAllowed(false);
+      throw new Error(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : agencyContext.portfolioError || agencyContext.error || "Для пользователя не найдено активное агентство.",
+      );
+    }
+
+    const all = await req<{ items: ClientOut[] }>("/clients?status=all");
+    if (!isCurrentRequest()) return;
+    const allItems = Array.isArray(all.items) ? all.items : [];
+    if (agencyContext.role === "agency") {
+      const allowedClientIds = new Set(agencyContext.clientIds);
+      setItems(allItems.filter((client) => allowedClientIds.has(client.id)));
+      setClientInvitesAllowed(agencyContext.selectedAgency?.allow_client_invites !== false);
     } else {
+      setItems(allItems);
       setClientInvitesAllowed(true);
     }
-  }, [req]);
+    setWarning("");
+  }, [
+    agencyContext.error,
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectedAgency,
+    agencyContext.selectedAgencyId,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
-    void loadClients().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load clients"));
-  }, [ready, loadClients]);
+    setItems([]);
+    setClientInvitesAllowed(false);
+    setWarning(agencyContext.selectionRequired ? agencySelectionRequiredMessage() : "");
+  }, [agencyContext.selectedAgencyId, agencyContext.selectionRequired]);
+
+  useEffect(() => {
+    if (!ready || agencyContext.loading) return;
+    void loadClients().catch((err) => setWarning(err instanceof Error ? err.message : "Не удалось загрузить клиентов"));
+  }, [agencyContext.loading, ready, loadClients]);
 
   const kpis = useMemo(() => {
     const active = items.filter((x) => x.status === "active").length;
@@ -208,7 +251,7 @@ export default function ClientsPage() {
 
   async function saveClient() {
     if (!form.name.trim()) {
-      setModalError("Name is required.");
+      setModalError("Укажите название клиента.");
       return;
     }
     if (!isSupportedCurrency(form.default_currency)) {
@@ -231,9 +274,18 @@ export default function ClientsPage() {
           method: "PATCH",
           body: JSON.stringify(payload),
         });
-        push("Client updated", "success");
+        push("Данные клиента обновлены", "success");
       } else {
-        const created = await req<ClientOut>("/clients", {
+        if (
+          agencyContext.role === "agency"
+          && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
+        ) {
+          throw new Error(agencySelectionRequiredMessage());
+        }
+        const createPath = agencyContext.role === "agency"
+          ? `/clients?agency_id=${encodeURIComponent(agencyContext.selectedAgencyId)}`
+          : "/clients";
+        const created = await req<ClientOut>(createPath, {
           method: "POST",
           body: JSON.stringify(payload),
         });
@@ -248,18 +300,18 @@ export default function ClientsPage() {
           });
           try {
             await navigator.clipboard.writeText(issued.accept_url);
-            push("Client created, invite issued, link copied", "success");
+            push("Клиент создан, приглашение выпущено, ссылка скопирована", "success");
           } catch {
-            push("Client created, invite issued", "success");
+            push("Клиент создан, приглашение выпущено", "success");
           }
         } else {
-          push("Client created", "success");
+          push("Клиент создан", "success");
         }
       }
       setModalOpen(false);
       await loadClients();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Save client failed";
+      const msg = err instanceof Error ? err.message : "Не удалось сохранить клиента";
       setModalError(msg);
       push(msg, "error");
     } finally {
@@ -270,10 +322,10 @@ export default function ClientsPage() {
   async function archiveClient(row: ClientOut) {
     try {
       await req<{ status: string }>(`/clients/${row.id}`, { method: "DELETE" });
-      push("Client archived", "success");
+      push("Клиент перемещён в архив. Запись и связанные данные сохранены.", "success");
       await loadClients();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Archive failed";
+      const msg = err instanceof Error ? err.message : "Не удалось переместить клиента в архив";
       setWarning(msg);
       push(msg, "error");
     }
@@ -282,10 +334,10 @@ export default function ClientsPage() {
   async function restoreClient(row: ClientOut) {
     try {
       await req<ClientOut>(`/clients/${row.id}`, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
-      push("Client restored", "success");
+      push("Клиент восстановлен из архива", "success");
       await loadClients();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Restore failed";
+      const msg = err instanceof Error ? err.message : "Не удалось восстановить клиента";
       setWarning(msg);
       push(msg, "error");
     }
@@ -302,10 +354,10 @@ export default function ClientsPage() {
           body: JSON.stringify({ expires_in_days: 7 }),
         });
       } else {
-        const email = window.prompt("Client email for invite");
+        const email = window.prompt("Email клиента для приглашения");
         const normEmail = String(email || "").trim().toLowerCase();
         if (!normEmail) {
-          push("Invite email is required", "info");
+          push("Укажите email для приглашения", "info");
           return;
         }
         issued = await req<ClientInviteIssueResponse>(`/clients/${row.id}/invites`, {
@@ -314,9 +366,9 @@ export default function ClientsPage() {
         });
       }
       await navigator.clipboard.writeText(issued.accept_url);
-      push("Invite link copied", "success");
+      push("Ссылка приглашения скопирована", "success");
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Invite action failed";
+      const msg = err instanceof Error ? err.message : "Не удалось подготовить приглашение";
       push(msg, "error");
     }
   }
@@ -324,14 +376,14 @@ export default function ClientsPage() {
   return (
     <>
       <div className="app-shell">
-        <AppSidebar active="clients" subtitle="Client Registry" />
+        <AppSidebar active="clients" subtitle="Реестр клиентов" />
 
         <main className="content">
           <header className="topbar">
             <div className="topbar-left">
               <AppTopTabs active="clients" />
-              <div className="topbar-title">Client Operations</div>
-              <div className="panel-subtitle">Manage client entities before account and budget operations.</div>
+              <div className="topbar-title">Клиенты</div>
+              <div className="panel-subtitle">Активные клиенты показаны по умолчанию; архив хранится отдельно и ничего не удаляет.</div>
             </div>
             <div className="session-controls">
               {tokenLoginEnabled ? (
@@ -356,18 +408,18 @@ export default function ClientsPage() {
                       setSession(next);
                       try {
                         await loadClients();
-                        push("Session saved", "success");
+                        push("Сессия сохранена", "success");
                       } catch (err) {
-                        setWarning(err instanceof Error ? err.message : "Load failed");
+                        setWarning(err instanceof Error ? err.message : "Не удалось загрузить данные");
                       }
                     }}
                     disabled={!ready}
                   >
-                    Save
+                    Сохранить
                   </button>
                 </>
               ) : null}
-              <button className="primary-btn" onClick={openCreate}>Create Client</button>
+              <button className="primary-btn" onClick={openCreate}>Создать клиента</button>
             </div>
           </header>
 
@@ -375,20 +427,21 @@ export default function ClientsPage() {
 
           <section className="kpi-grid" style={{ marginTop: 12 }}>
             <article className="kpi-card">
-              <div className="kpi-title">Total Clients</div>
+              <div className="kpi-title">Всего записей</div>
               <div className="kpi-value">{kpis.total}</div>
             </article>
             <article className="kpi-card good">
-              <div className="kpi-title">Active</div>
+              <div className="kpi-title">Активные</div>
               <div className="kpi-value">{kpis.active}</div>
             </article>
             <article className="kpi-card warn">
-              <div className="kpi-title">Inactive</div>
+              <div className="kpi-title">Неактивные</div>
               <div className="kpi-value">{kpis.inactive}</div>
             </article>
             <article className="kpi-card bad">
-              <div className="kpi-title">Archived</div>
+              <div className="kpi-title">В архиве</div>
               <div className="kpi-value">{kpis.archived}</div>
+              <div className="kpi-meta">Записи сохранены и могут быть восстановлены</div>
             </article>
           </section>
 
@@ -396,18 +449,18 @@ export default function ClientsPage() {
             <div className="panel-head budgets-toolbar">
               <div className="session-controls budgets-filters">
                 <label>
-                  Status
+                  Состояние
                   <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as ClientStatus)}>
-                    <option value="all">All</option>
-                    <option value="active">Active</option>
-                    <option value="inactive">Inactive</option>
-                    <option value="archived">Archived</option>
+                    <option value="active">Активные</option>
+                    <option value="inactive">Неактивные</option>
+                    <option value="archived">Архив</option>
+                    <option value="all">Все записи</option>
                   </select>
                 </label>
               </div>
               <div className="session-controls">
-                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search client / ID" />
-                <button className="ghost-btn" onClick={() => void loadClients()}>Refresh</button>
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Найти клиента или ID" />
+                <button className="ghost-btn" onClick={() => void loadClients()}>Обновить</button>
               </div>
             </div>
 
@@ -416,18 +469,18 @@ export default function ClientsPage() {
                 <thead>
                   <tr>
                     <th className={`sortable ${sortBy === "name" ? "active" : ""}`} onClick={() => toggleSort("name")}>
-                      Name {sortBy === "name" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                      Название {sortBy === "name" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                     </th>
-                    <th>Legal Name</th>
+                    <th>Юридическое название</th>
                     <th className={`sortable ${sortBy === "status" ? "active" : ""}`} onClick={() => toggleSort("status")}>
-                      Status {sortBy === "status" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                      Состояние {sortBy === "status" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                     </th>
-                    <th>Currency</th>
-                    <th>Timezone</th>
+                    <th>Валюта</th>
+                    <th>Часовой пояс</th>
                     <th className={`sortable ${sortBy === "updated_at" ? "active" : ""}`} onClick={() => toggleSort("updated_at")}>
-                      Updated {sortBy === "updated_at" ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                      Обновлён {sortBy === "updated_at" ? (sortDir === "asc" ? "↑" : "↓") : ""}
                     </th>
-                    <th>Actions</th>
+                    <th>Действия</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -440,27 +493,27 @@ export default function ClientsPage() {
                         </div>
                       </td>
                       <td>{c.legal_name || "--"}</td>
-                      <td>{c.status || "active"}</td>
+                      <td>{clientStatusLabel(c.status)}</td>
                       <td>{c.default_currency || "USD"}</td>
                       <td>{c.timezone || "--"}</td>
                       <td>{fmtDate(c.updated_at)}</td>
                       <td>
                         <div className="alert-actions" style={{ marginTop: 0 }}>
-                          <Link className="mini-btn" href={`/client/${c.id}`}>Open Client</Link>
+                          <Link className="mini-btn" href={`/client/${c.id}`}>Открыть клиента</Link>
                           {clientInvitesAllowed ? (
-                            <button className="mini-btn" onClick={() => void copyInviteLink(c)}>Copy Invite Link</button>
+                            <button className="mini-btn" onClick={() => void copyInviteLink(c)}>Скопировать приглашение</button>
                           ) : null}
-                          <button className="mini-btn" onClick={() => openEdit(c)}>Edit</button>
+                          <button className="mini-btn" onClick={() => openEdit(c)}>Изменить</button>
                           {c.status === "archived" ? (
-                            <button className="mini-btn" onClick={() => void restoreClient(c)}>Restore</button>
+                            <button className="mini-btn" onClick={() => void restoreClient(c)}>Восстановить</button>
                           ) : (
                             <button
                               className="mini-btn"
                               onClick={() => {
-                                if (window.confirm(`Archive client ${c.name}?`)) void archiveClient(c);
+                                if (window.confirm(`Переместить клиента «${c.name}» в архив? Запись и связанные данные сохранятся, клиента можно будет восстановить.`)) void archiveClient(c);
                               }}
                             >
-                              Archive
+                              В архив
                             </button>
                           )}
                         </div>
@@ -471,17 +524,17 @@ export default function ClientsPage() {
               </table>
             </div>
 
-            {!filtered.length ? <div className="muted-note" style={{ marginTop: 10 }}>No clients found for current filter.</div> : null}
+            {!filtered.length ? <div className="muted-note" style={{ marginTop: 10 }}>По выбранному фильтру клиентов нет.</div> : null}
             <div className="table-footer">
               <div className="session-controls">
-                <span className="muted-note">Rows per page</span>
+                <span className="muted-note">Строк на странице</span>
                 <select value={String(rowsPerPage)} onChange={(e) => setRowsPerPage(Number(e.target.value))}>
                   <option value="5">5</option>
                   <option value="10">10</option>
                   <option value="20">20</option>
                 </select>
                 <span className="muted-note">
-                  Showing {filtered.length ? (safePage - 1) * rowsPerPage + 1 : 0}-{Math.min(safePage * rowsPerPage, filtered.length)} of {filtered.length}
+                  Показано {filtered.length ? (safePage - 1) * rowsPerPage + 1 : 0}–{Math.min(safePage * rowsPerPage, filtered.length)} из {filtered.length}
                 </span>
               </div>
               <div className="pager">
@@ -498,33 +551,33 @@ export default function ClientsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>{editingId ? "Edit Client" : "Create Client"}</h3>
-              <div className="panel-subtitle">Client profile used by budgets and account ownership.</div>
+              <h3 style={{ margin: 0 }}>{editingId ? "Изменить клиента" : "Создать клиента"}</h3>
+              <div className="panel-subtitle">Профиль связывает рекламные аккаунты, бюджеты и клиентский доступ.</div>
             </div>
-            <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Close</button>
+            <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Закрыть</button>
           </div>
 
           <div className={`warning ${modalError ? "" : "hidden"}`} style={{ marginTop: 10 }}>{modalError}</div>
 
           <div className="detail-grid" style={{ marginTop: 10 }}>
             <label>
-              Name
+              Название
               <input value={form.name} onChange={(e) => setForm((s) => ({ ...s, name: e.target.value }))} />
             </label>
             <label>
-              Legal Name
+              Юридическое название
               <input value={form.legal_name} onChange={(e) => setForm((s) => ({ ...s, legal_name: e.target.value }))} />
             </label>
             <label>
-              Status
+              Состояние
               <select value={form.status} onChange={(e) => setForm((s) => ({ ...s, status: e.target.value as ClientForm["status"] }))}>
-                <option value="active">active</option>
-                <option value="inactive">inactive</option>
-                <option value="archived">archived</option>
+                <option value="active">Активен</option>
+                <option value="inactive">Неактивен</option>
+                <option value="archived">В архиве</option>
               </select>
             </label>
             <label>
-              Default Currency
+              Валюта по умолчанию
               <input
                 value={form.default_currency}
                 maxLength={3}
@@ -532,20 +585,20 @@ export default function ClientsPage() {
               />
             </label>
             <label>
-              Timezone
+              Часовой пояс
               <input value={form.timezone} onChange={(e) => setForm((s) => ({ ...s, timezone: e.target.value }))} />
             </label>
           </div>
 
           <label style={{ display: "block", marginTop: 10 }}>
-            Notes
+            Заметки
             <textarea value={form.notes} onChange={(e) => setForm((s) => ({ ...s, notes: e.target.value }))} rows={3} style={{ width: "100%" }} />
           </label>
 
           {!editingId && clientInvitesAllowed ? (
             <div className="detail-grid" style={{ marginTop: 10 }}>
               <label>
-                Client login email (optional)
+                Email клиента для входа (необязательно)
                 <input
                   type="email"
                   value={form.invite_email}
@@ -554,7 +607,7 @@ export default function ClientsPage() {
                 />
               </label>
               <label>
-                Invite expires (days)
+                Срок приглашения, дней
                 <input
                   type="number"
                   min={1}
@@ -567,13 +620,13 @@ export default function ClientsPage() {
           ) : null}
 
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-            <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Cancel</button>
+            <button className="ghost-btn" onClick={() => setModalOpen(false)} disabled={modalLoading}>Отмена</button>
             <button
               className="primary-btn"
               onClick={() => void saveClient()}
               disabled={modalLoading || !form.name.trim() || !isSupportedCurrency(form.default_currency)}
             >
-              {modalLoading ? "Saving..." : editingId ? "Save Changes" : "Create Client"}
+              {modalLoading ? "Сохраняем…" : editingId ? "Сохранить изменения" : "Создать клиента"}
             </button>
           </div>
         </div>

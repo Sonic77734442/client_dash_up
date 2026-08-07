@@ -90,7 +90,7 @@ def test_operational_insights_endpoint_returns_recommendations():
     )
     assert res.status_code == 200
     body = res.json()
-    assert set(body.keys()) == {"range", "scope", "items"}
+    assert set(body.keys()) == {"range", "scope", "data_quality", "items"}
     assert body["scope"]["client_id"] == c["id"]
     assert isinstance(body["items"], list)
     assert len(body["items"]) > 0
@@ -139,6 +139,7 @@ def test_operational_insights_rules_are_configurable_not_hardcoded():
         scope_account_id=None,
         breakdown_accounts=rows,
         budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={"status": "fresh", "rows_present": True},
     )
     assert not any(x["action"] == "cap" for x in out1["items"])
 
@@ -152,6 +153,7 @@ def test_operational_insights_rules_are_configurable_not_hardcoded():
         scope_account_id=None,
         breakdown_accounts=rows,
         budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={"status": "fresh", "rows_present": True},
     )
     assert any(x["action"] == "cap" for x in out2["items"])
 
@@ -186,9 +188,123 @@ def test_operational_insights_returns_monitoring_fallback_when_no_signals():
             }
         ],
         budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={"status": "fresh", "rows_present": True},
     )
     assert len(out["items"]) == 1
     item = out["items"][0]
     assert item["action"] == "review"
     assert item["priority"] == "low"
     assert item["metrics"]["fallback"] is True
+
+
+def test_operational_insights_reports_insufficient_data_instead_of_no_action():
+    svc = OperationalInsightsService(rules={"max_items": 6})
+    out = svc.generate(
+        date_from=date(2026, 8, 1),
+        date_to=date(2026, 8, 6),
+        scope_client_id="c-1",
+        scope_account_id=None,
+        breakdown_accounts=[],
+        budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={"status": "insufficient_data", "rows_present": False},
+    )
+
+    assert out["data_quality"]["status"] == "insufficient_data"
+    assert out["data_quality"]["rows_present"] is False
+    assert len(out["items"]) == 1
+    item = out["items"][0]
+    assert item["metrics"]["data_quality"] == "insufficient_data"
+    assert "no immediate action" not in item["title"].lower()
+    assert item["priority"] == "high"
+
+
+def _prescriptive_signal_rows():
+    return [
+        {
+            "account_id": "expensive",
+            "name": "Expensive",
+            "platform": "meta",
+            "spend": 700.0,
+            "cpc": 4.0,
+            "ctr": 0.03,
+            "conversions": 10.0,
+        },
+        {
+            "account_id": "efficient",
+            "name": "Efficient",
+            "platform": "google",
+            "spend": 300.0,
+            "cpc": 1.0,
+            "ctr": 0.07,
+            "conversions": 20.0,
+        },
+    ]
+
+
+def _prescriptive_rules():
+    return {
+        "max_items": 10,
+        "min_spend_share_for_action": 0.01,
+        "high_cpc_multiplier": 1.1,
+        "low_cpc_multiplier": 1.0,
+        "high_ctr_multiplier": 1.0,
+        "low_ctr_multiplier": 1.0,
+        "pace_delta_abs_percent_for_review": 100.0,
+    }
+
+
+def test_stale_data_never_returns_scale_or_cap_recommendations():
+    out = OperationalInsightsService(rules=_prescriptive_rules()).generate(
+        date_from=date(2026, 8, 1),
+        date_to=date(2026, 8, 6),
+        scope_client_id="c-1",
+        scope_account_id=None,
+        breakdown_accounts=_prescriptive_signal_rows(),
+        budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={
+            "status": "stale",
+            "rows_present": True,
+            "stale_accounts_count": 1,
+            "active_accounts_count": 2,
+        },
+    )
+
+    assert out["data_quality"]["status"] == "stale"
+    assert [item["action"] for item in out["items"]] == ["review"]
+    assert out["items"][0]["metrics"]["recommended_next_step"] == "refresh_data"
+
+
+def test_partial_data_never_returns_scale_or_cap_recommendations():
+    out = OperationalInsightsService(rules=_prescriptive_rules()).generate(
+        date_from=date(2026, 8, 1),
+        date_to=date(2026, 8, 6),
+        scope_client_id="c-1",
+        scope_account_id=None,
+        breakdown_accounts=_prescriptive_signal_rows(),
+        budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={
+            "status": "partial",
+            "rows_present": True,
+            "accounts_without_data_count": 1,
+            "active_accounts_count": 3,
+        },
+    )
+
+    assert out["data_quality"]["status"] == "partial"
+    assert [item["action"] for item in out["items"]] == ["review"]
+    assert out["items"][0]["metrics"]["recommended_next_step"] == "refresh_data"
+
+
+def test_cross_client_scope_never_returns_scale_or_cap_recommendations():
+    out = OperationalInsightsService(rules=_prescriptive_rules()).generate(
+        date_from=date(2026, 8, 1),
+        date_to=date(2026, 8, 6),
+        scope_client_id=None,
+        scope_account_id=None,
+        breakdown_accounts=_prescriptive_signal_rows(),
+        budget_summary={"pace_status": "on_track", "pace_delta_percent": 0},
+        data_quality={"status": "fresh", "rows_present": True},
+    )
+
+    assert [item["action"] for item in out["items"]] == ["review"]
+    assert out["items"][0]["metrics"]["recommended_next_step"] == "select_client"

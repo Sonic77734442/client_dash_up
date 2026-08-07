@@ -16,12 +16,71 @@ from app.schemas import AdAccountCreate, AdAccountOut, AdAccountPatch
 from app.services.clients import ClientStore
 
 
+def normalize_account_platform(value: object) -> str:
+    platform = str(value or "").strip().lower()
+    return "meta" if platform == "facebook" else platform
+
+
+def canonical_external_account_id(platform: object, value: object) -> str:
+    """Canonical provider identity used by every write path and conflict check."""
+    normalized_platform = normalize_account_platform(platform)
+    raw = str(value or "").strip()
+    if normalized_platform == "meta":
+        return raw[4:].strip() if raw.lower().startswith("act_") else raw
+    if normalized_platform in {"google", "tiktok"}:
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return digits or raw
+    return raw
+
+
+def _assignment_conflict(existing: AdAccountOut) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "assignment_conflict",
+            "message": "This advertising account is already assigned to another active client",
+            "details": {
+                "platform": existing.platform,
+                "external_account_id": existing.external_account_id,
+            },
+        },
+    )
+
+
 class AdAccountStore(Protocol):
     def create(self, payload: AdAccountCreate) -> AdAccountOut: ...
     def list(self, *, client_id: Optional[UUID] = None, status: Optional[str] = None) -> List[AdAccountOut]: ...
     def get(self, account_id: UUID) -> Optional[AdAccountOut]: ...
     def patch(self, account_id: UUID, payload: AdAccountPatch) -> AdAccountOut: ...
     def archive(self, account_id: UUID) -> AdAccountOut: ...
+
+
+def active_assignment_conflict_ids(account_store: AdAccountStore) -> set[UUID]:
+    """Return active mappings whose canonical provider identity is ambiguous.
+
+    Legacy databases can contain duplicates created before assignment guards
+    existed. Keeping the rows is non-destructive, but those rows must not be
+    synced or aggregated until an administrator resolves ownership.
+    """
+    accounts = account_store.list(status="active")
+    client_store = getattr(account_store, "client_store", None)
+    if client_store is not None:
+        active_client_ids = {client.id for client in client_store.list(status="active")}
+        accounts = [account for account in accounts if account.client_id in active_client_ids]
+
+    groups: dict[tuple[str, str], List[AdAccountOut]] = {}
+    for account in accounts:
+        identity = (
+            normalize_account_platform(account.platform),
+            canonical_external_account_id(account.platform, account.external_account_id),
+        )
+        groups.setdefault(identity, []).append(account)
+    return {
+        account.id
+        for group in groups.values()
+        if len(group) > 1
+        for account in group
+    }
 
 
 class SqliteAdAccountStore:
@@ -67,8 +126,98 @@ class SqliteAdAccountStore:
         if not self.client_store.get(client_id):
             raise HTTPException(status_code=400, detail="client_id does not exist")
 
+    def _active_assignment(
+        self,
+        *,
+        client_id: UUID | str,
+        platform: str,
+        external_account_id: str,
+        exclude: Optional[UUID] = None,
+    ) -> Optional[AdAccountOut]:
+        normalized_platform = normalize_account_platform(platform)
+        normalized_external = canonical_external_account_id(normalized_platform, external_account_id)
+        where = ["status='active'", "client_id<>?"]
+        params: List[object] = [str(client_id)]
+        if exclude:
+            where.append("id<>?")
+            params.append(str(exclude))
+        with sqlite_conn(self.db_path) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ad_accounts WHERE {' AND '.join(where)} ORDER BY created_at ASC",
+                params,
+            ).fetchall()
+        active_client_ids = {client.id for client in self.client_store.list(status="active")}
+        for row in rows:
+            account = self._to_account(row)
+            if account.client_id not in active_client_ids:
+                continue
+            if (
+                normalize_account_platform(account.platform) == normalized_platform
+                and canonical_external_account_id(account.platform, account.external_account_id) == normalized_external
+            ):
+                return account
+        return None
+
+    def _assert_unique_identity_available(
+        self,
+        *,
+        client_id: UUID | str,
+        platform: str,
+        external_account_id: str,
+        exclude: Optional[UUID] = None,
+    ) -> None:
+        normalized_platform = normalize_account_platform(platform)
+        normalized_external = canonical_external_account_id(normalized_platform, external_account_id)
+        with sqlite_conn(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM ad_accounts WHERE client_id=? ORDER BY created_at ASC",
+                (str(client_id),),
+            ).fetchall()
+        for row in rows:
+            account = self._to_account(row)
+            if exclude and account.id == exclude:
+                continue
+            if (
+                normalize_account_platform(account.platform) == normalized_platform
+                and canonical_external_account_id(account.platform, account.external_account_id) == normalized_external
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Account conflict: duplicate platform+external_account_id",
+                )
+
+    def _assert_active_assignment_available(
+        self,
+        *,
+        client_id: UUID | str,
+        platform: str,
+        external_account_id: str,
+        exclude: Optional[UUID] = None,
+    ) -> None:
+        existing = self._active_assignment(
+            client_id=client_id,
+            platform=platform,
+            external_account_id=external_account_id,
+            exclude=exclude,
+        )
+        if existing:
+            raise _assignment_conflict(existing)
+
     def create(self, payload: AdAccountCreate) -> AdAccountOut:
         self._assert_client_exists(payload.client_id)
+        platform = normalize_account_platform(payload.platform)
+        external_account_id = canonical_external_account_id(platform, payload.external_account_id)
+        self._assert_unique_identity_available(
+            client_id=payload.client_id,
+            platform=platform,
+            external_account_id=external_account_id,
+        )
+        if payload.status == "active":
+            self._assert_active_assignment_available(
+                client_id=payload.client_id,
+                platform=platform,
+                external_account_id=external_account_id,
+            )
         now = _utcnow().isoformat()
         account_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
@@ -82,8 +231,8 @@ class SqliteAdAccountStore:
                     (
                         account_id,
                         str(payload.client_id),
-                        payload.platform,
-                        payload.external_account_id,
+                        platform,
+                        external_account_id,
                         payload.name,
                         payload.currency,
                         payload.timezone,
@@ -94,7 +243,17 @@ class SqliteAdAccountStore:
                     ),
                 )
                 conn.commit()
+            except HTTPException:
+                raise
             except Exception as exc:
+                if "assignment_conflict" in str(exc).lower():
+                    existing = self._active_assignment(
+                        client_id=payload.client_id,
+                        platform=platform,
+                        external_account_id=external_account_id,
+                    )
+                    if existing:
+                        raise _assignment_conflict(existing)
                 raise HTTPException(status_code=409, detail=f"Account conflict: {exc}")
             row = conn.execute("SELECT * FROM ad_accounts WHERE id=?", (account_id,)).fetchone()
         return self._to_account(row)
@@ -128,9 +287,35 @@ class SqliteAdAccountStore:
         if not patch:
             return existing
         data = {**existing.model_dump(), **patch}
+        if "platform" in patch:
+            data["platform"] = normalize_account_platform(data["platform"])
+        if "platform" in patch or "external_account_id" in patch:
+            data["external_account_id"] = canonical_external_account_id(
+                data["platform"],
+                data["external_account_id"],
+            )
 
         if data.get("client_id"):
             self._assert_client_exists(data["client_id"])
+
+        identity_changed = any(
+            key in patch and patch[key] != getattr(existing, key)
+            for key in {"client_id", "platform", "external_account_id", "status"}
+        )
+        if identity_changed:
+            self._assert_unique_identity_available(
+                client_id=data["client_id"],
+                platform=data["platform"],
+                external_account_id=data["external_account_id"],
+                exclude=account_id,
+            )
+        if identity_changed and data["status"] == "active":
+            self._assert_active_assignment_available(
+                client_id=data["client_id"],
+                platform=data["platform"],
+                external_account_id=data["external_account_id"],
+                exclude=account_id,
+            )
 
         now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
@@ -155,7 +340,18 @@ class SqliteAdAccountStore:
                     ),
                 )
                 conn.commit()
+            except HTTPException:
+                raise
             except Exception as exc:
+                if "assignment_conflict" in str(exc).lower():
+                    conflicting = self._active_assignment(
+                        client_id=data["client_id"],
+                        platform=data["platform"],
+                        external_account_id=data["external_account_id"],
+                        exclude=account_id,
+                    )
+                    if conflicting:
+                        raise _assignment_conflict(conflicting)
                 raise HTTPException(status_code=409, detail=f"Account conflict: {exc}")
             row = conn.execute("SELECT * FROM ad_accounts WHERE id=?", (str(account_id),)).fetchone()
         return self._to_account(row)
@@ -189,15 +385,40 @@ class InMemoryAdAccountStore:
 
     def _assert_unique(self, client_id: UUID | str, platform: str, external: str, exclude: Optional[UUID] = None) -> None:
         resolved_client_id = str(client_id)
+        normalized_platform = normalize_account_platform(platform)
+        normalized_external = canonical_external_account_id(normalized_platform, external)
         for item in self.items.values():
             if exclude and item.id == exclude:
                 continue
             if (
                 str(item.client_id) == resolved_client_id
-                and item.platform == platform
-                and item.external_account_id == external
+                and normalize_account_platform(item.platform) == normalized_platform
+                and canonical_external_account_id(item.platform, item.external_account_id) == normalized_external
             ):
                 raise HTTPException(status_code=409, detail="Account conflict: duplicate platform+external_account_id")
+
+    def _assert_active_assignment_available(
+        self,
+        client_id: UUID | str,
+        platform: str,
+        external: str,
+        exclude: Optional[UUID] = None,
+    ) -> None:
+        resolved_client_id = str(client_id)
+        normalized_platform = normalize_account_platform(platform)
+        normalized_external = canonical_external_account_id(normalized_platform, external)
+        active_client_ids = {client.id for client in self.client_store.list(status="active")}
+        for item in self.items.values():
+            if exclude and item.id == exclude:
+                continue
+            if (
+                item.status == "active"
+                and item.client_id in active_client_ids
+                and str(item.client_id) != resolved_client_id
+                and normalize_account_platform(item.platform) == normalized_platform
+                and canonical_external_account_id(item.platform, item.external_account_id) == normalized_external
+            ):
+                raise _assignment_conflict(item)
 
     @staticmethod
     def _sync_fields_from_metadata(metadata: Optional[dict]) -> dict:
@@ -232,13 +453,21 @@ class InMemoryAdAccountStore:
 
     def create(self, payload: AdAccountCreate) -> AdAccountOut:
         self._assert_client_exists(payload.client_id)
-        self._assert_unique(payload.client_id, payload.platform, payload.external_account_id)
+        platform = normalize_account_platform(payload.platform)
+        external_account_id = canonical_external_account_id(platform, payload.external_account_id)
+        self._assert_unique(payload.client_id, platform, external_account_id)
+        if payload.status == "active":
+            self._assert_active_assignment_available(
+                payload.client_id,
+                platform,
+                external_account_id,
+            )
         now = _utcnow()
         rec = AdAccountOut(
             id=uuid4(),
             client_id=payload.client_id,
-            platform=payload.platform,
-            external_account_id=payload.external_account_id,
+            platform=platform,
+            external_account_id=external_account_id,
             name=payload.name,
             currency=payload.currency,
             timezone=payload.timezone,
@@ -272,10 +501,33 @@ class InMemoryAdAccountStore:
         if not patch:
             return existing
         merged = {**existing.model_dump(), **patch}
+        if "platform" in patch:
+            merged["platform"] = normalize_account_platform(merged["platform"])
+        if "platform" in patch or "external_account_id" in patch:
+            merged["external_account_id"] = canonical_external_account_id(
+                merged["platform"],
+                merged["external_account_id"],
+            )
         self._assert_client_exists(merged["client_id"])
         self._assert_unique(merged["client_id"], merged["platform"], merged["external_account_id"], exclude=account_id)
+        identity_changed = any(
+            key in patch and patch[key] != getattr(existing, key)
+            for key in {"client_id", "platform", "external_account_id", "status"}
+        )
+        if identity_changed and merged["status"] == "active":
+            self._assert_active_assignment_available(
+                merged["client_id"],
+                merged["platform"],
+                merged["external_account_id"],
+                exclude=account_id,
+            )
         sync_fields = self._sync_fields_from_metadata(merged.get("metadata"))
-        rec = existing.model_copy(update={**patch, **sync_fields, "updated_at": _utcnow()})
+        normalized_patch = dict(patch)
+        if "platform" in patch:
+            normalized_patch["platform"] = merged["platform"]
+        if "platform" in patch or "external_account_id" in patch:
+            normalized_patch["external_account_id"] = merged["external_account_id"]
+        rec = existing.model_copy(update={**normalized_patch, **sync_fields, "updated_at": _utcnow()})
         self.items[account_id] = rec
         return rec
 

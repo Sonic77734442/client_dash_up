@@ -34,6 +34,133 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_ad_accounts_client_platform_external_id
 ON ad_accounts(client_id, platform, external_account_id);
 CREATE INDEX IF NOT EXISTS idx_ad_accounts_client_id ON ad_accounts(client_id);
 CREATE INDEX IF NOT EXISTS idx_ad_accounts_status ON ad_accounts(status);
+CREATE INDEX IF NOT EXISTS idx_ad_accounts_assignment
+ON ad_accounts(platform, external_account_id, status);
+
+-- Existing production databases may already contain cross-client duplicates.  A
+-- global unique index would fail to install and would force a destructive data
+-- migration.  These triggers preserve existing rows while preventing any new
+-- second *active* assignment of the same provider account to another client.
+CREATE TRIGGER IF NOT EXISTS trg_ad_accounts_active_assignment_insert
+BEFORE INSERT ON ad_accounts
+WHEN NEW.status = 'active'
+ AND EXISTS (
+   SELECT 1
+   FROM ad_accounts a
+   WHERE (CASE WHEN lower(a.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(a.platform) END)
+       = (CASE WHEN lower(NEW.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(NEW.platform) END)
+     AND (
+       CASE
+         WHEN lower(a.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(a.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(a.external_account_id), 5) ELSE trim(a.external_account_id) END
+         WHEN lower(a.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(a.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(a.external_account_id)
+       END
+     ) = (
+       CASE
+         WHEN lower(NEW.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(NEW.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(NEW.external_account_id), 5) ELSE trim(NEW.external_account_id) END
+         WHEN lower(NEW.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(NEW.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(NEW.external_account_id)
+       END
+     )
+     AND a.status = 'active'
+     AND a.client_id <> NEW.client_id
+     AND EXISTS (SELECT 1 FROM clients c WHERE c.id=a.client_id AND c.status='active')
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'assignment_conflict');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_ad_accounts_active_assignment_update
+BEFORE UPDATE ON ad_accounts
+WHEN NEW.status = 'active'
+ AND (
+   OLD.status <> 'active'
+   OR OLD.client_id <> NEW.client_id
+   OR lower(OLD.platform) <> lower(NEW.platform)
+   OR OLD.external_account_id <> NEW.external_account_id
+ )
+ AND EXISTS (
+   SELECT 1
+   FROM ad_accounts a
+   WHERE a.id <> OLD.id
+     AND (CASE WHEN lower(a.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(a.platform) END)
+       = (CASE WHEN lower(NEW.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(NEW.platform) END)
+     AND (
+       CASE
+         WHEN lower(a.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(a.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(a.external_account_id), 5) ELSE trim(a.external_account_id) END
+         WHEN lower(a.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(a.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(a.external_account_id)
+       END
+     ) = (
+       CASE
+         WHEN lower(NEW.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(NEW.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(NEW.external_account_id), 5) ELSE trim(NEW.external_account_id) END
+         WHEN lower(NEW.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(NEW.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(NEW.external_account_id)
+       END
+     )
+     AND a.status = 'active'
+     AND a.client_id <> NEW.client_id
+     AND EXISTS (SELECT 1 FROM clients c WHERE c.id=a.client_id AND c.status='active')
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'assignment_conflict');
+END;
+
+-- Restoring an archived client can reactivate preserved child mappings. Guard
+-- that transition in the database as well, so a concurrent account assignment
+-- cannot race the application-level restore check.
+CREATE TRIGGER IF NOT EXISTS trg_clients_active_assignment_restore
+BEFORE UPDATE OF status ON clients
+WHEN NEW.status = 'active'
+ AND OLD.status <> 'active'
+ AND EXISTS (
+   SELECT 1
+   FROM ad_accounts own
+   JOIN ad_accounts other
+     ON other.client_id <> NEW.id
+    AND other.status = 'active'
+   JOIN clients other_client
+     ON other_client.id = other.client_id
+    AND other_client.status = 'active'
+   WHERE own.client_id = NEW.id
+     AND own.status = 'active'
+     AND (CASE WHEN lower(own.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(own.platform) END)
+       = (CASE WHEN lower(other.platform) IN ('meta', 'facebook') THEN 'meta' ELSE lower(other.platform) END)
+     AND (
+       CASE
+         WHEN lower(own.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(own.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(own.external_account_id), 5) ELSE trim(own.external_account_id) END
+         WHEN lower(own.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(own.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(own.external_account_id)
+       END
+     ) = (
+       CASE
+         WHEN lower(other.platform) IN ('meta', 'facebook') THEN
+           CASE WHEN lower(trim(other.external_account_id)) GLOB 'act_*'
+             THEN substr(trim(other.external_account_id), 5) ELSE trim(other.external_account_id) END
+         WHEN lower(other.platform) IN ('google', 'tiktok') THEN
+           replace(replace(replace(replace(trim(other.external_account_id), '-', ''), ' ', ''), '_', ''), '.', '')
+         ELSE trim(other.external_account_id)
+       END
+     )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'assignment_conflict');
+END;
 
 CREATE TABLE IF NOT EXISTS ad_account_sync_jobs (
   id TEXT PRIMARY KEY,
@@ -57,6 +184,13 @@ CREATE TABLE IF NOT EXISTS ad_account_sync_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_ad_account_sync_jobs_account ON ad_account_sync_jobs(ad_account_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ad_account_sync_jobs_status ON ad_account_sync_jobs(status, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS ad_account_sync_leases (
+  lease_key TEXT PRIMARY KEY,
+  lease_token TEXT NOT NULL,
+  lease_until TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS ad_stats (
   id TEXT PRIMARY KEY,
@@ -208,6 +342,7 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   provider TEXT NOT NULL,
   next_path TEXT NULL,
   nonce TEXT NOT NULL DEFAULT '',
+  initiator_user_id TEXT NULL,
   expires_at TEXT NOT NULL,
   used_at TEXT NULL,
   created_at TEXT NOT NULL
@@ -260,7 +395,7 @@ CREATE TABLE IF NOT EXISTS budgets (
   client_id TEXT NOT NULL,
   scope TEXT NOT NULL DEFAULT 'client' CHECK (scope IN ('client','account')),
   account_id TEXT NULL,
-  amount NUMERIC NOT NULL,
+  amount NUMERIC NOT NULL CHECK (amount >= 0),
   currency TEXT NOT NULL DEFAULT 'USD',
   period_type TEXT NOT NULL CHECK (period_type IN ('monthly','custom')),
   start_date TEXT NOT NULL,
@@ -287,7 +422,7 @@ CREATE TABLE IF NOT EXISTS budget_transfers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_budget_id TEXT NOT NULL,
   target_budget_id TEXT NOT NULL,
-  amount NUMERIC NOT NULL,
+  amount NUMERIC NOT NULL CHECK (amount > 0),
   note TEXT NULL,
   changed_by TEXT NULL,
   created_at TEXT NOT NULL
@@ -300,6 +435,30 @@ CREATE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope);
 CREATE INDEX IF NOT EXISTS idx_budget_history_budget_id ON budget_history(budget_id, changed_at);
 CREATE INDEX IF NOT EXISTS idx_budget_transfers_source ON budget_transfers(source_budget_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_budget_transfers_target ON budget_transfers(target_budget_id, created_at);
+
+-- CHECK constraints above protect newly-created databases. These triggers add
+-- the same invariant to existing SQLite files, whose table-level constraints
+-- cannot be changed in place without rebuilding the table.
+CREATE TRIGGER IF NOT EXISTS trg_budgets_nonnegative_insert
+BEFORE INSERT ON budgets
+WHEN CAST(NEW.amount AS NUMERIC) < 0
+BEGIN
+  SELECT RAISE(ABORT, 'budget_amount_negative');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_budgets_nonnegative_update
+BEFORE UPDATE OF amount ON budgets
+WHEN CAST(NEW.amount AS NUMERIC) < 0
+BEGIN
+  SELECT RAISE(ABORT, 'budget_amount_negative');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_budget_transfers_positive_insert
+BEFORE INSERT ON budget_transfers
+WHEN CAST(NEW.amount AS NUMERIC) <= 0
+BEGIN
+  SELECT RAISE(ABORT, 'budget_transfer_amount_not_positive');
+END;
 
 CREATE TABLE IF NOT EXISTS operational_actions (
   id TEXT PRIMARY KEY,
@@ -375,6 +534,8 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
     oauth_cols = {row[1] for row in conn.execute("PRAGMA table_info(oauth_states)").fetchall()}
     if oauth_cols and "nonce" not in oauth_cols:
         conn.execute("ALTER TABLE oauth_states ADD COLUMN nonce TEXT NOT NULL DEFAULT ''")
+    if oauth_cols and "initiator_user_id" not in oauth_cols:
+        conn.execute("ALTER TABLE oauth_states ADD COLUMN initiator_user_id TEXT NULL")
 
     agency_cols = {row[1] for row in conn.execute("PRAGMA table_info(agencies)").fetchall()}
     if agency_cols and "allow_client_invites" not in agency_cols:

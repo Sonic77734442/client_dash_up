@@ -65,6 +65,11 @@ class AuthFacadeService:
                     )
                 )
 
+        # A linked OAuth identity is not an activation mechanism. Disabled
+        # users must not have their identity refreshed or receive a new session.
+        if user.status != "active":
+            raise HTTPException(status_code=403, detail="user is inactive")
+
         # 4) upsert identity link to resolved user
         identity = self.auth_store.link_identity(
             AuthIdentityLink(
@@ -107,6 +112,8 @@ class AuthFacadeService:
         user = self.auth_store.get_user(valid.user_id) if valid.user_id else None
         if not user:
             return SessionContextResponse(valid=False, reason="user_not_found")
+        if user.status != "active":
+            return SessionContextResponse(valid=False, reason="user_inactive")
 
         # Role-based tenant access resolution
         role_cfg = ROLE_ACCESS_MODEL.get(user.role, {"scope": "assigned-tenants"})

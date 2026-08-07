@@ -3,20 +3,21 @@
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 from typing import Dict, Optional, Protocol
+from uuid import UUID
 from urllib.parse import urlencode
 
 import httpx
 from fastapi import HTTPException
 
 from app.db import init_sqlite, sqlite_conn
+from app.services.meta_version import meta_graph_api_version
 
-
-META_GRAPH_API_VERSION = "v26.0"
 
 
 @dataclass
@@ -37,6 +38,7 @@ class OAuthState:
     next_path: str
     nonce: str
     expires_at: datetime
+    initiator_user_id: Optional[UUID] = None
 
 
 @dataclass
@@ -50,7 +52,14 @@ class ExternalIdentityPayload:
 
 
 class OAuthStateStore(Protocol):
-    def create_state(self, provider: str, next_path: str, nonce: str, ttl_minutes: int = 10) -> OAuthState: ...
+    def create_state(
+        self,
+        provider: str,
+        next_path: str,
+        nonce: str,
+        ttl_minutes: int = 10,
+        initiator_user_id: Optional[UUID] = None,
+    ) -> OAuthState: ...
     def consume_state(self, provider: str, state: str, nonce: str) -> OAuthState: ...
 
 
@@ -66,24 +75,51 @@ class SqliteOAuthStateStore:
         self.db_path = db_path
         init_sqlite(db_path)
 
-    def create_state(self, provider: str, next_path: str, nonce: str, ttl_minutes: int = 10) -> OAuthState:
+    def create_state(
+        self,
+        provider: str,
+        next_path: str,
+        nonce: str,
+        ttl_minutes: int = 10,
+        initiator_user_id: Optional[UUID] = None,
+    ) -> OAuthState:
         now = _utcnow()
         state = secrets.token_urlsafe(32)
         expires_at = now + timedelta(minutes=ttl_minutes)
         with sqlite_conn(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT INTO oauth_states (state, provider, next_path, nonce, expires_at, used_at, created_at)
-                VALUES (?, ?, ?, ?, ?, NULL, ?)
+                INSERT INTO oauth_states
+                (state, provider, next_path, nonce, initiator_user_id, expires_at, used_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
                 """,
-                (state, provider, next_path, nonce, expires_at.isoformat(), now.isoformat()),
+                (
+                    state,
+                    provider,
+                    next_path,
+                    nonce,
+                    str(initiator_user_id) if initiator_user_id else None,
+                    expires_at.isoformat(),
+                    now.isoformat(),
+                ),
             )
             conn.commit()
-        return OAuthState(state=state, provider=provider, next_path=next_path, nonce=nonce, expires_at=expires_at)
+        return OAuthState(
+            state=state,
+            provider=provider,
+            next_path=next_path,
+            nonce=nonce,
+            expires_at=expires_at,
+            initiator_user_id=initiator_user_id,
+        )
 
     def consume_state(self, provider: str, state: str, nonce: str) -> OAuthState:
         now = _utcnow()
         with sqlite_conn(self.db_path) as conn:
+            # Claim the state under a write lock. A plain SELECT followed by an
+            # unconditional UPDATE lets two concurrent callbacks both observe
+            # used_at=NULL and replay the same OAuth state.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM oauth_states WHERE state=? AND provider=?",
                 (state, provider),
@@ -99,7 +135,16 @@ class SqliteOAuthStateStore:
             if expires_at <= now:
                 raise HTTPException(status_code=400, detail="OAuth state expired")
 
-            conn.execute("UPDATE oauth_states SET used_at=? WHERE state=?", (now.isoformat(), state))
+            claimed = conn.execute(
+                """
+                UPDATE oauth_states
+                SET used_at=?
+                WHERE state=? AND provider=? AND used_at IS NULL
+                """,
+                (now.isoformat(), state, provider),
+            )
+            if claimed.rowcount != 1:
+                raise HTTPException(status_code=400, detail="OAuth state already used")
             conn.commit()
 
         return OAuthState(
@@ -108,6 +153,7 @@ class SqliteOAuthStateStore:
             next_path=row["next_path"] or "/",
             nonce=row["nonce"] or "",
             expires_at=expires_at,
+            initiator_user_id=UUID(row["initiator_user_id"]) if row["initiator_user_id"] else None,
         )
 
 
@@ -115,8 +161,16 @@ class InMemoryOAuthStateStore:
     def __init__(self):
         self.items: Dict[str, OAuthState] = {}
         self.used: set[str] = set()
+        self._lock = Lock()
 
-    def create_state(self, provider: str, next_path: str, nonce: str, ttl_minutes: int = 10) -> OAuthState:
+    def create_state(
+        self,
+        provider: str,
+        next_path: str,
+        nonce: str,
+        ttl_minutes: int = 10,
+        initiator_user_id: Optional[UUID] = None,
+    ) -> OAuthState:
         state = secrets.token_urlsafe(32)
         rec = OAuthState(
             state=state,
@@ -124,22 +178,25 @@ class InMemoryOAuthStateStore:
             next_path=next_path,
             nonce=nonce,
             expires_at=_utcnow() + timedelta(minutes=ttl_minutes),
+            initiator_user_id=initiator_user_id,
         )
-        self.items[state] = rec
+        with self._lock:
+            self.items[state] = rec
         return rec
 
     def consume_state(self, provider: str, state: str, nonce: str) -> OAuthState:
-        rec = self.items.get(state)
-        if not rec or rec.provider != provider:
-            raise HTTPException(status_code=400, detail="Invalid OAuth state")
-        if rec.nonce != nonce:
-            raise HTTPException(status_code=400, detail="OAuth nonce mismatch")
-        if state in self.used:
-            raise HTTPException(status_code=400, detail="OAuth state already used")
-        if rec.expires_at <= _utcnow():
-            raise HTTPException(status_code=400, detail="OAuth state expired")
-        self.used.add(state)
-        return rec
+        with self._lock:
+            rec = self.items.get(state)
+            if not rec or rec.provider != provider:
+                raise HTTPException(status_code=400, detail="Invalid OAuth state")
+            if rec.nonce != nonce:
+                raise HTTPException(status_code=400, detail="OAuth nonce mismatch")
+            if state in self.used:
+                raise HTTPException(status_code=400, detail="OAuth state already used")
+            if rec.expires_at <= _utcnow():
+                raise HTTPException(status_code=400, detail="OAuth state expired")
+            self.used.add(state)
+            return rec
 
 
 class FacebookOAuthAdapter:
@@ -154,7 +211,7 @@ class FacebookOAuthAdapter:
                 "scope": "public_profile,email",
                 "response_type": "code",
             }
-            return f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
+            return f"https://www.facebook.com/{meta_graph_api_version()}/dialog/oauth?{urlencode(params)}"
 
         if not cfg.config_id:
             raise HTTPException(
@@ -172,12 +229,12 @@ class FacebookOAuthAdapter:
             "response_type": "code",
             "override_default_response_type": "true",
         }
-        return f"https://www.facebook.com/{META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
+        return f"https://www.facebook.com/{meta_graph_api_version()}/dialog/oauth?{urlencode(params)}"
 
     def fetch_identity(self, cfg: OAuthProviderConfig, code: str) -> ExternalIdentityPayload:
         with httpx.Client(timeout=20.0) as client:
             token_resp = client.get(
-                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/oauth/access_token",
+                f"https://graph.facebook.com/{meta_graph_api_version()}/oauth/access_token",
                 params={
                     "client_id": cfg.client_id,
                     "client_secret": cfg.client_secret,
@@ -193,7 +250,7 @@ class FacebookOAuthAdapter:
                 raise HTTPException(status_code=400, detail="Facebook access token missing")
 
             profile_resp = client.get(
-                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/me",
+                f"https://graph.facebook.com/{meta_graph_api_version()}/me",
                 params={"fields": "id,name,email" if cfg.intent == "login" else "id,name"},
                 headers={"Authorization": f"Bearer {token}"},
             )

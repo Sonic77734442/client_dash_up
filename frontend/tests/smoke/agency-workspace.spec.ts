@@ -1,9 +1,34 @@
 import { expect, test } from "@playwright/test";
-import { attachSession, createAgencySessionWithAccess } from "./auth";
+import { agencySelectionRequiredMessage, resolveAgencySelection } from "../../lib/agencyContext";
+import { calculateClientRiskScore } from "../../lib/riskScore";
+import type { AgencyOut } from "../../lib/types";
+import { attachSession, createAgencySessionWithAccess, createMultiAgencySessionWithAccess } from "./auth";
+
+const API_BASE = "http://127.0.0.1:8000";
+
+test("agency context auto-selects one agency and rejects an ambiguous saved choice", () => {
+  const north = { id: "north", name: "North" } as AgencyOut;
+  const south = { id: "south", name: "South" } as AgencyOut;
+
+  expect(resolveAgencySelection([north], null)).toBe("north");
+  expect(resolveAgencySelection([north, south], "south")).toBe("south");
+  expect(resolveAgencySelection([north, south], "removed")).toBe("");
+  expect(agencySelectionRequiredMessage()).toContain("Выберите текущее агентство");
+  expect(calculateClientRiskScore(60, 5_000_000, 5_000_000, false)).toBe(
+    calculateClientRiskScore(60, 1_000, 5_000_000, false),
+  );
+});
 
 test("agency workspace routes are stable and role-scoped", async ({ page, context, request }) => {
   test.setTimeout(90_000);
   const token = await createAgencySessionWithAccess(request);
+  const agenciesResponse = await request.get(`${API_BASE}/platform/agencies?status=active`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  expect(agenciesResponse.ok()).toBeTruthy();
+  const agencyRows = (await agenciesResponse.json()) as { items: AgencyOut[] };
+  const agency = agencyRows.items[0];
+  expect(agency?.id).toBeTruthy();
   await attachSession(page, context, token);
 
   await page.goto("/");
@@ -21,6 +46,34 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   }
 
   await page.goto("/sync-monitor");
+  await expect(page.locator(".agency-context-current")).toBeVisible({ timeout: 30_000 });
+
+  await page.route("**/ad-accounts/discover", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        requested_provider: "all",
+        client_id: "00000000-0000-0000-0000-000000000001",
+        discovered: 0,
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        providers_attempted: [],
+        providers_failed: {},
+        items: [],
+      }),
+    });
+  });
+  const discoverRequestPromise = page.waitForRequest((candidate) => (
+    candidate.method() === "POST" && candidate.url().endsWith("/ad-accounts/discover")
+  ));
+  const discoverButton = page.getByRole("button", { name: "Найти аккаунты", exact: true }).first();
+  await expect(discoverButton).toBeEnabled({ timeout: 30_000 });
+  await discoverButton.click();
+  const discoverRequest = await discoverRequestPromise;
+  expect(discoverRequest.postDataJSON()).toMatchObject({ agency_id: agency.id });
+
   const metaConnect = page.getByRole("button", { name: "Подключить Meta Ads" }).first();
   await expect(metaConnect).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("button", { name: "Войти через Facebook" })).toHaveCount(0);
@@ -40,4 +93,74 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   expect(oauthUrl.pathname).toMatch(/\/auth\/facebook\/start$/);
   expect(oauthUrl.searchParams.get("intent")).toBe("connect");
   expect(oauthUrl.searchParams.get("connect_mode")).toBe("add");
+  expect(oauthUrl.searchParams.get("agency_id")).toBe(agency.id);
+});
+
+test("switching agency drops delayed old scope and constrains bulk sync", async ({ page, context, request }) => {
+  test.setTimeout(120_000);
+  const fixture = await createMultiAgencySessionWithAccess(request);
+  const [north, south] = fixture.fixtures;
+  await attachSession(page, context, fixture.token);
+
+  await page.goto("/clients");
+  const agencySelect = page.getByLabel("Текущее агентство");
+  await expect(agencySelect).toBeVisible({ timeout: 30_000 });
+  await expect(agencySelect).toHaveValue("");
+
+  await page.route(`**/platform/agencies/${north.agencyId}/clients`, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await route.continue();
+  });
+  const delayedNorth = page.waitForRequest((candidate) => (
+    candidate.url().includes(`/platform/agencies/${north.agencyId}/clients`)
+  ));
+  await agencySelect.selectOption(north.agencyId);
+  await delayedNorth;
+  await agencySelect.selectOption(south.agencyId);
+
+  await expect(agencySelect).toHaveValue(south.agencyId);
+  await expect(page.getByText(south.clientId.slice(0, 8), { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  await expect(page.getByText(north.clientId.slice(0, 8), { exact: false })).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByLabel("Текущее агентство")).toHaveValue(south.agencyId, { timeout: 30_000 });
+
+  await page.goto("/accounts");
+  const accountsAgencySelect = page.getByLabel("Текущее агентство");
+  await expect(accountsAgencySelect).toHaveValue(south.agencyId, { timeout: 30_000 });
+  await accountsAgencySelect.selectOption(north.agencyId);
+  const northRow = page.getByRole("row").filter({ hasText: north.accountId.slice(0, 8) });
+  await expect(northRow).toBeVisible({ timeout: 30_000 });
+  await northRow.getByRole("checkbox").check();
+  await expect(page.getByTestId("bulk-assign-client")).toBeEnabled();
+
+  await accountsAgencySelect.selectOption(south.agencyId);
+  await expect(page.getByTestId("bulk-assign-client")).toBeDisabled();
+  await expect(page.getByRole("row").filter({ hasText: south.accountId.slice(0, 8) })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("row").filter({ hasText: north.accountId.slice(0, 8) })).toHaveCount(0);
+
+  await page.route("**/ad-accounts/sync/run", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        requested: 1,
+        processed: 1,
+        skipped: 0,
+        success: 1,
+        failed: 0,
+        retry_scheduled: 0,
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+        jobs: [],
+      }),
+    });
+  });
+  const syncRequestPromise = page.waitForRequest((candidate) => (
+    candidate.method() === "POST" && candidate.url().endsWith("/ad-accounts/sync/run")
+  ));
+  await page.getByRole("button", { name: "Обновить данные" }).click();
+  const syncRequest = await syncRequestPromise;
+  expect(syncRequest.postDataJSON()).toMatchObject({ account_ids: [south.accountId] });
 });

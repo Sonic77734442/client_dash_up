@@ -5,10 +5,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
 import { ToastHost } from "../../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../../hooks/useAgencyContext";
 import { useOperationalActions } from "../../../hooks/useOperationalActions";
 import { useSession } from "../../../hooks/useSession";
+import { useScopeRequestGuard } from "../../../hooks/useScopeRequestGuard";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson, getQuery } from "../../../lib/api";
+import { accountDataFreshness, dataFreshnessMeta, overviewDataFreshness } from "../../../lib/dataFreshness";
 import { AdAccount, Budget, ClientOut, OperationalAction, Overview } from "../../../lib/types";
 
 type ActionKind = "cap" | "review" | "scale";
@@ -129,10 +132,8 @@ function paceMeta(status?: string | null) {
 }
 
 function accountStatus(account: AdAccount) {
-  if (account.sync_status === "error") return { label: "Ошибка данных", tone: "bad" as Tone };
-  if (account.status !== "active") return { label: "Неактивен", tone: "warn" as Tone };
-  if (!account.last_sync_at) return { label: "Ожидает данных", tone: "warn" as Tone };
-  return { label: "Данные актуальны", tone: "good" as Tone };
+  const meta = dataFreshnessMeta(accountDataFreshness(account));
+  return { label: meta.label, tone: meta.tone as Tone, description: meta.description };
 }
 
 function MetricCard({
@@ -158,6 +159,10 @@ function MetricCard({
 export default function ClientDetailsPage({ clientId }: { clientId: string }) {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { session, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(
+    `${agencyContext.selectedAgencyId || agencyContext.role || "unknown"}:${clientId}`,
+  );
   const { toasts, push } = useToast();
   const { executeAction, listActions } = useOperationalActions(session.apiBase, session.token);
 
@@ -178,6 +183,23 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
 
   const loadData = useCallback(async () => {
     if (!clientId) return;
+    const isCurrentRequest = beginScopedRequest();
+    if (
+      agencyContext.role === "agency"
+      && (!agencyContext.portfolioReady || !agencyContext.clientIds.includes(clientId))
+    ) {
+      setClient(null);
+      setOverview(null);
+      setAccounts([]);
+      setBudgets([]);
+      setActions([]);
+      setWarning(
+        agencyContext.selectionRequired
+          ? agencySelectionRequiredMessage()
+          : "Этот клиент не входит в выбранное агентство.",
+      );
+      return;
+    }
     setLoading(true);
     try {
       setWarning("");
@@ -197,6 +219,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
         ),
         listActions({ clientId }),
       ]);
+      if (!isCurrentRequest()) return;
       setClient(clientPayload);
       setOverview(overviewPayload);
       setAccounts(accountPayload.items || []);
@@ -207,12 +230,31 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [clientId, listActions, periodDays, request]);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    clientId,
+    listActions,
+    periodDays,
+    request,
+  ]);
 
   useEffect(() => {
-    if (!ready || !clientId) return;
+    if (!ready || !clientId || agencyContext.loading) return;
     void loadData();
-  }, [ready, clientId, loadData]);
+  }, [agencyContext.loading, ready, clientId, loadData]);
+
+  useEffect(() => {
+    setClient(null);
+    setOverview(null);
+    setAccounts([]);
+    setBudgets([]);
+    setActions([]);
+    setBusyAction("");
+  }, [agencyContext.selectedAgencyId]);
 
   const clientBudget = useMemo(
     () => budgets.find((budget) => budget.scope === "client") || null,
@@ -241,6 +283,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
     null;
 
   const totalSpend = Number(overview?.spend_summary?.spend || 0);
+  const isReadOnly = client?.status !== "active";
   const totalConversions = Number(overview?.spend_summary?.conversions || 0);
   const averageCpl = totalConversions > 0 ? totalSpend / totalConversions : null;
   const overviewBudget =
@@ -249,7 +292,12 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
         ? Number(clientBudget.amount || 0)
         : null
       : Number(overview.budget_summary.budget);
-  const pace = paceMeta(overview?.budget_summary?.pace_status);
+  const dataState = overviewDataFreshness(overview);
+  const dataMeta = dataFreshnessMeta(dataState);
+  const rawPace = paceMeta(overview?.budget_summary?.pace_status);
+  const pace = dataState === "current"
+    ? rawPace
+    : { label: dataMeta.label, description: dataMeta.description, tone: dataMeta.tone as Tone };
   const usage = overview?.budget_summary?.usage_percent;
   const periodLabel = overview
     ? `${fmtShortDate(overview.range.date_from)} — ${fmtShortDate(overview.range.date_to)}`
@@ -264,13 +312,19 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
     return "Рекламный объект";
   };
 
-  const summaryText = totalSpend
+  const summaryText = dataState !== "current"
+    ? dataMeta.description
+    : totalSpend
     ? `За ${periodLabel} клиент потратил ${fmtMoney(totalSpend, resolvedCurrency)} и получил ${fmtNum(
         totalConversions
       )} конверсий из рекламных площадок. ${pace.description}`
     : `За ${periodLabel} рекламные площадки не вернули расход и конверсии. Проверьте период и состояние подключений.`;
 
   async function runQuickAction(scope: ActionScope, action: ActionKind, accountId?: string) {
+    if (isReadOnly) {
+      push("Неактивный или архивный клиент доступен только для просмотра истории.", "info");
+      return;
+    }
     const targetAccount = scope === "account" ? accounts.find((account) => account.id === accountId) : null;
     const key = `${scope}:${accountId || clientId}:${action}`;
     setBusyAction(key);
@@ -348,7 +402,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
             </select>
           </label>
           <div className="asof">
-            {overview ? `Данные на ${fmtShortDate(overview.range.as_of_date)}` : "Данные загружаются"}
+            {overview ? `${dataMeta.label} · срез на ${fmtShortDate(overview.range.as_of_date)}` : "Данные загружаются"}
           </div>
           <button className="ghost-btn" onClick={() => void loadData()} disabled={loading}>
             {loading ? "Обновляем…" : "Обновить"}
@@ -356,6 +410,12 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
         </section>
 
         <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
+
+        {isReadOnly && client ? (
+          <div className="warning" style={{ marginTop: 12 }}>
+            Клиент {client.status === "archived" ? "в архиве" : "неактивен"}. История доступна для просмотра, новые действия отключены.
+          </div>
+        ) : null}
 
         <div className={`blueprint-note ${pace.tone === "bad" ? "bad" : ""}`.trim()} style={{ marginTop: 16 }}>
           <strong>Главное за период</strong>
@@ -433,7 +493,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
                         <td>{performance ? fmtRate(performance.ctr) : "Нет данных"}</td>
                         <td>
                           <span className={`badge ${status.tone}`}>{status.label}</span>
-                          <div className="panel-subtitle">{fmtDate(account.last_sync_at || account.updated_at)}</div>
+                          <div className="panel-subtitle">{fmtDate(account.last_sync_at)}</div>
                         </td>
                         <td>
                           <div className="alert-actions" style={{ marginTop: 0 }}>
@@ -443,9 +503,9 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
                                 <button
                                   key={action}
                                   className="mini-btn"
-                                  disabled={Boolean(busyAction)}
+                                  disabled={isReadOnly || Boolean(busyAction) || status.tone !== "good"}
                                   onClick={() => void runQuickAction("account", action, account.id)}
-                                  title={`${actionLabel(action)} для ${account.name}`}
+                                  title={status.tone !== "good" ? status.description : `${actionLabel(action)} для ${account.name}`}
                                 >
                                   {busyAction === key ? "…" : actionLabel(action)}
                                 </button>
@@ -571,7 +631,7 @@ export default function ClientDetailsPage({ clientId }: { clientId: string }) {
                     <button
                       key={action}
                       className={action === "review" ? "primary-btn" : "ghost-btn"}
-                      disabled={Boolean(busyAction)}
+                      disabled={isReadOnly || Boolean(busyAction)}
                       onClick={() => void runQuickAction("client", action)}
                     >
                       {busyAction === key ? "Создаём…" : actionLabel(action)}

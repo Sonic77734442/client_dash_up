@@ -33,10 +33,105 @@ class OperationalInsightsService:
         scope_account_id: Optional[str],
         breakdown_accounts: List[Dict[str, object]],
         budget_summary: Dict[str, object],
+        data_quality: Dict[str, object],
     ) -> Dict[str, object]:
         rows = [dict(x) for x in breakdown_accounts]
         if scope_account_id:
             rows = [x for x in rows if str(x.get("account_id")) == str(scope_account_id)]
+
+        quality = dict(data_quality or {})
+        reported_status = str(quality.get("status") or "insufficient_data").strip().lower()
+        reported_rows_present = bool(quality.get("rows_present", bool(rows)))
+        quality_status = reported_status if reported_status in {"fresh", "partial", "stale", "insufficient_data"} else "insufficient_data"
+        if not rows or not reported_rows_present:
+            quality_status = "insufficient_data"
+        quality.update(
+            {
+                "status": quality_status,
+                "rows_present": bool(rows) and reported_rows_present,
+                "rows_evaluated": len(rows),
+            }
+        )
+
+        # Cross-client comparisons can mix currencies, business models and
+        # independent budgets. They are useful for triage, never for automatic
+        # scale/cap advice. Require one explicit client before prescribing.
+        if not scope_client_id:
+            return {
+                "range": {"date_from": date_from.isoformat(), "date_to": date_to.isoformat()},
+                "scope": {"client_id": None, "account_id": scope_account_id},
+                "data_quality": quality,
+                "items": [
+                    {
+                        "scope": "agency",
+                        "scope_id": "all",
+                        "title": "Select a client before taking action",
+                        "reason": (
+                            "Cross-client metrics may use different currencies and targets. "
+                            "Choose one client to receive budget or campaign recommendations."
+                        ),
+                        "action": "review",
+                        "priority": "high",
+                        "score": 1.0,
+                        "metrics": {
+                            "fallback": True,
+                            "data_quality": quality_status,
+                            "recommended_next_step": "select_client",
+                            "rows_present": quality["rows_present"],
+                            "rows_evaluated": len(rows),
+                        },
+                    }
+                ],
+            }
+
+        if quality_status != "fresh":
+            if quality_status == "stale":
+                title = "Refresh stale data before taking action"
+                reason = (
+                    f"Metrics are stale for {int(self._to_float(quality.get('stale_accounts_count')))} active account(s). "
+                    "Refresh connected ad accounts before changing campaign settings or budgets."
+                )
+            elif quality_status == "partial":
+                title = "Complete data coverage before taking action"
+                reason = (
+                    f"Metrics are missing for {int(self._to_float(quality.get('accounts_without_data_count')))} active account(s). "
+                    "Refresh all connected ad accounts before comparing performance or reallocating spend."
+                )
+            else:
+                title = "Insufficient data for an action recommendation"
+                reason = "No fresh metric rows are available for the selected scope. Refresh the connected ad accounts before changing campaign settings."
+            return {
+                "range": {
+                    "date_from": date_from.isoformat(),
+                    "date_to": date_to.isoformat(),
+                },
+                "scope": {
+                    "client_id": scope_client_id,
+                    "account_id": scope_account_id,
+                },
+                "data_quality": quality,
+                "items": [
+                    {
+                        "scope": "client" if scope_client_id else "agency",
+                        "scope_id": scope_client_id or "all",
+                        "title": title,
+                        "reason": reason,
+                        "action": "review",
+                        "priority": "high",
+                        "score": 1.0,
+                        "metrics": {
+                            "fallback": True,
+                            "data_quality": quality_status,
+                            "recommended_next_step": "refresh_data",
+                            "rows_present": quality["rows_present"],
+                            "rows_evaluated": len(rows),
+                            "active_accounts_count": quality.get("active_accounts_count"),
+                            "accounts_without_data_count": quality.get("accounts_without_data_count"),
+                            "stale_accounts_count": quality.get("stale_accounts_count"),
+                        },
+                    }
+                ],
+            }
 
         total_spend = sum(self._to_float(x.get("spend")) for x in rows) or 1.0
         ctr_values = [self._to_float(x.get("ctr")) for x in rows if self._to_float(x.get("ctr")) > 0]
@@ -190,5 +285,6 @@ class OperationalInsightsService:
                 "client_id": scope_client_id,
                 "account_id": scope_account_id,
             },
+            "data_quality": quality,
             "items": ranked[:max_items],
         }

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { usePathname } from "next/navigation";
-import { useSessionContext } from "../hooks/useSessionContext";
+import { useAgencyContext } from "../hooks/useAgencyContext";
 import { useLocale } from "../hooks/useLocale";
 import { t } from "../lib/i18n";
 import { resolveApiBase } from "../lib/apiBase";
@@ -203,7 +203,6 @@ function menuForRole(role: Role): NavGroup[] {
 }
 
 export function AppSidebar({
-  active: _active,
   subtitle,
   className = "sidebar",
 }: {
@@ -212,14 +211,14 @@ export function AppSidebar({
   className?: string;
 }) {
   const pathname = usePathname() || "/";
-  const { context } = useSessionContext();
+  const agencyContext = useAgencyContext();
   const { locale } = useLocale();
   const inferredRole: Role = pathname.startsWith("/portal")
     ? "client"
     : pathname.startsWith("/platform")
     ? "admin"
     : "agency";
-  const role = (context?.role || inferredRole) as Role;
+  const role = (agencyContext.role || inferredRole) as Role;
   const groups = menuForRole(role);
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -260,6 +259,32 @@ export function AppSidebar({
     <aside className={`${className} role-sidebar`.trim()}>
       <div className="brand" data-i18n-skip>Client Dash Up</div>
       <div className="panel-subtitle">{roleSubtitle}</div>
+
+      {role === "agency" && agencyContext.agencies.length ? (
+        <div className="agency-context-switcher">
+          <label htmlFor="agency-context-select">Текущее агентство</label>
+          {agencyContext.agencies.length === 1 ? (
+            <div className="agency-context-current" title={agencyContext.agencies[0].name}>
+              {agencyContext.agencies[0].name}
+            </div>
+          ) : (
+            <select
+              id="agency-context-select"
+              aria-label="Текущее агентство"
+              value={agencyContext.selectedAgencyId}
+              onChange={(event) => agencyContext.setSelectedAgencyId(event.target.value)}
+            >
+              <option value="">Выберите агентство</option>
+              {agencyContext.agencies.map((agency) => (
+                <option value={agency.id} key={agency.id}>{agency.name}</option>
+              ))}
+            </select>
+          )}
+          {agencyContext.selectionRequired ? (
+            <div className="agency-context-hint">Выберите агентство для работы с его клиентами и подключениями.</div>
+          ) : null}
+        </div>
+      ) : null}
 
       <nav className="role-menu" aria-label="Основная навигация">
         {groups.map((group) => (

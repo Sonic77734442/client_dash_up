@@ -2,10 +2,13 @@
 
 import { StateMessage } from "../common/StateMessage";
 import { TimelineChart } from "../TimelineChart";
+import { DataFreshnessState, dataFreshnessMeta } from "../../lib/dataFreshness";
 import { AccountBreakdown, OperationalAction, OperationalInsight, Overview, PlatformBreakdown, TimelineAction, TimelinePoint } from "../../lib/types";
 
 type DashboardViewProps = {
   overview: Overview | null;
+  dataState: DataFreshnessState;
+  dataNotice: string;
   platform: "all" | "meta" | "google" | "tiktok";
   platformRows: PlatformBreakdown[];
   riskRows: AccountBreakdown[];
@@ -75,6 +78,8 @@ function insightCopy(
 
 export function DashboardView({
   overview,
+  dataState,
+  dataNotice,
   platform,
   platformRows,
   riskRows,
@@ -93,22 +98,29 @@ export function DashboardView({
   const spend = Number(overview?.spend_summary?.spend || 0);
   const conversions = Number(overview?.spend_summary?.conversions || 0);
   const cpl = conversions > 0 ? spend / conversions : null;
-  const attentionCount = operationalInsights.filter((row) => row.priority === "high" || row.priority === "medium").length;
+  const dataMeta = dataFreshnessMeta(dataState);
+  const metricsUsable = dataState === "current" || dataState === "stale";
+  const attentionCount = operationalInsights.filter((row) => row.priority === "high" || row.priority === "medium").length + (dataState === "current" ? 0 : 1);
   const leadInsight = operationalInsights[0] || null;
-  const leadCopy = insightCopy(
-    leadInsight,
-    (value) => leadInsight
-      ? fmtScopedMoney(value, leadInsight.scope, leadInsight.scope_id)
-      : fmtMoney(value),
-  );
+  const leadCopy = dataState === "current"
+    ? insightCopy(
+        leadInsight,
+        (value) => leadInsight
+          ? fmtScopedMoney(value, leadInsight.scope, leadInsight.scope_id)
+          : fmtMoney(value),
+      )
+    : { title: dataMeta.label, reason: dataNotice };
   const contributionTotal = platformRows.reduce((sum, row) => sum + Number(row.spend || 0), 0) || 1;
 
   return (
     <>
+      {dataState !== "current" ? (
+        <div className="warning" style={{ marginBottom: 12 }}>{dataNotice}</div>
+      ) : null}
       <section className="kpi-grid">
-        <article className="kpi-card">
+        <article className={`kpi-card ${dataState === "stale" ? "warn" : ""}`}>
           <div className="kpi-title">Расход за период</div>
-          <div className="kpi-value">{fmtMoney(spend)}</div>
+          <div className="kpi-value">{metricsUsable ? fmtMoney(spend) : "—"}</div>
           <div className="kpi-meta">
             {platform === "all"
               ? `Бюджет: ${overview?.budget_summary?.budget == null ? "не задан" : fmtMoney(overview.budget_summary.budget)}`
@@ -117,12 +129,12 @@ export function DashboardView({
         </article>
         <article className="kpi-card">
           <div className="kpi-title">Конверсии</div>
-          <div className="kpi-value">{fmtNum(conversions)}</div>
+          <div className="kpi-value">{metricsUsable ? fmtNum(conversions) : "—"}</div>
           <div className="kpi-meta">{platform === "all" ? "Все рекламные платформы" : platform.toUpperCase()}</div>
         </article>
         <article className="kpi-card">
           <div className="kpi-title">Стоимость конверсии</div>
-          <div className="kpi-value">{cpl == null ? "—" : fmtMoney(cpl)}</div>
+          <div className="kpi-value">{!metricsUsable || cpl == null ? "—" : fmtMoney(cpl)}</div>
           <div className="kpi-meta">Фактическая стоимость за выбранный период</div>
         </article>
         <article className="kpi-card">
@@ -152,12 +164,12 @@ export function DashboardView({
 
         <article className="panel performance-summary">
           <h3>Главное за период</h3>
-          <div className={`blueprint-note ${leadInsight?.priority === "high" ? "bad" : ""}`}>
+          <div className={`blueprint-note ${dataMeta.tone === "bad" || leadInsight?.priority === "high" ? "bad" : ""}`}>
             <strong>{leadCopy.title}</strong>
             <p className="panel-subtitle">
               {leadCopy.reason}
             </p>
-            {leadInsight && !leadInsight.metrics?.fallback ? (
+            {dataState === "current" && leadInsight && !leadInsight.metrics?.fallback ? (
               <button className="primary-btn" onClick={() => void onInsightAction(leadInsight)}>
                 Создать действие
               </button>
@@ -224,7 +236,12 @@ export function DashboardView({
                       </span>
                     </td>
                     <td>
-                      <button className={`action-btn ${rec.cls}`} onClick={() => void onRiskActionDraft(r.account_id, rec.label)}>
+                      <button
+                        className={`action-btn ${rec.cls}`}
+                        onClick={() => void onRiskActionDraft(r.account_id, rec.label)}
+                        disabled={dataState !== "current"}
+                        title={dataState !== "current" ? "Сначала обновите данные" : undefined}
+                      >
                         {rec.label}
                       </button>
                     </td>
@@ -244,6 +261,14 @@ export function DashboardView({
             ) : (
               recentActions.slice(0, 5).map((x) => {
                 const status = String(x.status || "queued");
+                const statusNames: Record<string, string> = {
+                  queued: "В очереди",
+                  pending: "Ожидает",
+                  in_progress: "В работе",
+                  applied: "Выполнено",
+                  completed: "Выполнено",
+                  failed: "Ошибка",
+                };
                 const scope = String(x.scope || "account") === "client" ? "КЛИЕНТ" : "АККАУНТ";
                 const actionNames: Record<string, string> = { cap: "ОГРАНИЧЕНИЕ", pause: "ПАУЗА", scale: "МАСШТАБИРОВАНИЕ", review: "ПРОВЕРКА" };
                 const action = actionNames[String(x.action || "")] || String(x.action || "").toUpperCase();
@@ -253,7 +278,7 @@ export function DashboardView({
                   <div key={x.id} className="action-row timeline-item">
                     <div className="action-row-head">
                       <div className="action-title">{`${action} • ${scope}`}</div>
-                      <span className={`status-pill ${status}`}>{status.toUpperCase()}</span>
+                      <span className={`status-pill ${status}`}>{statusNames[status] || status}</span>
                     </div>
                     <div className="action-meta">{x.title || "--"}</div>
                     <div className="action-meta">{x.scope_id || "--"}</div>
@@ -273,7 +298,9 @@ export function DashboardView({
             <div className="panel-subtitle">Система объясняет причину и предлагает следующий шаг</div>
           </div>
         </div>
-        {!operationalInsights.length ? (
+        {dataState !== "current" ? (
+          <StateMessage title={dataMeta.label} message="Рекомендации появятся после подтверждённой свежей загрузки данных." />
+        ) : !operationalInsights.length ? (
           <StateMessage title="Рекомендаций пока нет" message="Выберите другой период или дождитесь новых данных." />
         ) : (
           operationalInsights.slice(0, 5).map((row) => {

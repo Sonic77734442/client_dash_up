@@ -5,7 +5,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
 import { ToastHost } from "../../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../../hooks/useAgencyContext";
 import { useSession } from "../../../hooks/useSession";
+import { useScopeRequestGuard } from "../../../hooks/useScopeRequestGuard";
 import { useToast } from "../../../hooks/useToast";
 import { fetchJson, getQuery } from "../../../lib/api";
 import { Client, OperationalAction, OperationalInsight } from "../../../lib/types";
@@ -25,6 +27,10 @@ function dateRange(days: number) {
 export default function AgencyActionsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { session, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const agencyScopeKey = agencyContext.selectedAgencyId || agencyContext.role || "unknown";
+  const beginScopedRequest = useScopeRequestGuard(agencyScopeKey);
+  const beginActionRequest = useScopeRequestGuard(agencyScopeKey);
   const { toasts, push } = useToast();
   const [clients, setClients] = useState<Client[]>([]);
   const [insights, setInsights] = useState<InsightRow[]>([]);
@@ -39,9 +45,20 @@ export default function AgencyActionsPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
     try {
+      if (agencyContext.role === "agency" && !agencyContext.portfolioReady) {
+        throw new Error(
+          agencyContext.selectionRequired
+            ? agencySelectionRequiredMessage()
+            : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
+        );
+      }
       const clientRows = await req<{ items: Client[] }>("/clients?status=active");
-      const visibleClients = clientRows.items || [];
+      const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+      const visibleClients = (clientRows.items || []).filter(
+        (client) => !allowedClientIds || allowedClientIds.has(client.id),
+      );
       const range = dateRange(30);
       const result = await Promise.all(
         visibleClients.map(async (client) => {
@@ -60,6 +77,7 @@ export default function AgencyActionsPage() {
           };
         })
       );
+      if (!isCurrentRequest()) return;
       setClients(visibleClients);
       setInsights(result.flatMap((item) => item.insights).sort((a, b) => b.score - a.score));
       setActions(result.flatMap((item) => item.actions).sort((a, b) => b.created_at.localeCompare(a.created_at)));
@@ -67,12 +85,27 @@ export default function AgencyActionsPage() {
     } catch (error) {
       setWarning(error instanceof Error ? error.message : "Не удалось загрузить отклонения");
     }
-  }, [req]);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void loadData();
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
+
+  useEffect(() => {
+    setClients([]);
+    setInsights([]);
+    setActions([]);
+    setBusyKey("");
+  }, [agencyContext.selectedAgencyId]);
 
   const visibleInsights = useMemo(
     () => insights.filter((item) => priority === "all" || item.priority === priority),
@@ -80,6 +113,14 @@ export default function AgencyActionsPage() {
   );
 
   async function queueAction(item: InsightRow) {
+    if (
+      agencyContext.role === "agency"
+      && (!agencyContext.portfolioReady || !agencyContext.clientIds.includes(item.client_id))
+    ) {
+      push("Действие недоступно: клиент не входит в выбранное агентство.", "error");
+      return;
+    }
+    const isCurrentRequest = beginActionRequest();
     const key = `${item.client_id}-${item.scope}-${item.scope_id}`;
     setBusyKey(key);
     try {
@@ -96,8 +137,10 @@ export default function AgencyActionsPage() {
           account_id: item.scope === "account" ? item.scope_id : null,
         }),
       });
-      push("Действие поставлено в очередь", "success");
-      await loadData();
+      if (isCurrentRequest()) {
+        push("Действие поставлено в очередь", "success");
+        await loadData();
+      }
     } catch (error) {
       push(error instanceof Error ? error.message : "Не удалось создать действие", "error");
     } finally {

@@ -1,6 +1,5 @@
-fastapi==0.115.8
+fastapi==0.141.1
 uvicorn[standard]==0.34.0
 httpx==0.28.1
-python-dotenv==1.0.1
-google-ads==29.2.0
-pytest==8.3.5
+python-dotenv==1.2.2
+google-ads==31.2.0

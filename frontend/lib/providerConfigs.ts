@@ -19,7 +19,7 @@ function optionalString(value: unknown): string | null | undefined {
 }
 
 export function normalizeProviderConfigs(payload: unknown): ProviderConfig[] {
-  const rows = normalizeListPayload(payload, (_row): _row is unknown => true, "OAuth-провайдеров");
+  const rows = normalizeListPayload(payload, isRecord, "OAuth-провайдеров");
 
   return rows.map((row, index) => {
     if (!isRecord(row) || typeof row.provider !== "string" || !row.provider.trim()) {

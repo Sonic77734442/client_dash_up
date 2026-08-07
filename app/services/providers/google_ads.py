@@ -3,6 +3,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from google.ads.googleads import client as google_ads_client_module
 from google.ads.googleads.client import GoogleAdsClient
 
 
@@ -11,12 +12,21 @@ def normalize_customer_id(customer_id: str) -> str:
 
 
 def _api_version() -> str:
-    # Keep explicit API version and sanitize env input (e.g. `"v19"`, `v19.`, ` V19 `).
-    raw = str(os.getenv("GOOGLE_ADS_API_VERSION", "v19") or "v19").strip().strip("'\"").rstrip(".")
+    default_version = str(google_ads_client_module._DEFAULT_VERSION)
+    supported_versions = {str(version) for version in google_ads_client_module._VALID_API_VERSIONS}
+    raw = str(os.getenv("GOOGLE_ADS_API_VERSION", default_version) or default_version).strip().strip("'\"").rstrip(".")
     m = re.match(r"^v(\d+)$", raw.lower())
-    if not m:
-        return "v19"
-    return f"v{m.group(1)}"
+    version = f"v{m.group(1)}" if m else ""
+    if version not in supported_versions:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "google_ads_api_version_unsupported",
+                "message": "Configured Google Ads API version is not supported by the installed client",
+                "details": {"configured": raw, "supported": sorted(supported_versions)},
+            },
+        )
+    return version
 
 
 def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
@@ -28,12 +38,19 @@ def valid_customer_id_or_none(customer_id: object) -> Optional[str]:
 
 def ads_client(config_override: Optional[Dict[str, Any]] = None) -> GoogleAdsClient:
     cfg = config_override or {}
+    scoped = config_override is not None
+    # The developer token identifies the application and may be shared globally;
+    # OAuth client/refresh credentials below must remain tenant-scoped.
     developer_token = str(cfg.get("developer_token") or os.getenv("GOOGLE_ADS_DEVELOPER_TOKEN") or "").strip()
-    client_id = str(cfg.get("client_id") or os.getenv("GOOGLE_ADS_CLIENT_ID") or "").strip()
-    client_secret = str(cfg.get("client_secret") or os.getenv("GOOGLE_ADS_CLIENT_SECRET") or "").strip()
-    refresh_token = str(cfg.get("refresh_token") or os.getenv("GOOGLE_ADS_REFRESH_TOKEN") or "").strip()
+    client_id = str(cfg.get("client_id") or ("" if scoped else os.getenv("GOOGLE_ADS_CLIENT_ID")) or "").strip()
+    client_secret = str(
+        cfg.get("client_secret") or ("" if scoped else os.getenv("GOOGLE_ADS_CLIENT_SECRET")) or ""
+    ).strip()
+    refresh_token = str(
+        cfg.get("refresh_token") or ("" if scoped else os.getenv("GOOGLE_ADS_REFRESH_TOKEN")) or ""
+    ).strip()
     # For explicit per-tenant credentials, do not fall back to global env login_customer_id.
-    if config_override is not None:
+    if scoped:
         login_customer_id = str(cfg.get("login_customer_id") or "").strip() or None
     else:
         login_customer_id = str(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "").strip() or None
@@ -46,12 +63,11 @@ def ads_client(config_override: Optional[Dict[str, Any]] = None) -> GoogleAdsCli
         "client_id": client_id,
         "client_secret": client_secret,
         "refresh_token": refresh_token,
-        "version": _api_version(),
         "use_proto_plus": True,
     }
     if login_customer_id:
         config["login_customer_id"] = login_customer_id
-    return GoogleAdsClient.load_from_dict(config)
+    return GoogleAdsClient.load_from_dict(config, version=_api_version())
 
 
 def _fallback_accounts() -> List[Dict[str, object]]:
@@ -72,7 +88,7 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     strict_mode = config_override is not None
     cfg = config_override or {}
-    if config_override is not None:
+    if strict_mode:
         login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or "")
     else:
         login_customer_id = valid_customer_id_or_none(cfg.get("login_customer_id") or os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or "")
@@ -103,6 +119,8 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
             if cid:
                 root_ids.append(cid)
 
+        verification_errors = 0
+
         # 1) Add root accessible accounts.
         for customer_id in root_ids:
             if login_customer_id and customer_id == login_customer_id:
@@ -110,7 +128,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
                 continue
             name = f"Google {customer_id}"
             currency = "USD"
-            is_manager = False
+            is_manager: Optional[bool] = None
             try:
                 rows = ga_service.search(
                     customer_id=customer_id,
@@ -124,7 +142,11 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
                     is_manager = bool(getattr(row.customer, "manager", False))
                     break
             except Exception:
-                pass
+                verification_errors += 1
+                continue
+            if is_manager is None:
+                verification_errors += 1
+                continue
             if is_manager:
                 continue
             add_row(customer_id, name, currency, "api_root")
@@ -145,6 +167,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
             try:
                 rows = ga_service.search(customer_id=manager_id, query=hierarchy_query)
             except Exception:
+                verification_errors += 1
                 continue
             for row in rows:
                 child_id = normalize_customer_id(str(row.customer_client.id or ""))
@@ -166,18 +189,23 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
 
         if out:
             return out
+        if strict_mode and verification_errors:
+            raise HTTPException(
+                status_code=502,
+                detail="Google account discovery could not verify accessible customer accounts",
+            )
     except HTTPException:
         if strict_mode:
             raise
     except Exception as exc:
         if strict_mode:
             raise HTTPException(status_code=502, detail=f"Google account discovery failed: {exc}")
-    return _fallback_accounts()
+    return [] if strict_mode else _fallback_accounts()
 
 
 def detect_login_customer_id(config_override: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Pick a manager (MCC) customer id for tenant-scoped credentials when possible."""
-    if not config_override:
+    if config_override is None:
         return None
     try:
         client = ads_client(config_override)
@@ -305,19 +333,42 @@ def fetch_daily(
     for query in queries:
         try:
             rows = ga_service.search(customer_id=customer_id, query=query)
-            daily: List[Dict[str, object]] = []
+            by_date: Dict[str, Dict[str, object]] = {}
             for row in rows:
                 metrics = row.metrics
+                day = str(row.segments.date)
+                bucket = by_date.setdefault(
+                    day,
+                    {
+                        "date": day,
+                        "impressions": 0,
+                        "clicks": 0,
+                        "spend": 0.0,
+                        "conversions": 0.0,
+                    },
+                )
+                bucket["impressions"] = int(bucket["impressions"]) + int(metrics.impressions or 0)
+                bucket["clicks"] = int(bucket["clicks"]) + int(metrics.clicks or 0)
+                bucket["spend"] = float(bucket["spend"]) + float(metrics.cost_micros or 0) / 1_000_000
+                bucket["conversions"] = float(bucket["conversions"]) + float(metrics.conversions or 0)
+
+            daily: List[Dict[str, object]] = []
+            for day in sorted(by_date):
+                bucket = by_date[day]
+                impressions = int(bucket["impressions"])
+                clicks = int(bucket["clicks"])
+                spend = float(bucket["spend"])
+                conversions = float(bucket["conversions"])
                 daily.append(
                     {
-                        "date": str(row.segments.date),
-                        "impressions": int(metrics.impressions or 0),
-                        "clicks": int(metrics.clicks or 0),
-                        "ctr": float(metrics.ctr or 0),
-                        "cpc": float(metrics.average_cpc or 0) / 1_000_000 if metrics.average_cpc else 0,
-                        "cpm": float(metrics.average_cpm or 0) / 1_000_000 if metrics.average_cpm else 0,
-                        "spend": float(metrics.cost_micros or 0) / 1_000_000,
-                        "conversions": float(metrics.conversions or 0),
+                        **bucket,
+                        # Derived rates must be recomputed from the aggregated
+                        # totals. Averaging per-campaign rates produces incorrect
+                        # account-level daily metrics.
+                        "ctr": clicks / impressions if impressions else 0.0,
+                        "cpc": spend / clicks if clicks else 0.0,
+                        "cpm": spend * 1_000 / impressions if impressions else 0.0,
+                        "cpa": spend / conversions if conversions else 0.0,
                     }
                 )
             return daily

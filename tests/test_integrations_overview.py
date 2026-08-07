@@ -1,7 +1,12 @@
+from datetime import datetime
+from uuid import uuid4
+
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.schemas import AdAccountOut, AdAccountSyncJobOut
+from app.services.integrations import build_integrations_overview
 
 
 client = TestClient(app)
@@ -176,3 +181,127 @@ def test_integrations_overview_is_not_available_to_client_role():
     )
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "forbidden"
+
+
+def test_provider_health_requires_fresh_coverage_for_every_active_account(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "configured-for-test")
+    client_id = uuid4()
+    first_id = uuid4()
+    second_id = uuid4()
+    created_at = datetime(2026, 1, 1)
+
+    def account(account_id, external_id):
+        return AdAccountOut(
+            id=account_id,
+            client_id=client_id,
+            platform="meta",
+            external_account_id=external_id,
+            name=external_id,
+            currency="USD",
+            status="active",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+
+    historical_success = AdAccountSyncJobOut(
+        id=uuid4(),
+        ad_account_id=first_id,
+        provider="meta",
+        status="success",
+        started_at=datetime(2026, 6, 1),
+        finished_at=datetime(2026, 6, 1),
+        records_synced=12,
+        request_meta={"date_from": "2026-05-01", "date_to": "2026-06-01"},
+        created_at=datetime(2026, 6, 1),
+    )
+
+    result = build_integrations_overview(
+        accounts=[account(first_id, "one"), account(second_id, "two")],
+        sync_jobs=[historical_success],
+        provider_configs=[],
+        now=datetime(2026, 8, 6),
+    )
+    provider = result.providers[0]
+
+    assert provider.status == "warning"
+    assert provider.active_accounts_count == 2
+    assert provider.accounts_with_data_count == 1
+    assert provider.never_synced_accounts_count == 1
+    assert provider.stale_accounts_count == 2
+    assert provider.coverage_percent == 50.0
+    assert provider.latest_data_date.isoformat() == "2026-05-01"
+    assert result.summary["data_quality"] == "attention_required"
+
+
+def test_empty_success_is_not_treated_as_healthy(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "configured-for-test")
+    now = datetime(2026, 8, 6, 12, 0)
+    account_id = uuid4()
+    account = AdAccountOut(
+        id=account_id,
+        client_id=uuid4(),
+        platform="meta",
+        external_account_id="empty",
+        name="empty",
+        currency="USD",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    empty_success = AdAccountSyncJobOut(
+        id=uuid4(),
+        ad_account_id=account_id,
+        provider="meta",
+        status="success",
+        started_at=now,
+        finished_at=now,
+        records_synced=0,
+        request_meta={"date_from": "2026-08-06", "date_to": "2026-08-06"},
+        created_at=now,
+    )
+
+    provider = build_integrations_overview(
+        accounts=[account],
+        sync_jobs=[empty_success],
+        provider_configs=[],
+        now=now,
+    ).providers[0]
+
+    assert provider.status == "warning"
+    assert provider.rows_present is False
+    assert provider.accounts_with_data_count == 0
+
+
+def test_legacy_duplicate_assignments_are_reported_as_configuration_errors(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "configured-for-test")
+    now = datetime(2026, 8, 6, 12, 0)
+
+    def account(client_id, account_id, external_id):
+        return AdAccountOut(
+            id=account_id,
+            client_id=client_id,
+            platform="meta",
+            external_account_id=external_id,
+            name=external_id,
+            currency="USD",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+
+    result = build_integrations_overview(
+        accounts=[
+            account(uuid4(), uuid4(), "act_998877"),
+            account(uuid4(), uuid4(), "998877"),
+        ],
+        sync_jobs=[],
+        provider_configs=[],
+        now=now,
+    )
+    provider = result.providers[0]
+
+    assert provider.status == "error"
+    assert provider.assignment_conflict_accounts_count == 2
+    assert "ambiguous client ownership" in (provider.status_reason or "")
+    assert result.summary["assignment_conflict_accounts"] == 2
+    assert result.summary["critical_issues"] == 1

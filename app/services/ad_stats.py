@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from datetime import date, datetime, timezone
 
 def _utcnow() -> datetime:
@@ -14,8 +15,8 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 
 from app.db import init_sqlite, sqlite_conn
-from app.schemas import AdStatOut, AdStatsIngestRequest, AdStatWrite
-from app.services.ad_accounts import AdAccountStore
+from app.schemas import AdAccountOut, AdStatOut, AdStatsIngestRequest, AdStatWrite
+from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
 
 
 getcontext().prec = 28
@@ -50,6 +51,133 @@ def _validate_row_account(ad_account_store: AdAccountStore, row: AdStatWrite):
     return account
 
 
+def _stale_after_days() -> int:
+    try:
+        return max(1, int(os.getenv("AD_STATS_STALE_AFTER_DAYS", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _data_quality(
+    *,
+    rows: List[AdStatOut],
+    scope_account_ids: set[UUID],
+    as_of_date: Optional[date],
+) -> Dict[str, object]:
+    effective_as_of = as_of_date or _utcnow().date()
+    relevant_rows = [row for row in rows if row.ad_account_id in scope_account_ids]
+    latest_by_account: Dict[UUID, date] = {}
+    for row in relevant_rows:
+        previous = latest_by_account.get(row.ad_account_id)
+        if previous is None or row.date > previous:
+            latest_by_account[row.ad_account_id] = row.date
+
+    accounts_with_data = set(latest_by_account)
+    # Keep the public field name for backwards compatibility. For an explicit
+    # archived client/account scope this count represents the selected
+    # historical accounts so row_count/coverage stay consistent with totals.
+    active_accounts_count = len(scope_account_ids)
+    accounts_with_data_count = len(accounts_with_data)
+    rows_present = bool(relevant_rows)
+    stale_after_days = _stale_after_days()
+    stale_days_by_account = {
+        account_id: max(0, (effective_as_of - latest_date).days)
+        for account_id, latest_date in latest_by_account.items()
+    }
+    stale_accounts_count = sum(days > stale_after_days for days in stale_days_by_account.values())
+
+    # For a multi-account scope the safe freshness watermark is the oldest
+    # account-level latest date. A fresh account must not hide a stale peer.
+    latest_data_date = min(latest_by_account.values(), default=None)
+    stale_days = max(stale_days_by_account.values(), default=None)
+
+    if not rows_present:
+        status = "insufficient_data"
+    elif active_accounts_count and accounts_with_data_count < active_accounts_count:
+        status = "partial"
+    elif stale_accounts_count:
+        status = "stale"
+    else:
+        status = "fresh"
+
+    coverage_percent = (
+        round((accounts_with_data_count / active_accounts_count) * 100, 2)
+        if active_accounts_count
+        else (100.0 if rows_present else 0.0)
+    )
+    return {
+        "status": status,
+        "rows_present": rows_present,
+        "row_count": len(relevant_rows),
+        "latest_data_date": latest_data_date.isoformat() if latest_data_date else None,
+        "stale_days": stale_days,
+        "stale_after_days": stale_after_days,
+        "stale_accounts_count": stale_accounts_count,
+        "active_accounts_count": active_accounts_count,
+        "accounts_with_data_count": accounts_with_data_count,
+        "accounts_without_data_count": max(0, active_accounts_count - accounts_with_data_count),
+        "coverage_percent": coverage_percent,
+    }
+
+
+def _active_parent_client_ids(ad_account_store: AdAccountStore) -> Optional[set[UUID]]:
+    client_store = getattr(ad_account_store, "client_store", None)
+    if client_store is None:
+        return None
+    return {client.id for client in client_store.list(status="active")}
+
+
+def _is_explicit_historical_scope(
+    ad_account_store: AdAccountStore,
+    *,
+    client_id: Optional[UUID],
+    account_id: Optional[UUID],
+) -> bool:
+    """An explicitly selected archived entity is a historical read.
+
+    A client_id by itself is still an operational/current view while that
+    client is active, so archived child accounts cannot leak into its totals.
+    """
+    client_store = getattr(ad_account_store, "client_store", None)
+    account = ad_account_store.get(account_id) if account_id else None
+    if account is not None and account.status != "active":
+        return True
+
+    effective_client_id = account.client_id if account is not None else client_id
+    if effective_client_id is not None and client_store is not None:
+        parent = client_store.get(effective_client_id)
+        return parent is not None and parent.status != "active"
+    return False
+
+
+def _accounts_for_scope(
+    ad_account_store: AdAccountStore,
+    *,
+    client_id: Optional[UUID],
+    account_id: Optional[UUID],
+    platform: Optional[str],
+) -> List[AdAccountOut]:
+    historical = _is_explicit_historical_scope(
+        ad_account_store,
+        client_id=client_id,
+        account_id=account_id,
+    )
+    accounts = ad_account_store.list(status="all" if historical else "active")
+    if not historical:
+        active_parent_ids = _active_parent_client_ids(ad_account_store)
+        if active_parent_ids is not None:
+            accounts = [account for account in accounts if account.client_id in active_parent_ids]
+    if client_id:
+        accounts = [account for account in accounts if account.client_id == client_id]
+    if account_id:
+        accounts = [account for account in accounts if account.id == account_id]
+    if platform:
+        accounts = [account for account in accounts if account.platform == platform]
+
+    conflict_ids = active_assignment_conflict_ids(ad_account_store)
+    return [account for account in accounts if account.id not in conflict_ids]
+
+
 class AdStatsStore(Protocol):
     def ingest(self, payload: AdStatsIngestRequest, *, idempotency_key: Optional[str] = None) -> Dict[str, object]: ...
     def list(
@@ -70,6 +198,7 @@ class AdStatsStore(Protocol):
         platform: Optional[str] = None,
         date_from: date,
         date_to: date,
+        as_of_date: Optional[date] = None,
     ) -> Dict[str, object]: ...
 
 
@@ -207,6 +336,17 @@ class SqliteAdStatsStore:
         if account_id:
             where.append("s.ad_account_id=?")
             params.append(str(account_id))
+        historical_scope = _is_explicit_historical_scope(
+            self.ad_account_store,
+            client_id=client_id,
+            account_id=account_id,
+        )
+        if not historical_scope:
+            # Operational views (global or an active client/account scope)
+            # exclude archived/inactive mappings and parents. Selecting an
+            # archived client/account explicitly remains a historical read.
+            where.append("a.status='active'")
+            where.append("EXISTS (SELECT 1 FROM clients c WHERE c.id=a.client_id AND c.status='active')")
         if platform:
             where.append("s.platform=?")
             params.append(platform)
@@ -228,7 +368,8 @@ class SqliteAdStatsStore:
                 """,
                 params,
             ).fetchall()
-        return [self._to_stat(r) for r in rows]
+        conflict_ids = active_assignment_conflict_ids(self.ad_account_store)
+        return [self._to_stat(r) for r in rows if UUID(r["ad_account_id"]) not in conflict_ids]
 
     def aggregate(
         self,
@@ -238,6 +379,7 @@ class SqliteAdStatsStore:
         platform: Optional[str] = None,
         date_from: date,
         date_to: date,
+        as_of_date: Optional[date] = None,
     ) -> Dict[str, object]:
         rows = self.list(
             client_id=client_id,
@@ -245,6 +387,12 @@ class SqliteAdStatsStore:
             platform=platform,
             date_from=date_from,
             date_to=date_to,
+        )
+        scope_accounts = _accounts_for_scope(
+            self.ad_account_store,
+            client_id=client_id,
+            account_id=account_id,
+            platform=platform,
         )
 
         total_spend = Decimal("0")
@@ -330,6 +478,11 @@ class SqliteAdStatsStore:
             }
 
         return {
+            "data_quality": _data_quality(
+                rows=rows,
+                scope_account_ids={x.id for x in scope_accounts},
+                as_of_date=as_of_date,
+            ),
             "totals": {
                 "spend": _q(total_spend),
                 "impressions": total_impr,
@@ -424,6 +577,19 @@ class InMemoryAdStatsStore:
         date_to: Optional[date] = None,
     ) -> List[AdStatOut]:
         rows = list(self.items.values())
+        historical_scope = _is_explicit_historical_scope(
+            self.ad_account_store,
+            client_id=client_id,
+            account_id=account_id,
+        )
+        if not historical_scope:
+            active_parent_ids = _active_parent_client_ids(self.ad_account_store)
+            eligible_account_ids = {
+                account.id
+                for account in self.ad_account_store.list(status="active")
+                if active_parent_ids is None or account.client_id in active_parent_ids
+            }
+            rows = [row for row in rows if row.ad_account_id in eligible_account_ids]
         if client_id:
             rows = [x for x in rows if self.ad_account_store.get(x.ad_account_id) and self.ad_account_store.get(x.ad_account_id).client_id == client_id]
         if account_id:
@@ -435,7 +601,8 @@ class InMemoryAdStatsStore:
         if date_to:
             rows = [x for x in rows if x.date <= date_to]
         rows.sort(key=lambda x: (x.date, x.updated_at), reverse=True)
-        return rows
+        conflict_ids = active_assignment_conflict_ids(self.ad_account_store)
+        return [row for row in rows if row.ad_account_id not in conflict_ids]
 
     def aggregate(
         self,
@@ -445,10 +612,17 @@ class InMemoryAdStatsStore:
         platform: Optional[str] = None,
         date_from: date,
         date_to: date,
+        as_of_date: Optional[date] = None,
     ) -> Dict[str, object]:
         # Reuse SQL implementation logic by adapting rows view.
         # Keep behavior consistent with production store.
         rows = self.list(client_id=client_id, account_id=account_id, platform=platform, date_from=date_from, date_to=date_to)
+        scope_accounts = _accounts_for_scope(
+            self.ad_account_store,
+            client_id=client_id,
+            account_id=account_id,
+            platform=platform,
+        )
 
         total_spend = Decimal("0")
         total_impr = 0
@@ -525,6 +699,11 @@ class InMemoryAdStatsStore:
             }
 
         return {
+            "data_quality": _data_quality(
+                rows=rows,
+                scope_account_ids={x.id for x in scope_accounts},
+                as_of_date=as_of_date,
+            ),
             "totals": {
                 "spend": _q(total_spend),
                 "impressions": total_impr,

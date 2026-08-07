@@ -121,7 +121,7 @@ def test_multitenant_contract_agency_and_client_data_isolation():
         json={
             "client_id": c1["id"],
             "platform": "meta",
-            "external_account_id": "shared-ext-001",
+            "external_account_id": "alpha-ext-001",
             "name": "Alpha Meta",
             "currency": "USD",
             "status": "active",
@@ -133,7 +133,7 @@ def test_multitenant_contract_agency_and_client_data_isolation():
         json={
             "client_id": c2["id"],
             "platform": "meta",
-            "external_account_id": "shared-ext-001",
+            "external_account_id": "beta-ext-001",
             "name": "Beta Meta",
             "currency": "USD",
             "status": "active",

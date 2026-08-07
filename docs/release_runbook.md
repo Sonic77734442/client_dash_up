@@ -6,19 +6,24 @@
 
 ## CI quality gate
 CI workflow (`.github/workflows/ci.yml`) enforces:
-1. migration sanity check (`scripts/check_migrations.py`)
-2. sqlite schema init check
-3. backend tests (`pytest -q`)
-4. frontend production build (`npm run build`)
+1. Python and npm dependency vulnerability audits
+2. migration sanity check (`scripts/check_migrations.py`)
+3. sqlite schema init check
+4. backend tests (`pytest -q`)
+5. frontend lint and TypeScript checks
+6. frontend production build (`npm run build`)
 
 ## Pre-release checklist
-1. Apply PostgreSQL migrations in order from `db/migrations/README.md`.
+1. Verify the Render persistent disk is mounted at `/var/data`, `BUDGETS_DB_PATH=/var/data/budgets.db`, and create a timestamped SQLite backup before deploying.
 2. Run backend tests and frontend build locally.
 3. Verify `.env` production security values:
 - `APP_ENV=production`
 - `AUTH_COOKIE_SECURE=true`
-- `AUTH_COOKIE_SAMESITE=lax|strict|none`
-- `ALLOWED_ORIGINS` explicitly set (no wildcard in prod)
+- `AUTH_COOKIE_SAMESITE=lax`
+- `ALLOWED_ORIGINS=https://client-dash-up.vercel.app`
+- `FRONTEND_BASE_URL=https://client-dash-up.vercel.app`
+- `BUDGETS_DB_PATH=/var/data/budgets.db`
+- `METRICS_BEARER_TOKEN=<long random secret>` when `OBSERVABILITY_PUBLIC=false`
 4. Run release gate:
 ```bash
 ./scripts/release_check.sh
@@ -26,12 +31,16 @@ CI workflow (`.github/workflows/ci.yml`) enforces:
 5. Validate runtime endpoints on deployed revision:
 - `GET /healthz`
 - `GET /readyz`
-- `GET /metrics`
+- authenticated `GET /metrics` (admin bearer token or dedicated metrics service token)
 6. Validate monitoring stack:
 - Prometheus target `envidicy_api` is `UP`
 - Grafana datasource `Prometheus` is healthy
 
 ## Deploy flow (compose baseline)
+Before starting compose, write the exact `METRICS_BEARER_TOKEN` value to
+`./storage/metrics_token` with no quotes. The API data volume is mounted at
+`/var/data`, matching `BUDGETS_DB_PATH=/var/data/budgets.db`.
+
 ```bash
 cp .env.prod.example .env.prod
 ./scripts/deploy_prod.sh
@@ -61,34 +70,22 @@ SQLITE_BACKUP_FILE=backups/<backup_file>.db ./scripts/rollback_prod.sh
 ./scripts/release_check.sh
 ```
 
-## Backup (before migration)
+## Backup (before schema change or deploy)
 
-### PostgreSQL
-```bash
-./scripts/backup_postgres.sh
-```
-
-### SQLite (local)
+### SQLite
 ```bash
 ./scripts/backup_sqlite.sh
 ```
 
+On Render, back up `/var/data/budgets.db` to a timestamped file on the same persistent disk and verify that both files exist before deployment. A relative path or an ephemeral filesystem is not production-safe.
+
 ## Rollback strategy
 
-### PostgreSQL
-1. Put app in maintenance mode.
-2. Restore latest successful dump:
-```bash
-./scripts/restore_postgres.sh backups/<dump_file>.dump
-```
-3. Re-deploy last known good backend image/commit.
-4. Run smoke checks: `/health`, `/healthz`, `/readyz`, `/auth/me`, `/insights/overview`, `/agency/overview`.
-
-### SQLite (local)
+### SQLite
 ```bash
 ./scripts/restore_sqlite.sh backups/<backup_file>.db
 ```
-Restart backend process.
+For Render, stop writes, restore the verified `/var/data` backup, and restart the backend process. Then run smoke checks: `/health`, `/healthz`, `/readyz`, `/auth/me`, `/insights/overview`, `/agency/overview`.
 
 ## Operational telemetry baseline
 - Access logs emit one JSON line per request with:

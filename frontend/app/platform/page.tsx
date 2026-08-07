@@ -8,6 +8,7 @@ import { StateMessage } from "../../components/common/StateMessage";
 import { useSession } from "../../hooks/useSession";
 import { fetchJson } from "../../lib/api";
 import { normalizeIntegrationsOverviewPayload } from "../../lib/analyticsPayload";
+import { dataFreshnessMeta, providerDataFreshness } from "../../lib/dataFreshness";
 import {
   hasOptionalStringFields,
   hasStringFields,
@@ -38,6 +39,14 @@ function isClientItem(value: unknown): value is ClientOut {
 
 function isAlertItem(value: unknown): value is AlertOut {
   return hasStringFields(value, ["id", "code", "severity", "title"]);
+}
+
+function providerLabel(value: string) {
+  const provider = String(value || "").toLowerCase();
+  if (provider === "google") return "Google Ads";
+  if (provider === "meta" || provider === "facebook") return "Meta Ads";
+  if (provider === "tiktok") return "TikTok Ads";
+  return value || "Рекламная платформа";
 }
 
 export default function PlatformDecisionCenterPage() {
@@ -137,15 +146,29 @@ export default function PlatformDecisionCenterPage() {
       });
     }
 
+    for (const provider of (integrations?.providers || [])
+      .filter((item) => providerDataFreshness(item) !== "current")
+      .slice(0, 3)) {
+      const meta = dataFreshnessMeta(providerDataFreshness(provider));
+      items.push({
+        key: `provider-${provider.provider}`,
+        level: meta.tone === "bad" ? "critical" : "warning",
+        title: `${providerLabel(provider.provider)}: ${meta.label}`,
+        detail: meta.description,
+        href: "/sync-monitor#sync-diagnostics",
+        action: "Проверить данные",
+      });
+    }
+
     return items.slice(0, 8);
-  }, [alerts, users, agencies]);
+  }, [alerts, users, agencies, integrations]);
 
   const criticalAlerts = alerts.filter((item) => item.severity === "critical").length;
   const inactiveUsers = users.filter((item) => item.status === "inactive").length;
   const suspendedAgencies = agencies.filter((item) => item.status === "suspended").length;
   const connectionProblems =
-    Number(integrations?.summary?.critical_issues || 0) +
-    Number(integrations?.summary?.warning_connections || 0);
+    (integrations?.providers || []).filter((provider) => providerDataFreshness(provider) !== "current").length;
+  const dataProblems = alerts.length + connectionProblems;
 
   return (
     <div className="app-shell">
@@ -176,10 +199,10 @@ export default function PlatformDecisionCenterPage() {
             <div className="kpi-value">{criticalAlerts}</div>
             <div className="kpi-meta">Открытые сейчас</div>
           </article>
-          <article className={`kpi-card ${connectionProblems ? "warn" : "good"}`}>
+          <article className={`kpi-card ${dataProblems ? "warn" : "good"}`}>
             <div className="kpi-title">Проблемы данных</div>
-            <div className="kpi-value">{connectionProblems}</div>
-            <div className="kpi-meta">Подключения и синхронизации</div>
+            <div className="kpi-value">{dataProblems}</div>
+            <div className="kpi-meta">Открытые инциденты: {alerts.length} · платформы без свежих данных: {connectionProblems}</div>
           </article>
           <article className={`kpi-card ${suspendedAgencies ? "warn" : "good"}`}>
             <div className="kpi-title">Агентства</div>
@@ -234,7 +257,7 @@ export default function PlatformDecisionCenterPage() {
                 <div className="activity-title">Подключения</div>
                 <div className="activity-meta">
                   {integrations
-                    ? `${Number(integrations.summary?.healthy_connections || 0)} работают · ${connectionProblems} требуют внимания`
+                    ? `${integrations.summary?.connected_providers || 0} подключено · ${(integrations.providers || []).filter((provider) => providerDataFreshness(provider) === "current").length} с актуальными данными · ${connectionProblems} требуют внимания`
                     : "Загрузка…"}
                 </div>
                 <Link className="ghost-btn activity-action" href="/integrations">Открыть подключения</Link>

@@ -1,4 +1,5 @@
 import { getSessionToken } from "./sessionToken";
+import { agencySelectionRequiredMessage } from "./agencyContext";
 
 export type ApiErrorEnvelope = {
   error?: {
@@ -7,6 +8,20 @@ export type ApiErrorEnvelope = {
     details?: Record<string, unknown>;
   };
 };
+
+export class ApiRequestError extends Error {
+  status: number;
+  code: string;
+  details?: Record<string, unknown>;
+
+  constructor(message: string, status: number, code = "", details?: Record<string, unknown>) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
 
 function normalizeQueryPath(path: string): string {
   const qIndex = path.indexOf("?");
@@ -159,8 +174,11 @@ export async function fetchJson<T>(
 
   if (!res.ok) {
     const envelope = body as ApiErrorEnvelope;
-    const msg = envelope?.error?.message || `Request failed (${res.status})`;
-    throw new Error(msg);
+    const code = String(envelope?.error?.code || "").trim();
+    const msg = code === "selection_required"
+      ? agencySelectionRequiredMessage()
+      : envelope?.error?.message || `Request failed (${res.status})`;
+    throw new ApiRequestError(msg, res.status, code, envelope?.error?.details);
   }
 
   return body as T;

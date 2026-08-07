@@ -4,7 +4,9 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../../components/AppSidebar";
 import { AppTopTabs } from "../../../components/AppTopTabs";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../../hooks/useAgencyContext";
 import { useSession } from "../../../hooks/useSession";
+import { useScopeRequestGuard } from "../../../hooks/useScopeRequestGuard";
 import { fetchJson, getQuery } from "../../../lib/api";
 import { AgencyOverview, Client } from "../../../lib/types";
 
@@ -22,6 +24,8 @@ function money(value: number) {
 export default function AgencyReportsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const { session, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
   const [clients, setClients] = useState<Client[]>([]);
   const [overview, setOverview] = useState<AgencyOverview | null>(null);
   const [periodDays, setPeriodDays] = useState(30);
@@ -33,24 +37,61 @@ export default function AgencyReportsPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
     try {
+      if (agencyContext.role === "agency" && !agencyContext.portfolioReady) {
+        throw new Error(
+          agencyContext.selectionRequired
+            ? agencySelectionRequiredMessage()
+            : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
+        );
+      }
       const range = dateRange(periodDays);
       const [clientRows, overviewRows] = await Promise.all([
         req<{ items: Client[] }>("/clients?status=active"),
         req<AgencyOverview>(`/agency/overview${getQuery({ date_from: range.from, date_to: range.to })}`),
       ]);
-      setClients(clientRows.items || []);
-      setOverview(overviewRows);
+      if (!isCurrentRequest()) return;
+      const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+      const visibleClients = (clientRows.items || []).filter(
+        (client) => !allowedClientIds || allowedClientIds.has(client.id),
+      );
+      const visiblePerClient = (overviewRows.per_client || []).filter(
+        (row) => !allowedClientIds || allowedClientIds.has(row.client_id),
+      );
+      setClients(visibleClients);
+      setOverview({
+        ...overviewRows,
+        totals: { ...overviewRows.totals, spend: visiblePerClient.reduce((sum, row) => sum + Number(row.spend || 0), 0) },
+        per_client: visiblePerClient,
+        per_account: (overviewRows.per_account || []).filter(
+          (row) => !allowedClientIds || allowedClientIds.has(row.client_id),
+        ),
+      });
       setWarning("");
     } catch (error) {
       setWarning(error instanceof Error ? error.message : "Не удалось подготовить отчёты");
     }
-  }, [periodDays, req]);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    periodDays,
+    req,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void loadData();
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
+
+  useEffect(() => {
+    setClients([]);
+    setOverview(null);
+  }, [agencyContext.selectedAgencyId]);
 
   const clientNames = useMemo(() => new Map(clients.map((item) => [item.id, item.name])), [clients]);
   const rows = useMemo(

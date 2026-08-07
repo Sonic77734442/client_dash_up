@@ -89,24 +89,35 @@ class SqliteClientStore:
         data = {**existing.model_dump(), **patch}
         now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
-            conn.execute(
-                """
-                UPDATE clients
-                SET name=?, legal_name=?, status=?, default_currency=?, timezone=?, notes=?, updated_at=?
-                WHERE id=?
-                """,
-                (
-                    data["name"],
-                    data["legal_name"],
-                    data["status"],
-                    data["default_currency"],
-                    data["timezone"],
-                    data["notes"],
-                    now,
-                    str(client_id),
-                ),
-            )
-            conn.commit()
+            try:
+                conn.execute(
+                    """
+                    UPDATE clients
+                    SET name=?, legal_name=?, status=?, default_currency=?, timezone=?, notes=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        data["name"],
+                        data["legal_name"],
+                        data["status"],
+                        data["default_currency"],
+                        data["timezone"],
+                        data["notes"],
+                        now,
+                        str(client_id),
+                    ),
+                )
+                conn.commit()
+            except Exception as exc:
+                if "assignment_conflict" in str(exc).lower():
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "assignment_conflict",
+                            "message": "Client cannot be restored while an advertising account has another active owner",
+                        },
+                    )
+                raise
             row = conn.execute("SELECT * FROM clients WHERE id=?", (str(client_id),)).fetchone()
         return self._to_client(row)
 

@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import threading
 import time
 import os
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -33,6 +35,9 @@ from app.schemas import (
     AdAccountSyncDiagnosticsResponse,
     AdAccountSyncRunRequest,
     AdAccountSyncRunResponse,
+    AssignmentConflictListResponse,
+    AssignmentConflictResolveRequest,
+    AssignmentConflictResolveResponse,
     AdStatOut,
     AdStatsIngestRequest,
     AdStatsIngestResponse,
@@ -42,6 +47,7 @@ from app.schemas import (
     AgencyCreate,
     AgencyInviteAcceptRequest,
     AgencyInviteAcceptResponse,
+    AgencyInviteAcceptPublicResponse,
     AgencyInviteCreate,
     AgencyInviteIssueResponse,
     AgencyInviteOut,
@@ -62,6 +68,7 @@ from app.schemas import (
     BudgetTransferResponse,
     ClientCreate,
     ClientInviteAcceptResponse,
+    ClientInviteAcceptPublicResponse,
     ClientInviteCreate,
     ClientInviteIssueResponse,
     ClientInviteOut,
@@ -99,13 +106,21 @@ from app.schemas import (
     OverviewResponse,
     TikTokInsightsResponse,
 )
-from app.services.ad_accounts import AdAccountStore, InMemoryAdAccountStore, SqliteAdAccountStore
+from app.services.ad_accounts import (
+    AdAccountStore,
+    InMemoryAdAccountStore,
+    SqliteAdAccountStore,
+    active_assignment_conflict_ids,
+    canonical_external_account_id,
+    normalize_account_platform,
+)
 from app.services.ad_account_sync import (
     AdAccountSyncService,
     InMemoryAdAccountSyncJobStore,
     SqliteAdAccountSyncJobStore,
 )
 from app.services.ad_account_discovery import AdAccountDiscoveryService
+from app.services.assignment_conflicts import AssignmentConflictService
 from app.services.ad_stats import AdStatsStore, InMemoryAdStatsStore, SqliteAdStatsStore
 from app.services.auth_arch import (
     ROLE_ACCESS_MODEL,
@@ -166,12 +181,70 @@ LOGIN_AUTO_SYNC_ENABLED = str(os.getenv("LOGIN_AUTO_SYNC_ENABLED", "true")).stri
 LOGIN_AUTO_SYNC_TTL_SECONDS = max(0, int(os.getenv("LOGIN_AUTO_SYNC_TTL_SECONDS", "1800")))
 LOGIN_AUTO_SYNC_LOOKBACK_DAYS = max(1, int(os.getenv("LOGIN_AUTO_SYNC_LOOKBACK_DAYS", "30")))
 
+
+def _sync_cron_enabled() -> bool:
+    return str(os.getenv("SYNC_CRON_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_scheduler_enabled() -> bool:
+    return str(os.getenv("SYNC_SCHEDULER_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_automation_enabled() -> bool:
+    return _sync_scheduler_enabled() or _sync_cron_enabled()
+
+
+async def _sync_scheduler_loop(application: FastAPI) -> None:
+    initial_delay = max(0, int(os.getenv("SYNC_SCHEDULER_INITIAL_DELAY_SECONDS", "10")))
+    interval = max(30, int(os.getenv("SYNC_SCHEDULER_INTERVAL_SECONDS", "300")))
+    batch_size = max(1, min(int(os.getenv("AD_SYNC_DUE_BATCH_SIZE", "10")), 100))
+    stale_after_hours = max(1, int(os.getenv("AD_SYNC_STALE_AFTER_HOURS", "24")))
+    lease_seconds = max(30, int(os.getenv("AD_SYNC_LEASE_SECONDS", "900")))
+    if initial_delay:
+        await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            due = await asyncio.to_thread(
+                _execute_due_sync_batch,
+                batch_size=batch_size,
+                stale_after_hours=stale_after_hours,
+                lease_seconds=lease_seconds,
+            )
+            logger.info(
+                "sync scheduler batch completed: lease=%s selected=%s processed=%s",
+                due.lease_acquired,
+                len(due.selected_account_ids),
+                due.sync_result.processed if due.sync_result else 0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("sync scheduler batch failed")
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def _app_lifespan(application: FastAPI):
+    scheduler_task: Optional[asyncio.Task] = None
+    if _sync_scheduler_enabled():
+        scheduler_task = asyncio.create_task(_sync_scheduler_loop(application), name="ad-account-sync-scheduler")
+    application.state.sync_scheduler_task = scheduler_task
+    try:
+        yield
+    finally:
+        if scheduler_task:
+            scheduler_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler_task
+        application.state.sync_scheduler_task = None
+
 app = FastAPI(
     title="Envidicy Digital Dashboard Backend",
     version="0.3.0",
     docs_url="/docs" if settings.api_docs_enabled else None,
     redoc_url="/redoc" if settings.api_docs_enabled else None,
     openapi_url="/openapi.json" if settings.api_docs_enabled else None,
+    lifespan=_app_lifespan,
 )
 
 app.state.login_auto_sync_state = {}
@@ -204,8 +277,15 @@ def _resolve_provider_credentials(
     provider: str,
     client_id: UUID,
     user_id: Optional[UUID],
+    agency_id: Optional[UUID] = None,
 ) -> Optional[dict]:
     rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    if agency_id is not None:
+        rows = [
+            row
+            for row in rows
+            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+        ]
     if not rows:
         return None
     return dict(rows[0].credentials)
@@ -215,8 +295,15 @@ def _resolve_provider_credentials_candidates(
     provider: str,
     client_id: UUID,
     user_id: Optional[UUID],
+    agency_id: Optional[UUID] = None,
 ) -> List[dict]:
     rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    if agency_id is not None:
+        rows = [
+            row
+            for row in rows
+            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+        ]
     out: List[dict] = []
     for row in rows:
         cred = dict(row.credentials)
@@ -235,12 +322,22 @@ ad_account_sync_service = AdAccountSyncService(
 )
 ad_account_discovery_service = AdAccountDiscoveryService(
     account_store=ad_account_store,
+    client_store=client_store,
     credential_resolver=_resolve_provider_credentials,
     credential_candidates_resolver=_resolve_provider_credentials_candidates,
 )
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
 platform_admin_store: PlatformAdminStore = SqlitePlatformAdminStore(settings.budgets_db_path, auth_store)
+audit_log_store: AuditLogStore = SqliteAuditLogStore(settings.budgets_db_path)
+assignment_conflict_service = AssignmentConflictService(
+    account_store=ad_account_store,
+    client_store=client_store,
+    ad_stats_store=ad_stats_store,
+    budget_store=budget_store,
+    platform_admin_store=platform_admin_store,
+    audit_log_store=audit_log_store,
+)
 oauth_state_store: OAuthStateStore = SqliteOAuthStateStore(settings.budgets_db_path)
 oauth_adapters: dict[str, OAuthProviderAdapter] = {
     "facebook": FacebookOAuthAdapter(),
@@ -257,13 +354,14 @@ app.state.ad_stats_store = ad_stats_store
 app.state.budget_store = budget_store
 app.state.auth_store = auth_store
 app.state.platform_admin_store = platform_admin_store
+app.state.assignment_conflict_service = assignment_conflict_service
 app.state.oauth_state_store = oauth_state_store
 app.state.oauth_adapters = oauth_adapters
 app.state.auth_facade = auth_facade
 app.state.overview_service = OverviewService(ad_stats_store=ad_stats_store, ad_account_store=ad_account_store, budget_store=budget_store)
 app.state.operational_insights_service = OperationalInsightsService(rules=settings.operational_insights_rules)
 app.state.operational_action_store = SqliteOperationalActionStore(settings.budgets_db_path)
-app.state.audit_log_store = SqliteAuditLogStore(settings.budgets_db_path)
+app.state.audit_log_store = audit_log_store
 app.state.alert_store = SqliteAlertStore(settings.budgets_db_path)
 app.state.rate_limiter = InMemoryRateLimiter()
 
@@ -425,9 +523,9 @@ def _ensure_credential_manage_access(ctx: RequestContext, row: IntegrationCreden
         return
     if ctx.role != "agency":
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
-    agency_ids = {str(x) for x in _agency_scope_ids_for_user(ctx.user_id)}
-    if row.scope_type != "agency" or not row.scope_id or str(row.scope_id) not in agency_ids:
+    if row.scope_type != "agency" or not row.scope_id:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential scope access denied"})
+    _resolve_agency_context_for_user(ctx.user_id, row.scope_id, require_manage=True)
 
 
 def _ensure_alert_access(ctx: RequestContext, row: AlertOut) -> None:
@@ -438,9 +536,14 @@ def _ensure_alert_access(ctx: RequestContext, row: AlertOut) -> None:
     raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Alert tenant access denied"})
 
 
-def _ensure_agency_member_access(ctx: RequestContext, agency_id: UUID, *, manage: bool = False) -> None:
+def _ensure_agency_member_access(
+    ctx: RequestContext,
+    agency_id: UUID,
+    *,
+    manage: bool = False,
+) -> Optional[AgencyMemberOut]:
     if ctx.role == "admin":
-        return
+        return None
     if ctx.role != "agency" or not ctx.user_id:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
     try:
@@ -454,6 +557,23 @@ def _ensure_agency_member_access(ctx: RequestContext, agency_id: UUID, *, manage
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency access denied"})
     if manage and me.role not in {"owner", "manager"}:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency management access denied"})
+    return me
+
+
+def _ensure_agency_invite_role_access(
+    ctx: RequestContext,
+    agency_id: UUID,
+    member_role: str,
+) -> None:
+    actor = _ensure_agency_member_access(ctx, agency_id, manage=True)
+    if member_role == "owner" and ctx.role != "admin" and (not actor or actor.role != "owner"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "agency_owner_protected",
+                "message": "Only an agency owner or platform administrator can invite another owner",
+            },
+        )
 
 
 def _status_code_to_error_code(status_code: int) -> str:
@@ -493,7 +613,9 @@ def _sync_action_hint(*, state: str, error_code: Optional[str], retryable: bool)
     if state == "never_synced":
         return "Run initial sync for this account."
     if state == "retry_scheduled":
-        return "Retry is already scheduled automatically. You can force sync if needed."
+        if _sync_automation_enabled():
+            return "The retry is eligible for the configured sync scheduler. You can force sync if needed."
+        return "The retry is eligible at the shown time. Run it manually or enable the sync scheduler."
     if error_code == "auth_failed":
         return "Reconnect provider credentials or fix account permissions."
     if error_code == "invalid_request":
@@ -662,8 +784,19 @@ def use_inmemory_stores():
     c = InMemoryClientStore()
     a = InMemoryAdAccountStore(c)
     integration_creds = InMemoryIntegrationCredentialStore()
-    def _resolve_provider_credentials_inmemory(provider: str, client_id: UUID, user_id: Optional[UUID]) -> Optional[dict]:
+    def _resolve_provider_credentials_inmemory(
+        provider: str,
+        client_id: UUID,
+        user_id: Optional[UUID],
+        agency_id: Optional[UUID] = None,
+    ) -> Optional[dict]:
         rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        if agency_id is not None:
+            rows = [
+                row
+                for row in rows
+                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            ]
         if not rows:
             return None
         return dict(rows[0].credentials)
@@ -671,8 +804,15 @@ def use_inmemory_stores():
         provider: str,
         client_id: UUID,
         user_id: Optional[UUID],
+        agency_id: Optional[UUID] = None,
     ) -> List[dict]:
         rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        if agency_id is not None:
+            rows = [
+                row
+                for row in rows
+                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            ]
         out: List[dict] = []
         for row in rows:
             cred = dict(row.credentials)
@@ -691,12 +831,43 @@ def use_inmemory_stores():
     )
     discovery_service = AdAccountDiscoveryService(
         account_store=a,
+        client_store=c,
         credential_resolver=_resolve_provider_credentials_inmemory,
         credential_candidates_resolver=_resolve_provider_credentials_candidates_inmemory,
     )
     b = InMemoryBudgetStore()
     auth = InMemoryAuthStore()
     platform_admin = InMemoryPlatformAdminStore(auth)
+    audit_log = InMemoryAuditLogStore()
+
+    def _agency_credential_access(
+        agency_id: UUID,
+        client_id: UUID,
+        user_id: Optional[UUID],
+    ) -> bool:
+        agency = platform_admin.agencies.get(agency_id)
+        if not agency or agency.status != "active":
+            return False
+        has_client = any(
+            binding.agency_id == agency_id and binding.client_id == client_id
+            for binding in platform_admin.clients.values()
+        )
+        if not has_client:
+            return False
+        if user_id is None:
+            return True
+        member = next(
+            (
+                row
+                for row in platform_admin.members.values()
+                if row.agency_id == agency_id and row.user_id == user_id and row.status == "active"
+            ),
+            None,
+        )
+        user = auth.get_user(user_id)
+        return member is not None and user is not None and user.status == "active"
+
+    integration_creds.agency_access_resolver = _agency_credential_access
     oauth_states = InMemoryOAuthStateStore()
     app.state.client_store = c
     app.state.ad_account_store = a
@@ -707,13 +878,21 @@ def use_inmemory_stores():
     app.state.budget_store = b
     app.state.auth_store = auth
     app.state.platform_admin_store = platform_admin
+    app.state.assignment_conflict_service = AssignmentConflictService(
+        account_store=a,
+        client_store=c,
+        ad_stats_store=s,
+        budget_store=b,
+        platform_admin_store=platform_admin,
+        audit_log_store=audit_log,
+    )
     app.state.oauth_state_store = oauth_states
     app.state.oauth_adapters = {"facebook": FacebookOAuthAdapter(), "google": GoogleOAuthAdapter()}
     app.state.auth_facade = AuthFacadeService(auth_store=auth)
     app.state.overview_service = OverviewService(ad_stats_store=s, ad_account_store=a, budget_store=b)
     app.state.operational_insights_service = OperationalInsightsService(rules=settings.operational_insights_rules)
     app.state.operational_action_store = InMemoryOperationalActionStore()
-    app.state.audit_log_store = InMemoryAuditLogStore()
+    app.state.audit_log_store = audit_log
     app.state.alert_store = InMemoryAlertStore()
     app.state.rate_limiter = InMemoryRateLimiter()
     app.state.runtime_metrics = RuntimeMetrics()
@@ -756,6 +935,10 @@ def _platform_admin_store() -> PlatformAdminStore:
     return app.state.platform_admin_store
 
 
+def _assignment_conflict_service() -> AssignmentConflictService:
+    return app.state.assignment_conflict_service
+
+
 def _oauth_state_store() -> OAuthStateStore:
     return app.state.oauth_state_store
 
@@ -766,6 +949,10 @@ def _oauth_adapters() -> dict[str, OAuthProviderAdapter]:
 
 def _overview_service() -> OverviewService:
     return app.state.overview_service
+
+
+def _active_client_ids() -> set[UUID]:
+    return {client.id for client in _client_store().list(status="active")}
 
 
 def _auth_facade() -> AuthFacadeService:
@@ -811,7 +998,7 @@ def _run_login_auto_sync(user_id: UUID, client_ids: List[UUID], state_key: str) 
 
         sync_to = date.today()
         sync_from = sync_to - timedelta(days=LOGIN_AUTO_SYNC_LOOKBACK_DAYS - 1)
-        result = _ad_account_sync_service().run_sync(
+        result = _ad_account_sync_service().run_sync_exclusive(
             account_ids=[account.id for account in accounts],
             date_from=sync_from,
             date_to=sync_to,
@@ -846,7 +1033,7 @@ def _run_login_auto_sync(user_id: UUID, client_ids: List[UUID], state_key: str) 
 
 
 def _schedule_login_auto_sync(background_tasks: Optional[BackgroundTasks], session: SessionContextResponse) -> None:
-    if not LOGIN_AUTO_SYNC_ENABLED or background_tasks is None:
+    if not LOGIN_AUTO_SYNC_ENABLED or _sync_automation_enabled() or background_tasks is None:
         return
     if not session.valid or session.role != "agency" or not session.user_id or not session.accessible_client_ids:
         return
@@ -1055,7 +1242,7 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
         redirect_uri = auth_env["redirect_uri"]
         config_id = None
     else:
-        if not cfg and provider != "facebook":
+        if not cfg and provider not in {"facebook", "google"}:
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -1076,10 +1263,23 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
                         "message": "Meta Ads OAuth credentials are not configured",
                     },
                 )
+        elif provider == "google":
+            client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip() or (cfg.client_id if cfg else "")
+            client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip() or (cfg.client_secret if cfg else "")
+            redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "").strip() or (cfg.redirect_uri if cfg else "")
+            config_id = None
+            if not client_id or not client_secret or not redirect_uri:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "provider_not_configured",
+                        "message": "Google OAuth credentials are not configured",
+                    },
+                )
         else:
             client_id = cfg.client_id
             client_secret = cfg.client_secret
-            redirect_env_name = {"google": "GOOGLE_REDIRECT_URI"}.get(provider)
+            redirect_env_name = None
             redirect_uri = (os.getenv(redirect_env_name, "").strip() if redirect_env_name else "") or cfg.redirect_uri
             config_id = None
     parsed_redirect = urlsplit(redirect_uri)
@@ -1102,20 +1302,99 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
     )
 
 
-def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
-    out: List[UUID] = []
+def _active_agency_memberships_for_user(user_id: UUID) -> List[tuple[UUID, AgencyMemberOut]]:
+    out: List[tuple[UUID, AgencyMemberOut]] = []
     try:
         agencies = _platform_admin_store().list_agencies(status="active")
-    except Exception:
+    except Exception as exc:
         return out
     for agency in agencies:
         try:
             members = _platform_admin_store().list_members(agency.id)
         except Exception:
             continue
-        if any(m.user_id == user_id and m.status == "active" for m in members):
-            out.append(agency.id)
+        member = next((m for m in members if m.user_id == user_id and m.status == "active"), None)
+        if member:
+            out.append((agency.id, member))
     return out
+
+
+def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
+    return [agency_id for agency_id, _member in _active_agency_memberships_for_user(user_id)]
+
+
+def _resolve_agency_context_for_user(
+    user_id: UUID,
+    requested_agency_id: Optional[UUID],
+    *,
+    require_manage: bool = True,
+) -> UUID:
+    """Resolve one active agency without ever fanning an action out to every membership."""
+    memberships = _active_agency_memberships_for_user(user_id)
+    if requested_agency_id is not None:
+        selected = next((row for row in memberships if row[0] == requested_agency_id), None)
+        if selected is None:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "agency_access_denied",
+                    "message": "The selected agency is not an active membership for this user",
+                    "details": {"agency_id": str(requested_agency_id)},
+                },
+            )
+    elif len(memberships) == 1:
+        selected = memberships[0]
+    elif len(memberships) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "selection_required",
+                "message": "Select an agency before continuing",
+                "details": {
+                    "selection": "agency_id",
+                    "agency_ids": [str(agency_id) for agency_id, _member in memberships],
+                },
+            },
+        )
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "agency_unbound",
+                "message": "Agency user has no active agency membership",
+            },
+        )
+
+    agency_id, member = selected
+    if require_manage and member.role not in {"owner", "manager"}:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "agency_manage_forbidden",
+                "message": "Owner or manager access is required for this agency action",
+                "details": {"agency_id": str(agency_id)},
+            },
+        )
+    return agency_id
+
+
+def _ensure_client_bound_to_agency(agency_id: UUID, client_id: UUID) -> None:
+    try:
+        bindings = _platform_admin_store().list_clients(agency_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    if any(binding.client_id == client_id for binding in bindings):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "agency_client_access_denied",
+            "message": "The selected client is not assigned to this agency",
+            "details": {"agency_id": str(agency_id), "client_id": str(client_id)},
+        },
+    )
 
 
 def _ensure_client_invites_allowed_for_agency(ctx: RequestContext, client_id: UUID) -> None:
@@ -1182,6 +1461,7 @@ def _auto_upsert_integration_credentials(
     provider_user_id: Optional[str],
     connect_mode: str = "add",
     requested_connection_key: Optional[str] = None,
+    agency_id: Optional[UUID],
     oauth_tokens: Optional[dict],
     cfg: OAuthProviderConfig,
 ) -> None:
@@ -1205,21 +1485,22 @@ def _auto_upsert_integration_credentials(
         return "default"
 
     if user.role == "agency":
-        agency_ids = _agency_scope_ids_for_user(user.id)
-        if not agency_ids:
-            return
+        selected_agency_id = _resolve_agency_context_for_user(
+            user.id,
+            agency_id,
+            require_manage=True,
+        )
         connection_key = _connection_key_for_credentials()
-        for agency_id in agency_ids:
-            _integration_credential_store().upsert(
-                IntegrationCredentialCreate(
-                    provider=provider_norm,
-                    scope_type="agency",
-                    scope_id=agency_id,
-                    connection_key=connection_key,
-                    credentials=credentials,
-                    created_by=user.id,
-                )
+        _integration_credential_store().upsert(
+            IntegrationCredentialCreate(
+                provider=provider_norm,
+                scope_type="agency",
+                scope_id=selected_agency_id,
+                connection_key=connection_key,
+                credentials=credentials,
+                created_by=user.id,
             )
+        )
         return
     if user.role == "admin":
         connection_key = _connection_key_for_credentials()
@@ -1278,9 +1559,14 @@ def _issue_client_invite(
         raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email is required"})
 
     with sqlite_conn(settings.budgets_db_path) as conn:
-        row_client = conn.execute("SELECT id FROM clients WHERE id=?", (str(client_id),)).fetchone()
+        row_client = conn.execute("SELECT id, status FROM clients WHERE id=?", (str(client_id),)).fetchone()
         if not row_client:
             raise HTTPException(status_code=404, detail="Client not found")
+        if row_client["status"] != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "client_not_active", "message": "Invites can only be issued for an active client"},
+            )
         conn.execute(
             """
             UPDATE client_invites
@@ -1349,16 +1635,37 @@ def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOu
             raise HTTPException(status_code=404, detail="Client invite not found")
         if row["status"] in {"accepted", "expired", "revoked"}:
             return _to_client_invite_out(row)
-        conn.execute(
-            "UPDATE client_invites SET status='revoked', updated_at=? WHERE id=?",
+        cursor = conn.execute(
+            "UPDATE client_invites SET status='revoked', updated_at=? WHERE id=? AND status='pending'",
             (now_iso, str(invite_id)),
         )
         conn.commit()
         updated = conn.execute("SELECT * FROM client_invites WHERE id=?", (str(invite_id),)).fetchone()
+        if cursor.rowcount != 1 and updated["status"] != "revoked":
+            raise HTTPException(status_code=409, detail="Client invite changed while it was being revoked")
     return _to_client_invite_out(updated)
 
 
-def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcceptResponse:
+def _revoke_pending_client_invites(*, client_id: UUID) -> int:
+    now_iso = _utcnow().isoformat()
+    with sqlite_conn(settings.budgets_db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE client_invites
+            SET status='revoked', updated_at=?
+            WHERE client_id=? AND status='pending'
+            """,
+            (now_iso, str(client_id)),
+        )
+        conn.commit()
+    return max(0, int(cursor.rowcount or 0))
+
+
+def _accept_client_invite(
+    payload: AgencyInviteAcceptRequest,
+    *,
+    accepting_user_id: Optional[UUID] = None,
+) -> ClientInviteAcceptResponse:
     now = _utcnow()
     token_hash = _invite_token_hash(payload.token.strip())
     with sqlite_conn(settings.budgets_db_path) as conn:
@@ -1381,16 +1688,47 @@ def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcc
         client_row = conn.execute("SELECT * FROM clients WHERE id=?", (row["client_id"],)).fetchone()
         if not client_row:
             raise HTTPException(status_code=404, detail={"code": "client_not_found", "message": "Client not found"})
+        if client_row["status"] != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "client_not_active",
+                    "message": "This client workspace is not active; ask an administrator to restore it first",
+                },
+            )
 
     email = str(row["email"]).strip().lower()
     existing_user = _auth_store().find_user_by_email(email)
+    created_user = False
     if existing_user:
         user = existing_user
+        if user.role != "client":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "user_role_conflict", "message": "Existing user role cannot accept client invite"},
+            )
         if user.status != "active":
-            user = _auth_store().patch_user(user.id, UserPatch(status="active"))
-        if payload.name and payload.name.strip():
-            user = _auth_store().patch_user(user.id, UserPatch(name=payload.name.strip()))
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "existing_user_inactive", "message": "Existing user must be active to accept invite"},
+            )
+        if accepting_user_id != user.id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "existing_user_auth_required",
+                    "message": "Sign in as the invited user before accepting this invite",
+                },
+            )
     else:
+        if accepting_user_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "invite_identity_mismatch",
+                    "message": "Sign out before accepting an invite for a new user",
+                },
+            )
         user = _auth_store().create_user(
             UserCreate(
                 email=email,
@@ -1399,33 +1737,102 @@ def _accept_client_invite(payload: AgencyInviteAcceptRequest) -> ClientInviteAcc
                 status="active",
             )
         )
+        created_user = True
+        password = (payload.password or "").strip()
+        if len(password) < 8:
+            password = f"{secrets.token_urlsafe(18)}Aa1"
+        _auth_store().set_password(user.id, password)
 
-    _auth_store().assign_client_access(
-        UserClientAccessCreate(
-            user_id=user.id,
-            client_id=UUID(row["client_id"]),
-            role="client",
-        )
+    target_client_id = UUID(row["client_id"])
+    had_client_access = any(
+        access.client_id == target_client_id
+        for access in _auth_store().list_client_access(user_id=user.id)
     )
-    password = (payload.password or "").strip()
-    if len(password) < 8:
-        password = f"{secrets.token_urlsafe(18)}Aa1"
-    _auth_store().set_password(user.id, password)
-    session = _auth_store().issue_session(SessionIssueRequest(user_id=user.id, ttl_minutes=settings.oauth_session_ttl_minutes))
 
+    # Atomically claim the still-pending invite before granting any access or
+    # issuing a session. A concurrent revoke/archive therefore wins cleanly
+    # instead of being overwritten after provisioning.
+    claim_error: Optional[HTTPException] = None
+    updated = None
     with sqlite_conn(settings.budgets_db_path) as conn:
-        conn.execute(
-            """
-            UPDATE client_invites
-            SET status='accepted', accepted_user_id=?, accepted_at=?, updated_at=?
-            WHERE id=?
-            """,
-            (str(user.id), now.isoformat(), now.isoformat(), row["id"]),
+        conn.execute("BEGIN IMMEDIATE")
+        locked = conn.execute("SELECT * FROM client_invites WHERE id=?", (row["id"],)).fetchone()
+        if not locked or locked["status"] != "pending":
+            current_status = locked["status"] if locked else "missing"
+            claim_error = HTTPException(
+                status_code=409,
+                detail={"code": "invite_not_pending", "message": f"Invite is no longer pending ({current_status})"},
+            )
+        locked_client = (
+            conn.execute("SELECT status FROM clients WHERE id=?", (locked["client_id"],)).fetchone()
+            if locked
+            else None
         )
-        conn.commit()
-        updated = conn.execute("SELECT * FROM client_invites WHERE id=?", (row["id"],)).fetchone()
+        if claim_error is None and (not locked_client or locked_client["status"] != "active"):
+            claim_error = HTTPException(
+                status_code=409,
+                detail={"code": "client_not_active", "message": "This client workspace is not active"},
+            )
+        if claim_error is None:
+            accepted = conn.execute(
+                """
+                UPDATE client_invites
+                SET status='accepted', accepted_user_id=?, accepted_at=?, updated_at=?
+                WHERE id=? AND status='pending'
+                """,
+                (str(user.id), now.isoformat(), now.isoformat(), row["id"]),
+            )
+            if accepted.rowcount != 1:
+                claim_error = HTTPException(
+                    status_code=409,
+                    detail={"code": "invite_not_pending", "message": "Invite is no longer pending"},
+                )
+        if claim_error is None:
+            conn.commit()
+            updated = conn.execute("SELECT * FROM client_invites WHERE id=?", (row["id"],)).fetchone()
+        else:
+            conn.rollback()
 
-    client = _client_store().get(UUID(row["client_id"]))
+    if claim_error is not None:
+        if created_user:
+            _auth_store().delete_user(user.id)
+        raise claim_error
+
+    try:
+        _auth_store().assign_client_access(
+            UserClientAccessCreate(
+                user_id=user.id,
+                client_id=target_client_id,
+                role="client",
+            )
+        )
+        session = _auth_store().issue_session(
+            SessionIssueRequest(user_id=user.id, ttl_minutes=settings.oauth_session_ttl_minutes)
+        )
+    except Exception as exc:
+        if not had_client_access:
+            _auth_store().remove_client_access(user.id, target_client_id)
+        with sqlite_conn(settings.budgets_db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE client_invites
+                SET status='pending', accepted_user_id=NULL, accepted_at=NULL, updated_at=?
+                WHERE id=? AND status='accepted' AND accepted_user_id=? AND accepted_at=?
+                """,
+                (now.isoformat(), row["id"], str(user.id), now.isoformat()),
+            )
+            conn.commit()
+        if created_user:
+            _auth_store().delete_user(user.id)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "invite_provisioning_failed", "message": "Invite access provisioning failed; retry safely"},
+        ) from exc
+
+    client = _client_store().get(target_client_id)
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     return ClientInviteAcceptResponse(
@@ -1451,12 +1858,13 @@ def _with_oauth_connect_options(
     intent: str,
     connect_mode: str,
     connection_key: Optional[str],
+    agency_id: Optional[UUID],
 ) -> str:
     parsed = urlsplit(_normalize_next_path(next_path))
     query_items = [
         (k, v)
         for (k, v) in parse_qsl(parsed.query, keep_blank_values=True)
-        if k not in {"ops_oauth_intent", "ops_connect_mode", "ops_connection_key"}
+        if k not in {"ops_oauth_intent", "ops_connect_mode", "ops_connection_key", "ops_agency_id"}
     ]
     normalized_intent = (intent or "login").strip().lower()
     if normalized_intent not in {"login", "connect"}:
@@ -1469,14 +1877,19 @@ def _with_oauth_connect_options(
     key = str(connection_key or "").strip()
     if mode == "overwrite" and key:
         query_items.append(("ops_connection_key", key))
+    if normalized_intent == "connect" and agency_id is not None:
+        query_items.append(("ops_agency_id", str(agency_id)))
     return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
 
 
-def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, str, Optional[str]]:
+def _extract_oauth_connect_options(
+    next_path: str,
+) -> tuple[str, str, str, Optional[str], Optional[UUID]]:
     parsed = urlsplit(_normalize_next_path(next_path))
     intent = "login"
     mode = "add"
     key: Optional[str] = None
+    agency_id: Optional[UUID] = None
     clean_items: List[tuple[str, str]] = []
     for k, v in parse_qsl(parsed.query, keep_blank_values=True):
         if k == "ops_oauth_intent":
@@ -1494,11 +1907,19 @@ def _extract_oauth_connect_options(next_path: str) -> tuple[str, str, str, Optio
             if candidate:
                 key = candidate
             continue
+        if k == "ops_agency_id":
+            candidate = str(v or "").strip()
+            if candidate:
+                try:
+                    agency_id = UUID(candidate)
+                except ValueError:
+                    agency_id = None
+            continue
         clean_items.append((k, v))
     if mode == "overwrite" and not key:
         mode = "add"
     clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
-    return clean_next, intent, mode, key
+    return clean_next, intent, mode, key, agency_id
 
 
 def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
@@ -1510,6 +1931,7 @@ def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
             "access_denied",
             "user_denied",
             "session_required",
+            "session_mismatch",
             "access_not_granted",
             "access_pending",
             "account_link_required",
@@ -1665,6 +2087,19 @@ def _get_session_token(
     raise HTTPException(status_code=401, detail={"code": "unauthorized", "message": "Missing session token"})
 
 
+def _restrict_archived_client_scope(session: SessionContextResponse) -> SessionContextResponse:
+    # Agencies keep archived-client scope so they can restore workspaces. A
+    # client user must lose live tenant access as soon as that workspace is
+    # archived or suspended.
+    if session.role != "client" or session.global_access:
+        return session
+    active_client_ids = {client.id for client in _client_store().list(status="active")}
+    accessible = [client_id for client_id in session.accessible_client_ids if client_id in active_client_ids]
+    if accessible == list(session.accessible_client_ids):
+        return session
+    return session.model_copy(update={"accessible_client_ids": accessible})
+
+
 def auth_context(
     request: Request,
     authorization: Optional[str] = Header(default=None),
@@ -1676,7 +2111,7 @@ def auth_context(
         request.cookies.get(settings.auth_cookie_name),
         required=True,
     )
-    session = _auth_facade().get_session_context(token)
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
     if not session.valid or not session.user_id or not session.role:
         raise HTTPException(
             status_code=401,
@@ -1707,7 +2142,7 @@ def optional_auth_context(
     )
     if not token:
         return None
-    session = _auth_facade().get_session_context(token)
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
     if not session.valid or not session.user_id or not session.role:
         if _internal_admin_required():
             raise HTTPException(
@@ -1719,6 +2154,41 @@ def optional_auth_context(
                 },
             )
         # Local/dev behavior: ignore stale/invalid token for optional admin plumbing.
+        return None
+    return RequestContext(
+        user_id=session.user_id,
+        role=session.role,
+        global_access=bool(session.global_access),
+        accessible_client_ids=set(session.accessible_client_ids),
+    )
+
+
+def invite_optional_auth_context(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+) -> Optional[RequestContext]:
+    """Use a valid session for identity matching, but ignore stale login state.
+
+    Invite tokens may create a new user without authentication. Existing users
+    are still protected because invite acceptance requires this resolver to
+    return the exact invited user's active session.
+    """
+    try:
+        token = _get_session_token(
+            authorization,
+            x_session_token,
+            request.cookies.get(settings.auth_cookie_name),
+            required=False,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return None
+        raise
+    if not token:
+        return None
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
+    if not session.valid or not session.user_id or not session.role:
         return None
     return RequestContext(
         user_id=session.user_id,
@@ -1754,7 +2224,7 @@ def session_token(
 
 
 def current_session_context(token: str = Depends(session_token)) -> SessionContextResponse:
-    session = _auth_facade().get_session_context(token)
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
     if not session.valid:
         raise HTTPException(
             status_code=401,
@@ -1788,6 +2258,15 @@ def _ensure_client_currency(client_id: UUID, currency: str, *, resource: str) ->
             status_code=400,
             detail={"code": "invalid_client", "message": "client_id does not exist"},
         )
+    if client.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "client_not_active",
+                "message": f"{resource} can only be created or activated for an active client",
+                "details": {"client_id": str(client.id), "client_status": client.status},
+            },
+        )
     expected = client.default_currency.strip().upper()
     actual = currency.strip().upper()
     if actual != expected:
@@ -1806,27 +2285,103 @@ def _ensure_client_currency(client_id: UUID, currency: str, *, resource: str) ->
     return client
 
 
-def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optional[UUID]) -> UUID:
+def _ensure_client_restore_assignments_available(client_id: UUID) -> None:
+    own_accounts = _ad_account_store().list(client_id=client_id, status="active")
+    if not own_accounts:
+        return
+    active_clients = _active_client_ids()
+    other_accounts = [
+        account
+        for account in _ad_account_store().list(status="active")
+        if account.client_id != client_id and account.client_id in active_clients
+    ]
+    for own in own_accounts:
+        identity = (
+            normalize_account_platform(own.platform),
+            canonical_external_account_id(own.platform, own.external_account_id),
+        )
+        conflict = next(
+            (
+                account
+                for account in other_accounts
+                if (
+                    normalize_account_platform(account.platform),
+                    canonical_external_account_id(account.platform, account.external_account_id),
+                )
+                == identity
+            ),
+            None,
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "assignment_conflict",
+                    "message": "Client cannot be restored while one of its advertising accounts is assigned to another active client",
+                    "details": {
+                        "account_id": str(own.id),
+                        "platform": identity[0],
+                        "external_account_id": identity[1],
+                    },
+                },
+            )
+
+
+def _resolve_discovery_client_id(
+    ctx: RequestContext,
+    requested_client_id: Optional[UUID],
+    requested_agency_id: Optional[UUID] = None,
+) -> UUID:
+    selected_agency_id: Optional[UUID] = None
+    if ctx.role == "agency":
+        if not ctx.user_id:
+            raise HTTPException(status_code=401, detail="Session user not found")
+        selected_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            requested_agency_id,
+            require_manage=True,
+        )
     if requested_client_id:
         ensure_client_access(ctx, requested_client_id)
+        if selected_agency_id is not None:
+            _ensure_client_bound_to_agency(selected_agency_id, requested_client_id)
         return requested_client_id
-    if ctx.global_access:
+
+    if selected_agency_id is not None:
+        bindings = _platform_admin_store().list_clients(selected_agency_id)
+        bound_client_ids = {binding.client_id for binding in bindings}
+        candidates = [
+            client.id
+            for client in _client_store().list(status="active")
+            if client.id in bound_client_ids
+        ]
+    elif ctx.global_access:
         candidates = [c.id for c in _client_store().list(status="active")]
     else:
-        candidates = [cid for cid in ctx.accessible_client_ids if _client_store().get(cid) is not None]
+        candidates = [
+            cid
+            for cid in ctx.accessible_client_ids
+            if (client := _client_store().get(cid)) is not None and client.status == "active"
+        ]
     if len(candidates) == 1:
         return candidates[0]
-    inbox_scope = "global" if ctx.global_access else (
-        "agency:" + ",".join(sorted(str(x) for x in _agency_scope_ids_for_user(ctx.user_id)))
-        if ctx.role == "agency" and ctx.user_id
-        else "tenant"
+    inbox_scope = (
+        f"agency:{selected_agency_id}"
+        if selected_agency_id is not None
+        else "global" if ctx.global_access else "tenant"
     )
     inbox_marker = f"system:discovery_inbox:{inbox_scope}"
     for row in _client_store().list(status="all"):
         if (row.notes or "").strip() != inbox_marker:
             continue
         if row.status != "active":
+            _ensure_client_restore_assignments_available(row.id)
             row = _client_store().patch(row.id, ClientPatch(status="active"))
+        if selected_agency_id is not None:
+            _platform_admin_store().assign_client(
+                selected_agency_id,
+                AgencyClientAccessCreate(client_id=row.id),
+            )
         return row.id
 
     created = _client_store().create(
@@ -1837,20 +2392,22 @@ def _resolve_discovery_client_id(ctx: RequestContext, requested_client_id: Optio
             notes=inbox_marker,
         )
     )
-    if ctx.role == "agency" and ctx.user_id:
-        for agency_id in _agency_scope_ids_for_user(ctx.user_id):
-            try:
-                _platform_admin_store().assign_client(agency_id, AgencyClientAccessCreate(client_id=created.id))
-            except Exception:
-                # Best effort binding for agency scoped discovery. Discovery still proceeds for created inbox.
-                continue
+    if selected_agency_id is not None:
+        _platform_admin_store().assign_client(
+            selected_agency_id,
+            AgencyClientAccessCreate(client_id=created.id),
+        )
     return created.id
 
 
 def _infer_single_tenant_client(ctx: RequestContext) -> Optional[UUID]:
     if ctx.global_access:
         return None
-    candidates = [cid for cid in ctx.accessible_client_ids if _client_store().get(cid) is not None]
+    candidates = [
+        cid
+        for cid in ctx.accessible_client_ids
+        if (client := _client_store().get(cid)) is not None and client.status == "active"
+    ]
     if len(candidates) == 1:
         return candidates[0]
     return None
@@ -1916,9 +2473,26 @@ def readyz(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> di
 
 
 @app.get("/metrics")
-def metrics(ctx: Optional[RequestContext] = Depends(optional_auth_context)):
+def metrics(request: Request):
     if not settings.observability_public:
-        if not ctx or ctx.role != "admin":
+        authorization = str(request.headers.get("Authorization") or "")
+        scheme, _, supplied = authorization.partition(" ")
+        service_token_ok = bool(
+            settings.metrics_bearer_token
+            and scheme.lower() == "bearer"
+            and secrets.compare_digest(supplied.strip(), settings.metrics_bearer_token)
+        )
+        admin_ok = False
+        if not service_token_ok:
+            token = _get_session_token(
+                authorization,
+                request.headers.get("X-Session-Token"),
+                request.cookies.get(settings.auth_cookie_name),
+                required=False,
+            )
+            session = _auth_facade().get_session_context(token) if token else None
+            admin_ok = bool(session and session.valid and session.role == "admin")
+        if not service_token_ok and not admin_ok:
             raise HTTPException(status_code=404, detail="Not found")
     snap = _runtime_metrics().snapshot()
     lines: list[str] = []
@@ -2309,11 +2883,14 @@ def auth_oauth_start(
     intent: str = Query(default="login", pattern="^(login|connect)$"),
     connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
     connection_key: Optional[str] = Query(default=None),
+    agency_id: Optional[UUID] = Query(default=None),
 ):
     adapters = _oauth_adapters()
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
+    selected_agency_id: Optional[UUID] = None
+    initiator_user_id: Optional[UUID] = None
     if intent == "connect":
         current_token = _get_session_token(
             request.headers.get("Authorization"),
@@ -2332,12 +2909,28 @@ def auth_oauth_start(
                 status_code=403,
                 detail={"code": "provider_connect_forbidden", "message": "This role cannot connect advertising accounts"},
             )
+        if current_ctx.role == "agency":
+            selected_agency_id = _resolve_agency_context_for_user(
+                current_ctx.user_id,
+                agency_id,
+                require_manage=True,
+            )
+        elif agency_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "agency_context_not_applicable",
+                    "message": "Admin OAuth connections use global scope and do not accept agency_id",
+                },
+            )
+        initiator_user_id = current_ctx.user_id
     cfg = _oauth_provider_config_or_400(provider, intent=intent)
     normalized_next = _with_oauth_connect_options(
         _normalize_next_path(next_path),
         intent=intent,
         connect_mode=connect_mode,
         connection_key=connection_key,
+        agency_id=selected_agency_id,
     )
     nonce = secrets.token_urlsafe(24)
     state = _oauth_state_store().create_state(
@@ -2345,6 +2938,7 @@ def auth_oauth_start(
         next_path=normalized_next,
         nonce=nonce,
         ttl_minutes=settings.oauth_state_ttl_minutes,
+        initiator_user_id=initiator_user_id,
     )
     url = adapter.build_authorize_url(cfg, state.state)
     response = RedirectResponse(url=url, status_code=302)
@@ -2390,9 +2984,30 @@ def auth_oauth_callback(
         consumed = _oauth_state_store().consume_state(provider=provider, state=state, nonce=nonce)
     except HTTPException:
         return _oauth_error_redirect("provider_error")
-    redirect_next, oauth_intent, connect_mode, requested_connection_key = _extract_oauth_connect_options(
-        consumed.next_path or "/"
-    )
+    (
+        redirect_next,
+        oauth_intent,
+        connect_mode,
+        requested_connection_key,
+        requested_agency_id,
+    ) = _extract_oauth_connect_options(consumed.next_path or "/")
+    current_ctx = None
+    if oauth_intent == "connect":
+        current_token = _get_session_token(
+            request.headers.get("Authorization"),
+            request.headers.get("X-Session-Token"),
+            request.cookies.get(settings.auth_cookie_name),
+            required=False,
+        )
+        current_ctx = _auth_facade().get_session_context(current_token) if current_token else None
+        if (
+            not current_ctx
+            or not current_ctx.valid
+            or not current_ctx.user_id
+            or consumed.initiator_user_id is None
+            or current_ctx.user_id != consumed.initiator_user_id
+        ):
+            return _oauth_error_redirect("session_mismatch")
     if error:
         return _oauth_error_redirect(error)
     if not code:
@@ -2403,14 +3018,6 @@ def auth_oauth_callback(
     except Exception:
         logger.warning("OAuth identity exchange failed for provider=%s intent=%s", provider, oauth_intent)
         return _oauth_error_redirect("provider_error")
-
-    current_token = _get_session_token(
-        request.headers.get("Authorization"),
-        request.headers.get("X-Session-Token"),
-        request.cookies.get(settings.auth_cookie_name),
-        required=False,
-    )
-    current_ctx = _auth_facade().get_session_context(current_token) if current_token else None
 
     if oauth_intent == "connect":
         if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
@@ -2426,6 +3033,7 @@ def auth_oauth_callback(
             provider_user_id=identity.provider_user_id,
             connect_mode=connect_mode,
             requested_connection_key=requested_connection_key,
+            agency_id=requested_agency_id,
             oauth_tokens=identity.oauth_tokens,
             cfg=cfg,
         )
@@ -2716,7 +3324,12 @@ def platform_upsert_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     ensure_admin(ctx)
-    return _platform_admin_store().upsert_member(agency_id, payload)
+    return _platform_admin_store().upsert_member(
+        agency_id,
+        payload,
+        actor_user_id=ctx.user_id,
+        actor_is_platform_admin=True,
+    )
 
 
 @app.get(
@@ -2760,11 +3373,11 @@ def platform_assign_agency_client(
 @app.get(
     "/platform/agencies/{agency_id}/clients",
     response_model=List[AgencyClientAccessOut],
-    summary="[INTERNAL/TEMP] List agency tenant access",
-    description="Temporary internal/admin-only plumbing endpoint for agency provisioning.",
+    summary="List agency tenant access",
+    description="Lists the clients available to the authenticated agency member.",
 )
 def platform_list_agency_clients(agency_id: UUID, ctx: RequestContext = Depends(auth_context)):
-    ensure_admin(ctx)
+    _ensure_agency_member_access(ctx, agency_id)
     return _platform_admin_store().list_clients(agency_id)
 
 
@@ -2782,7 +3395,7 @@ def platform_issue_agency_invite(
     payload: AgencyInviteCreate,
     ctx: RequestContext = Depends(auth_context),
 ):
-    _ensure_agency_member_access(ctx, agency_id, manage=True)
+    _ensure_agency_invite_role_access(ctx, agency_id, payload.member_role)
     return _platform_admin_store().issue_invite(
         agency_id,
         payload,
@@ -2817,6 +3430,17 @@ def platform_revoke_agency_invite(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
+    target = next(
+        (
+            invite
+            for invite in _platform_admin_store().list_invites(agency_id, status="all")
+            if invite.id == invite_id
+        ),
+        None,
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    _ensure_agency_invite_role_access(ctx, agency_id, target.member_role)
     return _platform_admin_store().revoke_invite(agency_id, invite_id)
 
 
@@ -2832,6 +3456,17 @@ def platform_resend_agency_invite(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
+    target = next(
+        (
+            invite
+            for invite in _platform_admin_store().list_invites(agency_id, status="all")
+            if invite.id == invite_id
+        ),
+        None,
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    _ensure_agency_invite_role_access(ctx, agency_id, target.member_role)
     return _platform_admin_store().resend_invite(
         agency_id,
         invite_id,
@@ -2852,7 +3487,12 @@ def platform_deactivate_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
-    return _platform_admin_store().deactivate_member(agency_id, member_id)
+    return _platform_admin_store().deactivate_member(
+        agency_id,
+        member_id,
+        actor_user_id=ctx.user_id,
+        actor_is_platform_admin=ctx.role == "admin",
+    )
 
 
 @app.delete(
@@ -2865,7 +3505,12 @@ def platform_remove_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
-    _platform_admin_store().remove_member(agency_id, member_id)
+    _platform_admin_store().remove_member(
+        agency_id,
+        member_id,
+        actor_user_id=ctx.user_id,
+        actor_is_platform_admin=ctx.role == "admin",
+    )
     return {"status": "removed"}
 
 
@@ -2885,16 +3530,23 @@ def platform_revoke_agency_client(
 
 @app.post(
     "/auth/invites/accept",
-    response_model=Union[AgencyInviteAcceptResponse, ClientInviteAcceptResponse],
+    response_model=Union[AgencyInviteAcceptPublicResponse, ClientInviteAcceptPublicResponse],
     summary="Accept agency invite",
     description=(
         "Public onboarding endpoint: validates invite token and accepts agency/client invite, "
         "materializes tenant access, and issues backend session."
     ),
 )
-def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
+def auth_accept_agency_invite(
+    payload: AgencyInviteAcceptRequest,
+    ctx: Optional[RequestContext] = Depends(invite_optional_auth_context),
+):
     try:
-        accepted = _platform_admin_store().accept_invite(payload, session_ttl_minutes=settings.oauth_session_ttl_minutes)
+        accepted = _platform_admin_store().accept_invite(
+            payload,
+            session_ttl_minutes=settings.oauth_session_ttl_minutes,
+            accepting_user_id=ctx.user_id if ctx else None,
+        )
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {}
         code = str(detail.get("code") or "").strip().lower() if isinstance(detail, dict) else ""
@@ -2903,8 +3555,13 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
             or (exc.status_code == 400 and code in {"invalid_invite", "invite_expired", "invite_revoked", "invite_used"})
         ):
             raise
-        accepted = _accept_client_invite(payload)
-    response = JSONResponse(content=accepted.model_dump(mode="json"))
+        accepted = _accept_client_invite(payload, accepting_user_id=ctx.user_id if ctx else None)
+    public_response = (
+        AgencyInviteAcceptPublicResponse.model_validate(accepted.model_dump())
+        if isinstance(accepted, AgencyInviteAcceptResponse)
+        else ClientInviteAcceptPublicResponse.model_validate(accepted.model_dump())
+    )
+    response = JSONResponse(content=public_response.model_dump(mode="json"))
     max_age = max(60, int((accepted.session.expires_at - _utcnow()).total_seconds()))
     response.set_cookie(
         key=settings.auth_cookie_name,
@@ -2920,25 +3577,35 @@ def auth_accept_agency_invite(payload: AgencyInviteAcceptRequest):
 
 
 @app.post("/clients", response_model=ClientOut, summary="Create client")
-def create_client(payload: ClientCreate, ctx: RequestContext = Depends(auth_context)):
+def create_client(
+    payload: ClientCreate,
+    agency_id: Optional[UUID] = Query(default=None),
+    ctx: RequestContext = Depends(auth_context),
+):
     ensure_tenant_write_access(ctx)
-    agency_ids: List[UUID] = []
+    selected_agency_id: Optional[UUID] = None
     if ctx.role == "agency":
         if not ctx.user_id:
             raise HTTPException(status_code=401, detail="Session user not found")
-        agency_ids = _agency_scope_ids_for_user(ctx.user_id)
-        if not agency_ids:
-            raise HTTPException(
-                status_code=403,
-                detail={"code": "agency_unbound", "message": "Agency user has no active agency membership"},
-            )
+        selected_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            agency_id,
+            require_manage=True,
+        )
+    elif agency_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "agency_context_not_applicable",
+                "message": "Admin client creation does not accept agency_id; assign the client explicitly after creation",
+            },
+        )
     created = _client_store().create(payload)
-    if ctx.role == "agency":
-        for agency_id in agency_ids:
-            _platform_admin_store().assign_client(
-                agency_id,
-                AgencyClientAccessCreate(client_id=created.id),
-            )
+    if selected_agency_id is not None:
+        _platform_admin_store().assign_client(
+            selected_agency_id,
+            AgencyClientAccessCreate(client_id=created.id),
+        )
     return created
 
 
@@ -2993,7 +3660,12 @@ def patch_client(client_id: UUID, payload: ClientPatch, ctx: RequestContext = De
                     },
                 },
             )
-    return _client_store().patch(client_id, payload)
+    if payload.status == "active" and existing.status != "active":
+        _ensure_client_restore_assignments_available(client_id)
+    updated = _client_store().patch(client_id, payload)
+    if updated.status == "archived":
+        _revoke_pending_client_invites(client_id=client_id)
+    return updated
 
 
 @app.delete("/clients/{client_id}", summary="Archive client")
@@ -3001,6 +3673,7 @@ def archive_client(client_id: UUID, ctx: RequestContext = Depends(auth_context))
     ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, client_id)
     row = _client_store().archive(client_id)
+    _revoke_pending_client_invites(client_id=client_id)
     return {"status": "archived", "client": row.model_dump(mode="json")}
 
 
@@ -3130,9 +3803,69 @@ def list_ad_accounts(
     if client_id:
         ensure_client_access(ctx, client_id)
     items = _ad_account_store().list(client_id=client_id, status=status)
+    if not client_id and status == "active":
+        active_clients = _active_client_ids()
+        items = [item for item in items if item.client_id in active_clients]
     if not ctx.global_access and not client_id:
         items = [x for x in items if x.client_id in ctx.accessible_client_ids]
     return {"items": [x.model_dump(mode="json") for x in items], "count": len(items)}
+
+
+@app.get(
+    "/ad-accounts/assignment-conflicts",
+    response_model=AssignmentConflictListResponse,
+    summary="List ambiguous ad-account assignments",
+)
+def list_ad_account_assignment_conflicts(
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can manage assignment conflicts"},
+        )
+    selected_agency_id = (
+        _resolve_agency_context_for_user(ctx.user_id, agency_id, require_manage=True)
+        if ctx.role == "agency"
+        else None
+    )
+    return _assignment_conflict_service().list_conflicts(
+        actor_user_id=ctx.user_id,
+        actor_role=ctx.role,
+        agency_id=selected_agency_id,
+    )
+
+
+@app.post(
+    "/ad-accounts/assignment-conflicts/{group_id}/resolve",
+    response_model=AssignmentConflictResolveResponse,
+    summary="Resolve an ambiguous ad-account assignment",
+)
+def resolve_ad_account_assignment_conflict(
+    group_id: str,
+    payload: AssignmentConflictResolveRequest,
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role not in {"admin", "agency"}:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Only admin/agency can manage assignment conflicts"},
+        )
+    selected_agency_id = (
+        _resolve_agency_context_for_user(ctx.user_id, agency_id, require_manage=True)
+        if ctx.role == "agency"
+        else None
+    )
+    result = _assignment_conflict_service().resolve_conflict(
+        group_id,
+        payload,
+        actor_user_id=ctx.user_id,
+        actor_role=ctx.role,
+        agency_id=selected_agency_id,
+    )
+    return result
 
 
 @app.get("/ad-accounts/{account_id}", response_model=AdAccountOut, summary="Get ad account")
@@ -3153,7 +3886,7 @@ def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestCont
         ensure_client_access(ctx, payload.client_id)
     target_client_id = payload.client_id or existing.client_id
     target_currency = payload.currency or existing.currency
-    if payload.client_id is not None or payload.currency is not None:
+    if payload.client_id is not None or payload.currency is not None or payload.status == "active":
         _ensure_client_currency(target_client_id, target_currency, resource="Ad account")
         account_budgets = _budget_store().list(account_id=existing.id, status="all")
         if payload.client_id is not None and payload.client_id != existing.client_id and account_budgets:
@@ -3203,12 +3936,23 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             status_code=403,
             detail={"code": "forbidden", "message": "Only admin/agency can run account discovery"},
         )
-    target_client_id = _resolve_discovery_client_id(ctx, payload.client_id)
+    selected_agency_id = (
+        _resolve_agency_context_for_user(ctx.user_id, payload.agency_id, require_manage=True)
+        if ctx.role == "agency" and ctx.user_id
+        else None
+    )
+    target_client_id = _resolve_discovery_client_id(ctx, payload.client_id, selected_agency_id)
     target_client = _client_or_404(target_client_id)
+    if target_client.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "client_not_active", "message": "Ad accounts can only be discovered for an active client"},
+        )
     result = _ad_account_discovery_service().discover(
         provider=payload.provider,
         client_id=target_client_id,
-        user_id=ctx.user_id,
+        user_id=None if ctx.role == "admin" else ctx.user_id,
+        agency_id=selected_agency_id,
         upsert_existing=payload.upsert_existing,
         expected_currency=target_client.default_currency,
     )
@@ -3243,7 +3987,8 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
         "Runs provider sync for selected ad accounts and records sync jobs. "
         "Sync status/last_sync/error for account registry is derived from these jobs. "
         "If date_from/date_to are omitted, sync runs one-time historical backfill first "
-        "(AD_SYNC_INITIAL_LOOKBACK_DAYS, default 180), then incremental from account last_sync_at."
+        "(AD_SYNC_INITIAL_LOOKBACK_DAYS, default 180), then incremental from the latest metric date "
+        "with AD_SYNC_INCREMENTAL_OVERLAP_DAYS overlap (default 3)."
     ),
 )
 def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext = Depends(auth_context)):
@@ -3253,7 +3998,12 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
             detail={"code": "forbidden", "message": "Only admin/agency can run account sync"},
         )
     all_accounts = _ad_account_store().list(status="all")
-    requested_accounts = all_accounts
+    active_clients = _active_client_ids()
+    requested_accounts = [
+        account
+        for account in all_accounts
+        if account.status == "active" and account.client_id in active_clients
+    ]
     if payload.client_id:
         ensure_client_access(ctx, payload.client_id)
         requested_accounts = [a for a in requested_accounts if a.client_id == payload.client_id]
@@ -3284,13 +4034,13 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
     if not ctx.global_access:
         requested_accounts = [a for a in requested_accounts if a.client_id in ctx.accessible_client_ids]
 
-    result = _ad_account_sync_service().run_sync(
+    result = _ad_account_sync_service().run_sync_exclusive(
         account_ids=[a.id for a in requested_accounts],
         platform=None,
         date_from=payload.date_from,
         date_to=payload.date_to,
         created_by=ctx.user_id,
-        user_id=ctx.user_id,
+        user_id=None if ctx.role == "admin" else ctx.user_id,
         force=payload.force,
     )
     _process_sync_alerts(
@@ -3323,6 +4073,77 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
         finished_at=result.finished_at,
         jobs=result.jobs,
     )
+
+
+def _execute_due_sync_batch(*, batch_size: int, stale_after_hours: int, lease_seconds: int):
+    due = _ad_account_sync_service().run_due_sync(
+        batch_size=batch_size,
+        stale_after_hours=stale_after_hours,
+        lease_seconds=lease_seconds,
+    )
+    sync_result = due.sync_result
+    if sync_result:
+        accounts = {a.id: a.client_id for a in _ad_account_store().list(status="all")}
+        _process_sync_alerts(jobs=sync_result.jobs, account_client_by_id=accounts)
+    return due
+
+
+@app.post(
+    "/ad-accounts/sync/due",
+    summary="Run one protected due-sync batch",
+    description=(
+        "Protected endpoint intended for Render Cron. It selects active never-synced accounts, stale successful "
+        "accounts, and retryable failures whose retry time is due. A database lease prevents overlapping runs."
+    ),
+)
+def run_due_ad_accounts_sync(
+    x_sync_cron_secret: Optional[str] = Header(default=None, alias="X-Sync-Cron-Secret"),
+    batch_size: Optional[int] = Query(default=None, ge=1, le=100),
+    stale_after_hours: Optional[int] = Query(default=None, ge=1, le=720),
+):
+    if not _sync_cron_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "sync_cron_disabled",
+                "message": "Scheduled sync is disabled. Set SYNC_CRON_ENABLED=true after configuring Render Cron.",
+            },
+        )
+    expected_secret = str(os.getenv("SYNC_CRON_SECRET", "")).strip()
+    provided_secret = str(x_sync_cron_secret or "").strip()
+    if not expected_secret:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "sync_cron_not_configured", "message": "SYNC_CRON_SECRET is not configured"},
+        )
+    if not provided_secret or not secrets.compare_digest(provided_secret, expected_secret):
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "invalid_sync_cron_secret", "message": "Invalid sync cron credentials"},
+        )
+
+    resolved_batch_size = batch_size or max(1, min(int(os.getenv("AD_SYNC_DUE_BATCH_SIZE", "10")), 100))
+    resolved_stale_hours = stale_after_hours or max(1, int(os.getenv("AD_SYNC_STALE_AFTER_HOURS", "24")))
+    lease_seconds = max(30, int(os.getenv("AD_SYNC_LEASE_SECONDS", "900")))
+    due = _execute_due_sync_batch(
+        batch_size=resolved_batch_size,
+        stale_after_hours=resolved_stale_hours,
+        lease_seconds=lease_seconds,
+    )
+
+    sync_result = due.sync_result
+    return {
+        "status": "completed" if due.lease_acquired else "already_running",
+        "lease_acquired": due.lease_acquired,
+        "selected": len(due.selected_account_ids),
+        "selected_account_ids": [str(account_id) for account_id in due.selected_account_ids],
+        "processed": sync_result.processed if sync_result else 0,
+        "success": sync_result.success if sync_result else 0,
+        "failed": sync_result.failed if sync_result else 0,
+        "retry_eligible": sync_result.retry_scheduled if sync_result else 0,
+        "started_at": due.started_at.isoformat(),
+        "finished_at": due.finished_at.isoformat(),
+    }
 
 
 @app.get(
@@ -3364,6 +4185,9 @@ def ad_account_sync_diagnostics(
     if client_id:
         ensure_client_access(ctx, client_id)
     rows = _ad_account_store().list(client_id=client_id, status=status)
+    if not client_id and status == "active":
+        active_clients = _active_client_ids()
+        rows = [row for row in rows if row.client_id in active_clients]
     if provider:
         p = provider.strip().lower()
         rows = [x for x in rows if (x.platform or "").lower().strip() == p]
@@ -3372,11 +4196,31 @@ def ad_account_sync_diagnostics(
     rows = rows[:limit]
 
     latest = _ad_account_sync_service().latest_by_account_ids([x.id for x in rows])
+    assignment_conflicts = active_assignment_conflict_ids(_ad_account_store())
     client_names = {c.id: c.name for c in _client_store().list(status="all")}
     now = _utcnow()
     items: List[AdAccountSyncDiagnosticOut] = []
 
     for account in rows:
+        if account.id in assignment_conflicts:
+            items.append(
+                AdAccountSyncDiagnosticOut(
+                    ad_account_id=account.id,
+                    client_id=account.client_id,
+                    client_name=client_names.get(account.client_id),
+                    platform=account.platform,
+                    account_name=account.name,
+                    account_status=account.status,
+                    sync_state="error",
+                    diagnostic_message="This provider account has ambiguous ownership across active client mappings.",
+                    action_hint="Archive or reassign the duplicate mapping before syncing or using its metrics.",
+                    last_sync_at=account.last_sync_at,
+                    error_code="assignment_conflict",
+                    error_category="configuration",
+                    retryable=False,
+                )
+            )
+            continue
         job = latest.get(account.id)
         if not job:
             state = "never_synced"
@@ -3398,12 +4242,20 @@ def ad_account_sync_diagnostics(
             )
             continue
 
-        if job.status == "success":
+        empty_response = bool((job.request_meta or {}).get("empty_response"))
+        if job.status == "success" and empty_response:
+            state = "error"
+            message = "Provider request succeeded but returned no metric rows; data freshness is not confirmed."
+        elif job.status == "success":
             state = "healthy"
             message = "Last sync completed successfully."
         elif job.retryable and job.next_retry_at and job.next_retry_at > now:
             state = "retry_scheduled"
-            message = "Sync failed, retry is already scheduled."
+            message = (
+                "Sync failed; the configured scheduler can retry it after the shown time."
+                if _sync_automation_enabled()
+                else "Sync failed; it becomes eligible after the shown time but automatic scheduling is disabled."
+            )
         else:
             state = "error"
             message = _safe_sync_error_message(job.error_message)
@@ -3420,7 +4272,11 @@ def ad_account_sync_diagnostics(
                 sync_state=state,
                 diagnostic_message=message,
                 action_hint=action,
-                last_sync_at=account.last_sync_at or job.finished_at or job.started_at,
+                last_sync_at=(
+                    account.last_sync_at
+                    if empty_response
+                    else account.last_sync_at or job.finished_at or job.started_at
+                ),
                 last_job_id=job.id,
                 last_job_status=job.status,
                 records_synced=job.records_synced,
@@ -3457,7 +4313,12 @@ def integrations_overview(ctx: RequestContext = Depends(auth_context)):
             status_code=403,
             detail={"code": "forbidden", "message": "Integration management is available to admin and agency roles"},
         )
-    accounts = [a for a in _ad_account_store().list(status="all") if a.status != "archived"]
+    active_clients = _active_client_ids()
+    accounts = [
+        account
+        for account in _ad_account_store().list(status="all")
+        if account.status != "archived" and account.client_id in active_clients
+    ]
     if not ctx.global_access:
         accounts = [a for a in accounts if a.client_id in ctx.accessible_client_ids]
     account_ids = {a.id for a in accounts}
@@ -3604,6 +4465,14 @@ def create_budget(payload: BudgetCreate, ctx: RequestContext = Depends(auth_cont
         ensure_account_access(ctx, account.client_id, account_id=account.id)
         if account.client_id != payload.client_id:
             raise HTTPException(status_code=400, detail="account_id must belong to client_id")
+        if account.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "account_not_active",
+                    "message": "An active budget can only be created for an active advertising account",
+                },
+            )
         if account.currency != payload.currency:
             raise HTTPException(
                 status_code=400,
@@ -3649,6 +4518,9 @@ def list_budgets(
         date_from=date_from,
         date_to=date_to,
     )
+    if not client_id and not account_id and status == "active":
+        active_clients = _active_client_ids()
+        rows = [row for row in rows if row.client_id in active_clients]
     if not ctx.global_access and not client_id and not account_id:
         rows = [r for r in rows if r.client_id in ctx.accessible_client_ids]
     return {"items": [r.model_dump(mode="json") for r in rows], "count": len(rows)}
@@ -3685,13 +4557,23 @@ def patch_budget(budget_id: UUID, payload: BudgetPatch, ctx: RequestContext = De
     target_account_id = payload.account_id if payload.account_id is not None else existing.account_id
     target_client_id = payload.client_id if payload.client_id is not None else existing.client_id
     target_currency = payload.currency if payload.currency is not None else existing.currency
-    if {"client_id", "account_id", "scope", "currency"} & payload.model_fields_set:
+    target_status = payload.status if payload.status is not None else existing.status
+    business_fields = payload.model_fields_set - {"changed_by"}
+    if business_fields and target_status == "active":
         _ensure_client_currency(target_client_id, target_currency, resource="Budget")
     if target_account_id:
         account = _account_or_404(target_account_id)
         ensure_account_access(ctx, account.client_id, account_id=account.id)
         if account.client_id != target_client_id:
             raise HTTPException(status_code=400, detail="account_id must belong to client_id")
+        if business_fields and target_status == "active" and account.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "account_not_active",
+                    "message": "An active budget can only be assigned to an active advertising account",
+                },
+            )
         if account.currency != target_currency:
             raise HTTPException(
                 status_code=400,
@@ -3747,12 +4629,24 @@ def transfer_budget(budget_id: UUID, payload: BudgetTransferRequest, ctx: Reques
     if not source:
         raise HTTPException(status_code=404, detail="Budget not found")
     ensure_client_access(ctx, source.client_id)
+    _ensure_client_currency(source.client_id, source.currency, resource="Budget transfer")
     if source.account_id:
+        source_account = _account_or_404(source.account_id)
         ensure_account_access(ctx, source.client_id, account_id=source.account_id)
+        if source_account.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "account_not_active", "message": "Source advertising account is not active"},
+            )
     target_account = _account_or_404(payload.target_account_id)
     ensure_account_access(ctx, target_account.client_id, account_id=target_account.id)
     if target_account.client_id != source.client_id:
         raise HTTPException(status_code=400, detail="target account must belong to same client as source budget")
+    if target_account.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "account_not_active", "message": "Target advertising account is not active"},
+        )
     if target_account.currency != source.currency:
         raise HTTPException(
             status_code=400,
@@ -3898,6 +4792,7 @@ def insights_operational(
         scope_account_id=overview["scope"]["account_id"],
         breakdown_accounts=overview["breakdowns"]["accounts"],
         budget_summary=overview["budget_summary"],
+        data_quality=overview["data_quality"],
     )
 
 
@@ -4014,10 +4909,12 @@ def list_operational_actions(
 
 @app.get("/agency/overview", response_model=AgencyOverviewResponse, summary="Agency aggregation overview")
 def agency_overview(date_from: date, date_to: date, ctx: RequestContext = Depends(auth_context)):
+    active_clients = _active_client_ids()
+    allowed_client_ids = active_clients if ctx.global_access else active_clients.intersection(ctx.accessible_client_ids)
     return _overview_service().agency_overview(
         date_from=date_from,
         date_to=date_to,
-        allowed_client_ids=None if ctx.global_access else ctx.accessible_client_ids,
+        allowed_client_ids=allowed_client_ids,
     )
 
 
@@ -4062,6 +4959,9 @@ def list_alerts(
         client_id=client_id,
         limit=limit,
     )
+    if not client_id and status in {"open", "acked"}:
+        active_clients = _active_client_ids()
+        rows = [row for row in rows if row.client_id is None or row.client_id in active_clients]
     if ctx.role != "admin":
         rows = [x for x in rows if x.client_id and x.client_id in ctx.accessible_client_ids]
     return rows

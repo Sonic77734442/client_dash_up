@@ -14,7 +14,9 @@ def normalize_advertiser_id(advertiser_id: object) -> str:
 
 def access_token(config_override: Optional[Dict[str, Any]] = None) -> str:
     cfg = config_override or {}
-    token = str(cfg.get("access_token") or os.getenv("TIKTOK_ACCESS_TOKEN") or "").strip()
+    token = str(
+        cfg.get("access_token") or ("" if config_override is not None else os.getenv("TIKTOK_ACCESS_TOKEN")) or ""
+    ).strip()
     if not token:
         raise HTTPException(status_code=500, detail="TIKTOK_ACCESS_TOKEN is not set")
     return token
@@ -87,7 +89,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
     except Exception:
         if strict_mode:
             raise HTTPException(status_code=502, detail="TikTok account discovery failed")
-    return _fallback_accounts()
+    return [] if strict_mode else _fallback_accounts()
 
 
 def fetch_report(

@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 API_BASE="${API_BASE:-http://127.0.0.1:8000}"
 RUN_TESTS="${RUN_TESTS:-1}"
 RUN_FRONTEND_BUILD="${RUN_FRONTEND_BUILD:-1}"
+RUN_FRONTEND_QUALITY="${RUN_FRONTEND_QUALITY:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 TOKEN="${TOKEN:-}"
 if [[ -z "$TOKEN" && -f "$ROOT_DIR/storage/demo_seed.json" ]]; then
@@ -42,13 +44,20 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$API_BASE/ad-accounts/sync/jobs?sta
 curl -fsS -H "Authorization: Bearer $TOKEN" "$API_BASE/budgets?status=active" >/dev/null
 
 echo "[5/6] metrics endpoint"
-curl -fsS "$API_BASE/metrics" >/dev/null
+curl -fsS -H "Authorization: Bearer ${METRICS_TOKEN:-$TOKEN}" "$API_BASE/metrics" >/dev/null
 
 if [[ "$RUN_TESTS" == "1" ]]; then
   echo "[6/6] pytest"
-  (cd "$ROOT_DIR" && PYTHONPATH=. .venv/bin/pytest -q)
+  (cd "$ROOT_DIR" && PYTHONPATH=. "$PYTHON_BIN" -m pytest -q)
 else
   echo "[6/6] pytest skipped"
+fi
+
+if [[ "$RUN_FRONTEND_QUALITY" == "1" ]]; then
+  echo "[extra] frontend lint and typecheck"
+  (cd "$ROOT_DIR/frontend" && npm run lint && npm run typecheck)
+else
+  echo "[extra] frontend lint and typecheck skipped"
 fi
 
 if [[ "$RUN_FRONTEND_BUILD" == "1" ]]; then

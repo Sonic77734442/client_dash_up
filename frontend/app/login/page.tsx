@@ -109,12 +109,7 @@ export default function LoginPage() {
         return;
       }
       localStorage.setItem(LS_API_BASE, base);
-      const issuedToken = String((body as { session?: { token?: string } })?.session?.token || "").trim();
-      if (issuedToken) {
-        setSessionToken(issuedToken);
-      } else {
-        clearSessionToken();
-      }
+      clearSessionToken();
       window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
       redirectAfterLogin(body);
     } catch {

@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, settings
 
 
 client = TestClient(app)
@@ -36,3 +36,22 @@ def test_metrics_endpoint_exposes_counters():
     assert "http_requests_total" in text
     assert "http_request_duration_seconds_sum" in text
     assert "app_uptime_seconds" in text
+
+
+def test_protected_metrics_accepts_only_dedicated_service_token():
+    reset_state()
+    previous_public = settings.observability_public
+    previous_token = settings.metrics_bearer_token
+    object.__setattr__(settings, "observability_public", False)
+    object.__setattr__(settings, "metrics_bearer_token", "metrics-service-token-123456789")
+    try:
+        assert client.get("/metrics").status_code == 404
+        allowed = client.get(
+            "/metrics",
+            headers={"Authorization": "Bearer metrics-service-token-123456789"},
+        )
+        assert allowed.status_code == 200
+        assert "app_uptime_seconds" in allowed.text
+    finally:
+        object.__setattr__(settings, "observability_public", previous_public)
+        object.__setattr__(settings, "metrics_bearer_token", previous_token)

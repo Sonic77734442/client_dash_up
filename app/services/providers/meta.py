@@ -5,8 +5,9 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import HTTPException
 
+from app.services.meta_version import meta_graph_api_version
 
-API_VERSION = "v20.0"
+META_INSIGHTS_MAX_PAGES = 100
 DEFAULT_CONVERSION_ACTION_TYPES = {
     "purchase",
     "lead",
@@ -28,7 +29,9 @@ def _fallback_accounts() -> List[Dict[str, object]]:
 
 def _access_token(config_override: Optional[Dict[str, Any]] = None) -> str:
     cfg = config_override or {}
-    return str(cfg.get("access_token") or os.getenv("META_ACCESS_TOKEN") or "").strip()
+    if config_override is not None:
+        return str(cfg.get("access_token") or "").strip()
+    return str(os.getenv("META_ACCESS_TOKEN") or "").strip()
 
 
 def _business_ids(config_override: Optional[Dict[str, Any]] = None) -> List[str]:
@@ -36,7 +39,7 @@ def _business_ids(config_override: Optional[Dict[str, Any]] = None) -> List[str]
     raw_value = cfg.get("business_ids")
     if isinstance(raw_value, list):
         return [str(x).strip() for x in raw_value if str(x).strip()]
-    raw = str(raw_value or os.getenv("META_BUSINESS_IDS") or "")
+    raw = str(raw_value or ("" if config_override is not None else os.getenv("META_BUSINESS_IDS")) or "")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
@@ -87,10 +90,45 @@ def _sum_actions_conversions(actions: object) -> Optional[float]:
     return total
 
 
+def _fetch_paginated_insights(url: str, params: Dict[str, object]) -> List[Dict[str, object]]:
+    """Fetch every Meta insights page without silently returning partial data."""
+    rows: List[Dict[str, object]] = []
+    next_url: Optional[str] = url
+    next_params: Optional[Dict[str, object]] = params
+
+    for _page_number in range(META_INSIGHTS_MAX_PAGES):
+        if not next_url:
+            return rows
+        resp = httpx.get(next_url, params=next_params, timeout=20)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
+
+        payload = resp.json()
+        page_rows = payload.get("data", [])
+        if isinstance(page_rows, list):
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+
+        paging = payload.get("paging") or {}
+        next_url = paging.get("next") if isinstance(paging, dict) else None
+        # Meta's paging.next is already a complete URL (including its cursor and
+        # access token). Reapplying the original query parameters can reset the
+        # cursor and repeatedly fetch page one.
+        next_params = None
+
+    if next_url:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Meta API pagination exceeded the safe limit of {META_INSIGHTS_MAX_PAGES} pages",
+        )
+    return rows
+
+
 def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, object]]:
     strict_mode = config_override is not None
     token = _access_token(config_override)
     if not token:
+        if strict_mode:
+            raise HTTPException(status_code=500, detail="Tenant-scoped Meta access token is not set")
         return _fallback_accounts()
 
     out: List[Dict[str, object]] = []
@@ -118,7 +156,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
     try:
         # Direct user-accessible ad accounts.
         pull(
-            f"https://graph.facebook.com/{API_VERSION}/me/adaccounts",
+            f"https://graph.facebook.com/{meta_graph_api_version()}/me/adaccounts",
             {
                 "access_token": token,
                 "fields": "id,account_id,name,currency,account_status",
@@ -129,7 +167,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
 
         # Business Manager accounts (owned + client/shared).
         for business_id in _business_ids(config_override):
-            base = f"https://graph.facebook.com/{API_VERSION}/{business_id}"
+            base = f"https://graph.facebook.com/{meta_graph_api_version()}/{business_id}"
             common = {"access_token": token, "fields": "id,account_id,name,currency,account_status", "limit": 200}
             pull(f"{base}/owned_ad_accounts", common, "api_bm_owned")
             pull(f"{base}/client_ad_accounts", common, "api_bm_client")
@@ -148,7 +186,7 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
             return fallback
         raise HTTPException(status_code=502, detail="Meta account discovery failed")
 
-    if out:
+    if out or strict_mode:
         return out
     return _fallback_accounts()
 
@@ -163,25 +201,18 @@ def fetch_insights(
     if not token:
         raise HTTPException(status_code=500, detail="META_ACCESS_TOKEN is not set")
 
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_external_id}/insights"
+    url = f"https://graph.facebook.com/{meta_graph_api_version()}/act_{account_external_id}/insights"
     params = {
         "access_token": token,
         "level": "campaign",
         "fields": "campaign_id,campaign_name,account_id,account_currency,spend,ctr,cpc,cpm,reach,impressions,clicks,actions",
         "time_range": json.dumps({"since": date_from, "until": date_to}),
     }
-    resp = httpx.get(url, params=params, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
-    payload = resp.json()
-    rows = payload.get("data", [])
-    if not isinstance(rows, list):
-        return []
+    rows = _fetch_paginated_insights(url, params)
     for row in rows:
-        if isinstance(row, dict):
-            conversions = _sum_actions_conversions(row.get("actions"))
-            if conversions is not None:
-                row["conversions"] = conversions
+        conversions = _sum_actions_conversions(row.get("actions"))
+        if conversions is not None:
+            row["conversions"] = conversions
     return rows
 
 
@@ -195,7 +226,7 @@ def fetch_daily(
     if not token:
         raise HTTPException(status_code=500, detail="META_ACCESS_TOKEN is not set")
 
-    url = f"https://graph.facebook.com/{API_VERSION}/act_{account_external_id}/insights"
+    url = f"https://graph.facebook.com/{meta_graph_api_version()}/act_{account_external_id}/insights"
     params = {
         "access_token": token,
         "level": "account",
@@ -203,16 +234,9 @@ def fetch_daily(
         "time_increment": 1,
         "time_range": json.dumps({"since": date_from, "until": date_to}),
     }
-    resp = httpx.get(url, params=params, timeout=20)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
-    payload = resp.json()
-    rows = payload.get("data", [])
-    if not isinstance(rows, list):
-        return []
+    rows = _fetch_paginated_insights(url, params)
     for row in rows:
-        if isinstance(row, dict):
-            conversions = _sum_actions_conversions(row.get("actions"))
-            if conversions is not None:
-                row["conversions"] = conversions
+        conversions = _sum_actions_conversions(row.get("actions"))
+        if conversions is not None:
+            row["conversions"] = conversions
     return rows

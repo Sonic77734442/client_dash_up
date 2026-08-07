@@ -26,6 +26,7 @@ class OverviewService:
         account_id: Optional[UUID] = None,
         as_of_date: Optional[date] = None,
     ) -> Dict[str, object]:
+        effective_as_of_date = as_of_date or utc_today_date()
         effective_client_id = client_id
         if account_id and not effective_client_id:
             acc = self.ad_account_store.get(account_id)
@@ -36,6 +37,7 @@ class OverviewService:
             account_id=account_id,
             date_from=date_from,
             date_to=date_to,
+            as_of_date=effective_as_of_date,
         )
         totals = aggr["totals"]
         spend = Decimal(str(totals["spend"]))
@@ -52,20 +54,21 @@ class OverviewService:
             budget=Decimal(str(budget.amount)) if budget else None,
             period_start=budget.start_date if budget else date_from,
             period_end=budget.end_date if budget else date_to,
-            as_of_date=as_of_date or utc_today_date(),
+            as_of_date=effective_as_of_date,
         )
 
         return {
             "range": {
                 "date_from": date_from.isoformat(),
                 "date_to": date_to.isoformat(),
-                "as_of_date": (as_of_date or utc_today_date()).isoformat(),
+                "as_of_date": effective_as_of_date.isoformat(),
                 "timezone_policy": metric.date_policy,
             },
             "scope": {
                 "client_id": str(effective_client_id) if effective_client_id else None,
                 "account_id": str(account_id) if account_id else None,
             },
+            "data_quality": aggr["data_quality"],
             "spend_summary": {
                 "spend": float(totals["spend"]),
                 "impressions": int(totals["impressions"]),

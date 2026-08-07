@@ -9,7 +9,7 @@ services:
     ports:
       - "${API_BIND_PORT:-8000}:8000"
     volumes:
-      - ./storage:/app/storage
+      - ./storage:/var/data
       - ./accounts.json:/app/accounts.json:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
@@ -41,6 +41,7 @@ services:
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./storage/metrics_token:/etc/prometheus/metrics_token:ro
       - prometheus_data:/prometheus
     depends_on:
       api:

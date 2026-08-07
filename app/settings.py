@@ -39,6 +39,7 @@ class Settings:
     request_log_enabled: bool
     metrics_enabled: bool
     observability_public: bool
+    metrics_bearer_token: str
     enable_test_endpoints: bool
     api_docs_enabled: bool
     operational_insights_rules: Dict[str, Any]
@@ -89,7 +90,9 @@ def get_settings() -> Settings:
     origins = [_normalize_origin(x) for x in origins_raw.split(",") if _normalize_origin(x)]
     app_env = os.getenv("APP_ENV", "development")
     is_prod = app_env.lower() in {"prod", "production"}
-    frontend_base_url = _normalize_origin(os.getenv("FRONTEND_BASE_URL", "http://localhost:3000"))
+    frontend_base_url = _normalize_origin(
+        os.getenv("FRONTEND_BASE_URL", "" if is_prod else "http://localhost:3000")
+    )
 
     default_origins = [
         "http://localhost:3000",
@@ -98,9 +101,19 @@ def get_settings() -> Settings:
         "http://127.0.0.1:5173",
         "https://client-dash-up.vercel.app",
     ]
-    if frontend_base_url:
-        default_origins.append(frontend_base_url)
-    computed_origins = sorted({o for o in (origins + default_origins) if o and o != "*"})
+    if is_prod:
+        if "*" in origins:
+            raise ValueError("ALLOWED_ORIGINS must be an explicit allowlist in production")
+        if not frontend_base_url:
+            raise ValueError("FRONTEND_BASE_URL must be configured in production")
+        production_origins = [*origins, frontend_base_url]
+        computed_origins = sorted({o for o in production_origins if o})
+        if not computed_origins:
+            raise ValueError("ALLOWED_ORIGINS or FRONTEND_BASE_URL must be configured in production")
+    else:
+        if frontend_base_url:
+            default_origins.append(frontend_base_url)
+        computed_origins = sorted({o for o in (origins + default_origins) if o and o != "*"})
     settings = Settings(
         app_env=app_env,
         host=os.getenv("HOST", "0.0.0.0"),
@@ -129,6 +142,7 @@ def get_settings() -> Settings:
         request_log_enabled=_bool_from_env("REQUEST_LOG_ENABLED", True),
         metrics_enabled=_bool_from_env("METRICS_ENABLED", True),
         observability_public=_bool_from_env("OBSERVABILITY_PUBLIC", not is_prod),
+        metrics_bearer_token=os.getenv("METRICS_BEARER_TOKEN", "").strip(),
         enable_test_endpoints=_bool_from_env("ENABLE_TEST_ENDPOINTS", app_env.lower() == "test"),
         api_docs_enabled=_bool_from_env("API_DOCS_ENABLED", not is_prod),
         operational_insights_rules=_operational_insights_rules_from_env(),
@@ -137,6 +151,15 @@ def get_settings() -> Settings:
         raise ValueError("AUTH_COOKIE_SECURE must be true when AUTH_COOKIE_SAMESITE=none")
     if settings.app_env.lower() in {"prod", "production"} and not settings.auth_cookie_secure:
         raise ValueError("AUTH_COOKIE_SECURE must be true in production")
+    if settings.app_env.lower() in {"prod", "production"} and settings.enable_test_endpoints:
+        raise ValueError("ENABLE_TEST_ENDPOINTS must be false in production")
+    if (
+        settings.app_env.lower() in {"prod", "production"}
+        and settings.metrics_enabled
+        and not settings.observability_public
+        and len(settings.metrics_bearer_token) < 24
+    ):
+        raise ValueError("METRICS_BEARER_TOKEN must be a strong secret when protected metrics are enabled")
     return settings
 
 

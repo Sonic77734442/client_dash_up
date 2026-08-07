@@ -6,10 +6,13 @@ import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
 import { DataSourcesNav } from "../../components/DataSourcesNav";
 import { ToastHost } from "../../components/ToastHost";
+import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
 import { useSession } from "../../hooks/useSession";
+import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
-import { AdAccount, IntegrationsOverview, IntegrationProvider } from "../../lib/types";
+import { dataFreshnessMeta, providerDataFreshness, syncRunFeedback } from "../../lib/dataFreshness";
+import { AdAccount, AdAccountSyncRunResponse, IntegrationConnection, IntegrationsOverview, IntegrationProvider } from "../../lib/types";
 
 function fmtDate(v?: string | null) {
   if (!v) return "--";
@@ -26,17 +29,14 @@ function providerLabel(v: string) {
   return v;
 }
 
-function statusClass(status: IntegrationProvider["status"]) {
-  if (status === "healthy") return "good";
-  if (status === "warning") return "warn";
-  return "bad";
+function statusClass(provider: IntegrationProvider) {
+  return dataFreshnessMeta(providerDataFreshness(provider)).tone;
 }
 
-function statusLabel(status: IntegrationProvider["status"]) {
-  if (status === "healthy") return "Работает";
-  if (status === "warning") return "Нужно проверить";
-  if (status === "error") return "Ошибка";
-  return "Не подключено";
+function statusLabel(provider: IntegrationProvider) {
+  if ((provider.assignment_conflict_accounts_count || 0) > 0) return "Конфликт привязки";
+  if (!provider.sync_ready || provider.status === "disconnected") return "Нужна настройка";
+  return dataFreshnessMeta(providerDataFreshness(provider)).label;
 }
 
 function authStateLabel(state?: string | null) {
@@ -95,6 +95,8 @@ export default function IntegrationsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
+  const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
+  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -111,12 +113,22 @@ export default function IntegrationsPage() {
   );
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
     setLoading(true);
     try {
-      const [overview, accountRows] = await Promise.all([
+      if (agencyContext.role === "agency" && !agencyContext.portfolioReady) {
+        throw new Error(
+          agencyContext.selectionRequired
+            ? agencySelectionRequiredMessage()
+            : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
+        );
+      }
+      const [overview, accountRows, connectionRows] = await Promise.all([
         req<IntegrationsOverview>("/integrations/overview"),
         req<{ items?: AdAccount[] }>("/ad-accounts?status=all"),
+        req<{ items?: IntegrationConnection[] }>("/me/integration-connections?status=all"),
       ]);
+      if (!isCurrentRequest()) return;
       if (
         !overview ||
         !overview.summary ||
@@ -125,20 +137,90 @@ export default function IntegrationsPage() {
       ) {
         throw new Error("Сервис вернул некорректные данные о подключениях");
       }
-      setData(overview);
-      setAccounts(Array.isArray(accountRows?.items) ? accountRows.items : []);
+      const allAccounts = Array.isArray(accountRows?.items) ? accountRows.items : [];
+      const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+      const visibleAccounts = allowedClientIds
+        ? allAccounts.filter((account) => allowedClientIds.has(account.client_id))
+        : allAccounts;
+      if (allowedClientIds) {
+        const allConnections = Array.isArray(connectionRows?.items) ? connectionRows.items : [];
+        const visibleConnections = allConnections.filter((connection) => (
+          (connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
+          || (connection.scope_type === "client" && !!connection.scope_id && allowedClientIds.has(connection.scope_id))
+        ));
+        const scopedProviders = overview.providers.map((provider) => {
+          const providerKey = provider.provider === "facebook" ? "meta" : provider.provider;
+          const providerAccounts = visibleAccounts.filter((account) => {
+            const accountKey = account.platform === "facebook" ? "meta" : account.platform;
+            return accountKey === providerKey;
+          });
+          const providerConnections = visibleConnections.filter((connection) => {
+            const connectionKey = connection.provider === "facebook" ? "meta" : connection.provider;
+            return connectionKey === providerKey && connection.status === "active";
+          });
+          const activeAccounts = providerAccounts.filter((account) => account.status === "active");
+          const errorAccounts = activeAccounts.filter((account) => account.sync_status === "error").length;
+          const neverSynced = activeAccounts.filter((account) => !account.last_sync_at).length;
+          const connected = providerConnections.length > 0;
+          return {
+            ...provider,
+            status: connected ? (errorAccounts ? "error" : neverSynced ? "warning" : "healthy") : "disconnected",
+            auth_state: connected ? "configured" : "missing",
+            connection_sources: providerConnections.map((connection) => connection.connection_key),
+            identity_linked_users: providerConnections.length,
+            sync_ready: connected,
+            linked_accounts_count: providerAccounts.length,
+            active_accounts_count: activeAccounts.length,
+            successfully_synced_accounts_count: activeAccounts.filter((account) => account.sync_status === "success").length,
+            error_accounts_count: errorAccounts,
+            never_synced_accounts_count: neverSynced,
+            affected_clients_count: new Set(providerAccounts.map((account) => account.client_id)).size,
+          } satisfies IntegrationProvider;
+        });
+        const connectedProviders = scopedProviders.filter((provider) => provider.auth_state === "configured").length;
+        setData({
+          summary: {
+            ...overview.summary,
+            connected_providers: connectedProviders,
+            healthy_connections: scopedProviders.filter((provider) => provider.status === "healthy").length,
+            warning_connections: scopedProviders.filter((provider) => provider.status === "warning").length,
+            critical_issues: scopedProviders.filter((provider) => provider.status === "error").length,
+            active_nodes: visibleAccounts.filter((account) => account.status === "active").length,
+          },
+          providers: scopedProviders,
+          events: [],
+        });
+      } else {
+        setData(overview);
+      }
+      setAccounts(visibleAccounts);
       setWarning("");
     } finally {
       setLoading(false);
     }
-  }, [req]);
+  }, [
+    agencyContext.clientIds,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.role,
+    agencyContext.selectedAgencyId,
+    agencyContext.selectionRequired,
+    beginScopedRequest,
+    req,
+  ]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || agencyContext.loading) return;
     void loadData().catch((err) =>
       setWarning(err instanceof Error ? err.message : "Не удалось загрузить источники рекламы")
     );
-  }, [ready, loadData]);
+  }, [agencyContext.loading, ready, loadData]);
+
+  useEffect(() => {
+    setData(null);
+    setAccounts([]);
+    setSelectedProvider("");
+  }, [agencyContext.selectedAgencyId]);
 
   const providers = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -158,28 +240,38 @@ export default function IntegrationsPage() {
   }, [providers, selectedProvider]);
 
   const selected = useMemo(() => providers.find((p) => p.provider === selectedProvider) || null, [providers, selectedProvider]);
+  const selectedDataMeta = useMemo(
+    () => selected ? dataFreshnessMeta(providerDataFreshness(selected)) : null,
+    [selected]
+  );
 
   const runProviderSync = useCallback(async () => {
     if (!selected?.provider || syncLoading) return;
+    const scopedAccountIds = accounts
+      .filter((account) => {
+        const accountProvider = account.platform === "facebook" ? "meta" : account.platform;
+        const selectedKey = selected.provider === "facebook" ? "meta" : selected.provider;
+        return accountProvider === selectedKey;
+      })
+      .map((account) => account.id);
+    if (agencyContext.role === "agency" && (!agencyContext.portfolioReady || !scopedAccountIds.length)) {
+      push("У выбранного агентства нет аккаунтов этой платформы для обновления.", "info");
+      return;
+    }
     setSyncLoading(true);
     setWarning("");
     try {
-      const result = await req<{
-        requested: number;
-        processed: number;
-        success: number;
-        failed: number;
-        skipped: number;
-      }>("/ad-accounts/sync/run", {
+      const result = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: selected.provider }),
+        body: JSON.stringify({
+          platform: selected.provider,
+          ...(agencyContext.role === "agency" ? { account_ids: scopedAccountIds } : {}),
+        }),
       });
       await loadData();
-      push(
-        `Синхронизация завершена: успешно ${result.success}, с ошибкой ${result.failed}, пропущено ${result.skipped}.`,
-        result.failed > 0 ? "info" : "success",
-      );
+      const feedback = syncRunFeedback(result);
+      push(feedback.message, feedback.tone);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Не удалось запустить синхронизацию";
       setWarning(message);
@@ -187,7 +279,7 @@ export default function IntegrationsPage() {
     } finally {
       setSyncLoading(false);
     }
-  }, [loadData, push, req, selected, syncLoading]);
+  }, [accounts, agencyContext.portfolioReady, agencyContext.role, loadData, push, req, selected, syncLoading]);
 
   const recentEvents = useMemo(() => {
     const items = Array.isArray(data?.events) ? data.events : [];
@@ -199,9 +291,9 @@ export default function IntegrationsPage() {
     const connected = data?.summary?.connected_providers ?? 0;
     const accountCount = accounts.length;
     const unassigned = accounts.filter((account) => !account.client_id).length;
-    const issues =
-      (data?.summary?.warning_connections ?? 0) +
-      (data?.summary?.critical_issues ?? 0);
+    const issues = (data?.providers || []).filter(
+      (provider) => providerDataFreshness(provider) !== "current"
+    ).length;
     const completed = [
       connected > 0,
       accountCount > 0,
@@ -268,7 +360,7 @@ export default function IntegrationsPage() {
       issues,
       completed: 4,
       title: "Источники настроены",
-      description: "Аккаунты привязаны к клиентам, данные обновляются без критических ошибок.",
+      description: "Аккаунты привязаны к клиентам, и у каждой подключённой платформы есть свежая успешная загрузка.",
       action: "Открыть рекламные аккаунты",
       href: "/accounts",
     };
@@ -279,10 +371,15 @@ export default function IntegrationsPage() {
     { label: "Аккаунты импортированы", done: setup.accountCount > 0 },
     { label: "Клиенты назначены", done: setup.accountCount > 0 && setup.unassigned === 0 },
     {
-      label: "Данные обновляются",
+      label: "Есть свежая успешная загрузка",
       done: setup.connected > 0 && setup.accountCount > 0 && setup.issues === 0,
     },
   ];
+  const assignmentConflictCount = data?.summary?.assignment_conflict_accounts
+    ?? (data?.providers || []).reduce(
+      (total, item) => total + (item.assignment_conflict_accounts_count || 0),
+      0,
+    );
 
   return (
     <>
@@ -339,6 +436,18 @@ export default function IntegrationsPage() {
 
           <DataSourcesNav active="overview" />
 
+          {assignmentConflictCount > 0 ? (
+            <section className="alert-card high" style={{ marginTop: 12 }}>
+              <div className="alert-priority high">ТРЕБУЕТСЯ РЕШЕНИЕ</div>
+              <div className="insight-text" style={{ marginTop: 8 }}>
+                Конфликтующих рекламных аккаунтов: {assignmentConflictCount}. Они временно исключены из обновления и отчётов, чтобы данные разных клиентов не смешались.
+              </div>
+              <Link className="primary-btn" href="/accounts#assignment-conflicts" style={{ marginTop: 10 }}>
+                Выбрать правильных владельцев
+              </Link>
+            </section>
+          ) : null}
+
           <section className="data-setup-hero" aria-labelledby="data-setup-title">
             <div className="data-setup-main">
               <div className="data-setup-overline">Быстрый старт · {setup.completed} из 4 шагов</div>
@@ -368,7 +477,9 @@ export default function IntegrationsPage() {
             <article>
               <span>Платформы</span>
               <strong>{data?.summary?.connected_providers ?? 0}</strong>
-              <small>{data?.summary?.healthy_connections ?? 0} работают без ошибок</small>
+              <small>
+                {(data?.providers || []).filter((provider) => providerDataFreshness(provider) === "current").length} с актуальными данными; подключение само по себе не означает свежесть
+              </small>
             </article>
             <article>
               <span>Рекламные аккаунты</span>
@@ -415,18 +526,18 @@ export default function IntegrationsPage() {
                       onClick={() => setSelectedProvider(provider.provider)}
                       aria-pressed={active}
                     >
-                      <span className={`data-provider-mark ${statusClass(provider.status)}`}>
+                      <span className={`data-provider-mark ${statusClass(provider)}`}>
                         {providerMark(provider.provider)}
                       </span>
                       <span className="data-provider-copy">
                         <span className="data-provider-title">
                           <strong>{providerLabel(provider.provider)}</strong>
-                          <span className={`badge ${statusClass(provider.status)}`}>
-                            {statusLabel(provider.status)}
+                          <span className={`badge ${statusClass(provider)}`}>
+                            {statusLabel(provider)}
                           </span>
                         </span>
                         <small>
-                          {accountCountLabel(provider.linked_accounts_count)} · обновлено {fmtDate(provider.last_successful_sync_at)}
+                          {accountCountLabel(provider.active_accounts_count ?? provider.linked_accounts_count)} · {provider.last_successful_sync_at ? `последняя успешная загрузка ${fmtDate(provider.last_successful_sync_at)}` : "успешных загрузок ещё не было"}
                         </small>
                       </span>
                       <span className="data-provider-chevron">›</span>
@@ -452,14 +563,14 @@ export default function IntegrationsPage() {
               ) : (
                 <>
                   <div className="data-provider-detail-head">
-                    <span className={`data-provider-mark large ${statusClass(selected.status)}`}>
+                    <span className={`data-provider-mark large ${statusClass(selected)}`}>
                       {providerMark(selected.provider)}
                     </span>
                     <div>
                       <div className="kpi-title">Выбранная платформа</div>
                       <h3>{providerLabel(selected.provider)}</h3>
                     </div>
-                    <span className={`badge ${statusClass(selected.status)}`}>{statusLabel(selected.status)}</span>
+                    <span className={`badge ${statusClass(selected)}`}>{statusLabel(selected)}</span>
                   </div>
 
                   <div className="data-provider-summary">
@@ -472,7 +583,7 @@ export default function IntegrationsPage() {
                       <strong>{selected.linked_accounts_count}</strong>
                     </div>
                     <div>
-                      <span>Последнее обновление</span>
+                      <span>Последняя успешная загрузка</span>
                       <strong>{fmtDate(selected.last_successful_sync_at)}</strong>
                     </div>
                     <div>
@@ -481,19 +592,23 @@ export default function IntegrationsPage() {
                     </div>
                   </div>
 
-                  {!selected.sync_ready || selected.last_error_safe ? (
+                  {!selected.sync_ready || selected.last_error_safe || selectedDataMeta?.tone !== "good" ? (
                     <div className="data-next-step">
-                      <strong>Что сделать</strong>
+                      <strong>{!selected.sync_ready ? "Нужна настройка" : selectedDataMeta?.label || "Что сделать"}</strong>
                       <span>
-                        {selected.last_error_safe
+                        {(selected.assignment_conflict_accounts_count || 0) > 0
+                          ? `Найдено конфликтующих привязок: ${selected.assignment_conflict_accounts_count}. Откройте монитор обновлений и оставьте рекламный аккаунт только у одного активного клиента.`
+                          : selected.last_error_safe
                           ? readableEventMessage(selected.last_error_safe)
-                          : "Завершите авторизацию платформы, чтобы начать загрузку данных."}
+                          : !selected.sync_ready
+                            ? "Завершите авторизацию платформы, чтобы начать загрузку данных."
+                            : selectedDataMeta?.description}
                       </span>
                     </div>
                   ) : (
                     <div className="data-next-step success">
-                      <strong>Подключение готово</strong>
-                      <span>Можно обновлять показатели и импортировать новые рекламные аккаунты.</span>
+                      <strong>Данные актуальны</strong>
+                      <span>Подключение настроено, а последняя успешная загрузка подтверждена и свежая.</span>
                     </div>
                   )}
 

@@ -6,7 +6,8 @@ import json
 import secrets
 import base64
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Protocol
+from threading import RLock
+from typing import Callable, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -63,6 +64,7 @@ class AuthStore(Protocol):
     def list_identities(self, user_id: Optional[UUID] = None) -> List[AuthIdentityOut]: ...
     def assign_client_access(self, payload: UserClientAccessCreate) -> UserClientAccessOut: ...
     def list_client_access(self, user_id: Optional[UUID] = None) -> List[UserClientAccessOut]: ...
+    def remove_client_access(self, user_id: UUID, client_id: UUID) -> None: ...
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse: ...
     def validate_session(self, token: str) -> SessionValidationResponse: ...
     def refresh_session(self, token: str, ttl_minutes: int) -> SessionValidationResponse: ...
@@ -100,6 +102,20 @@ def _password_verify(password: str, encoded: str) -> bool:
         return False
     actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return hmac.compare_digest(actual, expected)
+
+
+def _raise_last_active_agency_owner(agency_id: Optional[str] = None) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "last_active_agency_owner",
+            "message": (
+                "Transfer ownership to another active user before deactivating, "
+                "demoting, or deleting this owner"
+            ),
+            "details": {"agency_id": agency_id} if agency_id else {},
+        },
+    )
 
 
 class SqliteAuthStore:
@@ -190,9 +206,40 @@ class SqliteAuthStore:
             rows = conn.execute("SELECT * FROM users ORDER BY updated_at DESC").fetchall()
         return [self._to_user(r) for r in rows]
 
+    @staticmethod
+    def _assert_agency_owner_exit_allowed(conn, user_id: UUID) -> None:
+        blocking = conn.execute(
+            """
+            SELECT target.agency_id
+            FROM agency_members target
+            WHERE target.user_id=?
+              AND target.role='owner'
+              AND target.status='active'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM agency_members other
+                JOIN users other_user ON other_user.id=other.user_id
+                WHERE other.agency_id=target.agency_id
+                  AND other.user_id<>target.user_id
+                  AND other.role='owner'
+                  AND other.status='active'
+                  AND other_user.status='active'
+                  AND other_user.role IN ('agency','admin')
+              )
+            LIMIT 1
+            """,
+            (str(user_id),),
+        ).fetchone()
+        if blocking:
+            _raise_last_active_agency_owner(str(blocking["agency_id"]))
+
     def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
         patch = payload.model_dump(exclude_unset=True)
         with sqlite_conn(self.db_path) as conn:
+            # Serialize admin role/status transitions. Without a write lock, two
+            # concurrent requests could each observe the other active admin and
+            # leave the platform without an administrator.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -203,29 +250,68 @@ class SqliteAuthStore:
             name = patch.get("name", row["name"])
             role = patch.get("role", row["role"])
             status = patch.get("status", row["status"])
+            removes_active_admin = (
+                row["role"] == "admin"
+                and row["status"] == "active"
+                and (role != "admin" or status != "active")
+            )
+            if removes_active_admin:
+                other_admin = conn.execute(
+                    "SELECT id FROM users WHERE role='admin' AND status='active' AND id<>? LIMIT 1",
+                    (str(user_id),),
+                ).fetchone()
+                if not other_admin:
+                    raise HTTPException(status_code=409, detail="Cannot demote or deactivate last active admin")
+            removes_active_agency_owner = (
+                row["role"] in {"agency", "admin"}
+                and row["status"] == "active"
+                and (role not in {"agency", "admin"} or status != "active")
+            )
+            if removes_active_agency_owner:
+                self._assert_agency_owner_exit_allowed(conn, user_id)
             try:
                 conn.execute(
                     "UPDATE users SET email=?, name=?, role=?, status=?, updated_at=? WHERE id=?",
                     (email, name, role, status, now, str(user_id)),
                 )
+                # Agency access is materialized. A role demotion/promotion or
+                # deactivation must not leave tenant grants from the old role.
+                # Do not synthesize grants on activation here: provisioning via
+                # agency membership remains the sole source of agency scope.
+                if role != "agency" or status != "active":
+                    conn.execute(
+                        "DELETE FROM user_client_access WHERE user_id=? AND role='agency'",
+                        (str(user_id),),
+                    )
+                if status != "active":
+                    conn.execute(
+                        "UPDATE sessions SET revoked_at=?, updated_at=? WHERE user_id=? AND revoked_at IS NULL",
+                        (now, now, str(user_id)),
+                    )
                 conn.commit()
             except Exception as exc:
+                if isinstance(exc, HTTPException):
+                    raise
                 raise HTTPException(status_code=409, detail=f"User conflict: {exc}")
             updated = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
         return self._to_user(updated)
 
     def delete_user(self, user_id: UUID) -> None:
         with sqlite_conn(self.db_path) as conn:
+            # Serialize last-admin and last-agency-owner checks with deletion.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="User not found")
-            if row["role"] == "admin":
+            if row["role"] == "admin" and row["status"] == "active":
                 other_admin = conn.execute(
                     "SELECT id FROM users WHERE role='admin' AND status='active' AND id<>? LIMIT 1",
                     (str(user_id),),
                 ).fetchone()
                 if not other_admin:
                     raise HTTPException(status_code=409, detail="Cannot delete last active admin")
+            if row["role"] in {"agency", "admin"} and row["status"] == "active":
+                self._assert_agency_owner_exit_allowed(conn, user_id)
 
             conn.execute("DELETE FROM agency_members WHERE user_id=?", (str(user_id),))
             conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
@@ -385,6 +471,14 @@ class SqliteAuthStore:
                 rows = conn.execute("SELECT * FROM user_client_access ORDER BY updated_at DESC").fetchall()
         return [self._to_access(r) for r in rows]
 
+    def remove_client_access(self, user_id: UUID, client_id: UUID) -> None:
+        with sqlite_conn(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM user_client_access WHERE user_id=? AND client_id=?",
+                (str(user_id), str(client_id)),
+            )
+            conn.commit()
+
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
         user = self.get_user(payload.user_id)
         if not user or user.status != "active":
@@ -533,12 +627,17 @@ class SqliteAuthStore:
 
 class InMemoryAuthStore:
     def __init__(self):
+        self._user_lock = RLock()
+        self._agency_owner_exit_guard: Optional[Callable[[UUID], None]] = None
         self.users: Dict[UUID, UserOut] = {}
         self.password_hashes: Dict[UUID, str] = {}
         self.identities: Dict[str, AuthIdentityOut] = {}
         self.access: Dict[str, UserClientAccessOut] = {}
         self.sessions: Dict[str, Dict[str, object]] = {}
         self.provider_cfg: Dict[str, AuthProviderConfigOut] = {}
+
+    def register_agency_owner_exit_guard(self, guard: Callable[[UUID], None]) -> None:
+        self._agency_owner_exit_guard = guard
 
     def create_user(self, payload: UserCreate) -> UserOut:
         now = _utcnow()
@@ -561,6 +660,10 @@ class InMemoryAuthStore:
         return sorted(self.users.values(), key=lambda x: x.updated_at, reverse=True)
 
     def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
+        with self._user_lock:
+            return self._patch_user_locked(user_id, payload)
+
+    def _patch_user_locked(self, user_id: UUID, payload: UserPatch) -> UserOut:
         existing = self.users.get(user_id)
         if not existing:
             raise HTTPException(status_code=404, detail="User not found")
@@ -572,20 +675,58 @@ class InMemoryAuthStore:
                     raise HTTPException(status_code=409, detail="User conflict: duplicate email")
             patch["email"] = new_email
         updated = existing.model_copy(update={**patch, "updated_at": _utcnow()})
+        removes_active_admin = (
+            existing.role == "admin"
+            and existing.status == "active"
+            and (updated.role != "admin" or updated.status != "active")
+        )
+        if removes_active_admin:
+            has_other_admin = any(
+                u.id != user_id and u.role == "admin" and u.status == "active"
+                for u in self.users.values()
+            )
+            if not has_other_admin:
+                raise HTTPException(status_code=409, detail="Cannot demote or deactivate last active admin")
+        removes_active_agency_owner = (
+            existing.role in {"agency", "admin"}
+            and existing.status == "active"
+            and (updated.role not in {"agency", "admin"} or updated.status != "active")
+        )
+        if removes_active_agency_owner and self._agency_owner_exit_guard:
+            self._agency_owner_exit_guard(user_id)
+
         self.users[user_id] = updated
+        if updated.role != "agency" or updated.status != "active":
+            for key, value in list(self.access.items()):
+                if value.user_id == user_id and value.role == "agency":
+                    self.access.pop(key, None)
+        if updated.status != "active":
+            for session in self.sessions.values():
+                if session.get("user_id") == user_id:
+                    session["revoked"] = True
         return updated
 
     def delete_user(self, user_id: UUID) -> None:
+        with self._user_lock:
+            self._delete_user_locked(user_id)
+
+    def _delete_user_locked(self, user_id: UUID) -> None:
         existing = self.users.get(user_id)
         if not existing:
             raise HTTPException(status_code=404, detail="User not found")
-        if existing.role == "admin":
+        if existing.role == "admin" and existing.status == "active":
             has_other_admin = any(
                 u.id != user_id and u.role == "admin" and u.status == "active"
                 for u in self.users.values()
             )
             if not has_other_admin:
                 raise HTTPException(status_code=409, detail="Cannot delete last active admin")
+        if (
+            existing.role in {"agency", "admin"}
+            and existing.status == "active"
+            and self._agency_owner_exit_guard
+        ):
+            self._agency_owner_exit_guard(user_id)
 
         self.users.pop(user_id, None)
         self.password_hashes.pop(user_id, None)
@@ -672,6 +813,9 @@ class InMemoryAuthStore:
             rows = [x for x in rows if x.user_id == user_id]
         rows.sort(key=lambda x: x.updated_at, reverse=True)
         return rows
+
+    def remove_client_access(self, user_id: UUID, client_id: UUID) -> None:
+        self.access.pop(f"{user_id}:{client_id}", None)
 
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
         user = self.users.get(payload.user_id)
