@@ -22,6 +22,32 @@ function badgeClass(v: string) {
   return "good";
 }
 
+const severityLabels: Record<AlertOut["severity"], string> = {
+  critical: "Критично",
+  high: "Высокая",
+  medium: "Средняя",
+  low: "Низкая",
+};
+
+const statusLabels: Record<AlertOut["status"], string> = {
+  open: "Открыт",
+  acked: "Принят в работу",
+  resolved: "Решён",
+};
+
+const alertMessages: Record<string, string> = {
+  "account.blocked_or_disabled": "Рекламный аккаунт заблокирован, отключён или недоступен. Проверьте его состояние на стороне платформы.",
+  "provider.auth_failed": "Недостаточно прав для обновления данных. Переподключите платформу и подтвердите доступ к рекламному аккаунту.",
+  "provider.unavailable": "Рекламная платформа временно недоступна. Повторите обновление позже.",
+  "discovery.provider_failed": "Не удалось получить список рекламных аккаунтов. Проверьте подключение и повторите поиск.",
+  "discovery.account_blocked_or_disabled": "При поиске найден заблокированный или отключённый рекламный аккаунт.",
+  "discovery.auth_failed": "Не удалось получить список аккаунтов из-за недостаточных прав. Переподключите платформу.",
+};
+
+function alertMessage(alert: AlertOut) {
+  return alertMessages[alert.code] || alert.message;
+}
+
 export default function PlatformAlertsPage() {
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
@@ -42,7 +68,7 @@ export default function PlatformAlertsPage() {
   const loadData = useCallback(async () => {
     const me = await req<AuthMeResponse>("/auth/me");
     if (me.user.role !== "admin") {
-      throw new Error("Admin access required");
+      throw new Error("Требуются права администратора");
     }
     const q = new URLSearchParams({ status, limit: "200" });
     if (severity) q.set("severity", severity);
@@ -53,16 +79,16 @@ export default function PlatformAlertsPage() {
 
   useEffect(() => {
     if (!ready) return;
-    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Failed to load alerts"));
+    void loadData().catch((err) => setWarning(err instanceof Error ? err.message : "Не удалось загрузить инциденты"));
   }, [ready, loadData]);
 
   async function ackAlert(alertId: string) {
     try {
       await req<AlertOut>(`/alerts/${alertId}/ack`, { method: "POST" });
       await loadData();
-      push("Alert acknowledged", "success");
+      push("Инцидент принят в работу", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Acknowledge failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось принять инцидент в работу", "error");
     }
   }
 
@@ -70,9 +96,9 @@ export default function PlatformAlertsPage() {
     try {
       await req<AlertOut>(`/alerts/${alertId}/resolve`, { method: "POST" });
       await loadData();
-      push("Alert resolved", "success");
+      push("Инцидент отмечен решённым", "success");
     } catch (err) {
-      push(err instanceof Error ? err.message : "Resolve failed", "error");
+      push(err instanceof Error ? err.message : "Не удалось закрыть инцидент", "error");
     }
   }
 
@@ -93,11 +119,11 @@ export default function PlatformAlertsPage() {
           <header className="topbar">
             <div className="topbar-left">
               <AppTopTabs active="platform_admin" />
-              <div className="topbar-title">Platform Alerts</div>
+              <div className="topbar-title">Инциденты платформы</div>
             </div>
             <div className="session-controls">
-              <a className="ghost-btn" href="/platform/users">Users</a>
-              <a className="ghost-btn" href="/platform/agencies">Agencies</a>
+              <a className="ghost-btn" href="/platform/users">Пользователи</a>
+              <a className="ghost-btn" href="/platform/agencies">Агентства</a>
               {tokenLoginEnabled ? (
                 <>
                   <input value={session.apiBase} onChange={(e) => setSession((s) => ({ ...s, apiBase: e.target.value }))} placeholder="API base" />
@@ -109,10 +135,10 @@ export default function PlatformAlertsPage() {
                       persist(next);
                       setSession(next);
                       await loadData();
-                      push("Session saved", "success");
+                      push("Сеанс сохранён", "success");
                     }}
                   >
-                    Save
+                    Сохранить
                   </button>
                 </>
               ) : null}
@@ -122,74 +148,74 @@ export default function PlatformAlertsPage() {
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
 
           <section className="kpi-grid" style={{ marginTop: 12 }}>
-            <article className="kpi-card"><div className="kpi-title">Total</div><div className="kpi-value">{summary.total}</div></article>
-            <article className="kpi-card bad"><div className="kpi-title">Critical</div><div className="kpi-value">{summary.critical}</div></article>
-            <article className="kpi-card bad"><div className="kpi-title">High</div><div className="kpi-value">{summary.high}</div></article>
-            <article className="kpi-card warn"><div className="kpi-title">Open</div><div className="kpi-value">{summary.open}</div></article>
+            <article className="kpi-card"><div className="kpi-title">Всего</div><div className="kpi-value">{summary.total}</div></article>
+            <article className="kpi-card bad"><div className="kpi-title">Критические</div><div className="kpi-value">{summary.critical}</div></article>
+            <article className="kpi-card bad"><div className="kpi-title">Высокая важность</div><div className="kpi-value">{summary.high}</div></article>
+            <article className="kpi-card warn"><div className="kpi-title">Открытые</div><div className="kpi-value">{summary.open}</div></article>
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
             <div className="chip-row" style={{ marginTop: 0 }}>
               <label>
-                Status
+                Статус
                 <select value={status} onChange={(e) => setStatus(e.target.value as "open" | "acked" | "resolved" | "all")}>
-                  <option value="open">open</option>
-                  <option value="acked">acked</option>
-                  <option value="resolved">resolved</option>
-                  <option value="all">all</option>
+                  <option value="open">Открытые</option>
+                  <option value="acked">В работе</option>
+                  <option value="resolved">Решённые</option>
+                  <option value="all">Все</option>
                 </select>
               </label>
               <label>
-                Severity
+                Важность
                 <select value={severity} onChange={(e) => setSeverity(e.target.value as "" | "critical" | "high" | "medium" | "low")}>
-                  <option value="">all</option>
-                  <option value="critical">critical</option>
-                  <option value="high">high</option>
-                  <option value="medium">medium</option>
-                  <option value="low">low</option>
+                  <option value="">Все</option>
+                  <option value="critical">Критическая</option>
+                  <option value="high">Высокая</option>
+                  <option value="medium">Средняя</option>
+                  <option value="low">Низкая</option>
                 </select>
               </label>
-              <input value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="provider (google/meta/tiktok)" />
-              <button className="ghost-btn" onClick={() => void loadData()}>Refresh</button>
+              <input value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="Платформа: google, meta или tiktok" />
+              <button className="ghost-btn" onClick={() => void loadData()}>Обновить</button>
             </div>
 
             <div className="budgets-table-wrap" style={{ marginTop: 10 }}>
               <table className="budgets-table">
                 <thead>
                   <tr>
-                    <th>Severity</th>
-                    <th>Status</th>
-                    <th>Code</th>
-                    <th>Provider</th>
-                    <th>Message</th>
-                    <th>Occurrences</th>
-                    <th>Last Seen</th>
-                    <th>Actions</th>
+                    <th>Важность</th>
+                    <th>Статус</th>
+                    <th>Код</th>
+                    <th>Платформа</th>
+                    <th>Причина и следующее действие</th>
+                    <th>Повторения</th>
+                    <th>Последнее событие</th>
+                    <th>Действия</th>
                   </tr>
                 </thead>
                 <tbody>
                   {alerts.map((a) => (
                     <tr key={a.id}>
-                      <td><span className={`badge ${badgeClass(a.severity)}`}>{a.severity}</span></td>
-                      <td>{a.status}</td>
+                      <td><span className={`badge ${badgeClass(a.severity)}`}>{severityLabels[a.severity]}</span></td>
+                      <td>{statusLabels[a.status]}</td>
                       <td>{a.code}</td>
                       <td>{a.provider || "--"}</td>
-                      <td>{a.message}</td>
+                      <td>{alertMessage(a)}</td>
                       <td>{a.occurrences}</td>
                       <td>{fmtDate(a.last_seen_at)}</td>
                       <td>
                         <button className="ghost-btn" onClick={() => void ackAlert(a.id)} disabled={a.status !== "open"}>
-                          Ack
+                          В работу
                         </button>
                         <button className="ghost-btn" onClick={() => void resolveAlert(a.id)} disabled={a.status === "resolved"}>
-                          Resolve
+                          Закрыть
                         </button>
                       </td>
                     </tr>
                   ))}
                   {!alerts.length ? (
                     <tr>
-                      <td colSpan={8} className="muted-note">No alerts.</td>
+                      <td colSpan={8} className="muted-note">Инцидентов по выбранным фильтрам нет.</td>
                     </tr>
                   ) : null}
                 </tbody>

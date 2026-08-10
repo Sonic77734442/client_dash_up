@@ -235,3 +235,15 @@ test("admin settings renders provider config envelopes without crashing", async 
   await expect(page.getByText("Настройки платформы", { exact: true })).toBeVisible();
   await expect(page.getByText("OAuth-провайдеры", { exact: true })).toBeVisible();
 });
+
+test("admin incidents screen uses clear Russian controls", async ({ page, context, request }) => {
+  const token = await createAdminSession(request);
+  await attachSession(page, context, token);
+  await page.goto("/platform/alerts");
+
+  await expect(page).toHaveURL(/\/platform\/alerts$/, { timeout: 15_000 });
+  await expect(page.getByText("Инциденты платформы", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Обновить" })).toBeVisible();
+  await expect(page.getByText("Причина и следующее действие", { exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "Все" }).first()).toBeAttached();
+});
