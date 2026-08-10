@@ -22,6 +22,7 @@ import {
 
 test("redirect helpers enforce role boundaries and reject external next URLs", () => {
   expect(isAppRole("admin")).toBeTruthy();
+  expect(isAppRole("solo_client")).toBeTruthy();
   expect(isAppRole("owner")).toBeFalsy();
   expect(safeRelativePath("//example.com/path", "/")).toBe("/");
   expect(safeRelativePath("https://example.com/path", "/")).toBe("/");
@@ -29,10 +30,20 @@ test("redirect helpers enforce role boundaries and reject external next URLs", (
 
   expect(isPathAllowedForRole("client", "/portal/reports")).toBeTruthy();
   expect(isPathAllowedForRole("client", "/budgets")).toBeFalsy();
+  expect(isPathAllowedForRole("solo_client", "/portal/reports")).toBeTruthy();
+  expect(isPathAllowedForRole("solo_client", "/integrations")).toBeTruthy();
+  expect(isPathAllowedForRole("solo_client", "/accounts")).toBeTruthy();
+  expect(isPathAllowedForRole("solo_client", "/sync-monitor")).toBeTruthy();
+  expect(isPathAllowedForRole("solo_client", "/budgets")).toBeTruthy();
+  expect(isPathAllowedForRole("solo_client", "/clients")).toBeFalsy();
+  expect(isPathAllowedForRole("solo_client", "/agency/team")).toBeFalsy();
+  expect(isPathAllowedForRole("solo_client", "/platform/users")).toBeFalsy();
   expect(isPathAllowedForRole("agency", "/client/abc")).toBeTruthy();
   expect(isPathAllowedForRole("agency", "/platform/users")).toBeFalsy();
   expect(isPathAllowedForRole("admin", "/platform/settings")).toBeTruthy();
   expect(destinationForRole("client", "/clients")).toBe("/portal");
+  expect(destinationForRole("solo_client", "/clients")).toBe("/portal");
+  expect(destinationForRole("solo_client", "/sync-monitor")).toBe("/sync-monitor");
 });
 
 test("list payload parser accepts arrays and envelopes and rejects malformed rows", () => {

@@ -18,6 +18,7 @@ export function scopeIntegrationsOverview(
   agencyId: string,
   clientIds: string[],
 ): { overview: IntegrationsOverview; accounts: AdAccount[]; connections: IntegrationConnection[] } {
+  const workspaceLabel = agencyId ? "выбранного агентства" : "вашего кабинета";
   const allowedClientIds = new Set(clientIds);
   const accounts = allAccounts.filter((account) => allowedClientIds.has(account.client_id));
   const connections = allConnections.filter((connection) => (
@@ -46,12 +47,12 @@ export function scopeIntegrationsOverview(
     return {
       ...provider,
       status: connected ? (errorAccounts.length ? "error" : neverSynced.length ? "warning" : "healthy") : "disconnected",
-      status_reason: connected ? null : "Для выбранного агентства подключение не настроено",
+      status_reason: connected ? null : `Для ${workspaceLabel} подключение не настроено`,
       auth_state: connected ? "configured" : "missing",
       connection_sources: providerConnections.map((connection) => connection.connection_key),
       identity_linked_users: providerConnections.length,
       sync_ready: connected,
-      sync_readiness_reason: connected ? null : "Подключите платформу для выбранного агентства",
+      sync_readiness_reason: connected ? null : `Подключите платформу для ${workspaceLabel}`,
       linked_accounts_count: providerAccounts.length,
       active_accounts_count: activeAccounts.length,
       successfully_synced_accounts_count: activeAccounts.filter((account) => account.sync_status === "success").length,

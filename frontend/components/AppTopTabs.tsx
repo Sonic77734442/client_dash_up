@@ -45,6 +45,15 @@ const SEARCH_ITEMS = {
     { label: "Что изменилось", href: "/portal/changes", hint: "Агентство" },
     { label: "План действий", href: "/portal/plan", hint: "Агентство" },
   ],
+  solo_client: [
+    { label: "Главное", href: "/portal", hint: "Мои результаты" },
+    { label: "Реклама", href: "/portal/advertising", hint: "Показатели" },
+    { label: "Лиды", href: "/portal/leads", hint: "Результаты" },
+    { label: "Отчёты", href: "/portal/reports", hint: "Документы" },
+    { label: "Источники рекламы", href: "/integrations", hint: "Подключения и аккаунты" },
+    { label: "Синхронизация", href: "/sync-monitor", hint: "Обновление моих данных" },
+    { label: "Мои бюджеты", href: "/budgets", hint: "Финансовый контроль" },
+  ],
 } as const;
 
 export function AppTopTabs({
@@ -64,12 +73,14 @@ export function AppTopTabs({
   const role = (
     context?.role ||
     (pathname.startsWith("/portal") ? "client" : pathname.startsWith("/platform") ? "admin" : "agency")
-  ) as "admin" | "agency" | "client";
+  ) as "admin" | "agency" | "client" | "solo_client";
   const roleLabel =
     role === "admin"
       ? t(locale, "role_admin", "Администратор")
       : role === "client"
       ? t(locale, "role_client", "Клиент")
+      : role === "solo_client"
+      ? "Владелец клиента"
       : t(locale, "role_agency", "Агентство");
   const sectionLabels: Record<TabKey, string> = {
     dashboard: t(locale, "tab_dashboard", "Центр эффективности"),
@@ -94,6 +105,8 @@ export function AppTopTabs({
       ? "Найти агентство, клиента…"
       : role === "agency"
       ? "Найти клиента, аккаунт…"
+      : role === "solo_client"
+      ? "Найти отчёт, подключение…"
       : "Найти отчёт, раздел…";
 
   return (

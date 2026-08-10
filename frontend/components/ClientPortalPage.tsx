@@ -38,7 +38,7 @@ const PLATFORMS: Array<{ key: PlatformKey; label: string }> = [
 ];
 
 const TAB_META: Record<ClientPortalTab, { title: string; subtitle: string }> = {
-  overview: { title: "Результаты рекламы", subtitle: "Главные показатели, отклонения и текущая работа агентства" },
+  overview: { title: "Результаты рекламы", subtitle: "Главные показатели, отклонения и необходимые действия" },
   advertising: { title: "Реклама", subtitle: "Результаты по рекламным площадкам и аккаунтам" },
   leads: { title: "Лиды", subtitle: "Конверсии, полученные из рекламных площадок" },
   reports: { title: "Отчёты", subtitle: "Понятный отчёт по фактическим данным выбранного периода" },
@@ -189,7 +189,7 @@ function insightCopy(insight: OperationalInsight, currency: string) {
   if (insight.metrics?.fallback) {
     return {
       title: "Срочных действий не требуется",
-      reason: "Показатели находятся внутри заданных порогов. Агентство продолжает наблюдение.",
+      reason: "Показатели находятся внутри заданных порогов. Продолжайте наблюдение.",
     };
   }
   if (insight.action === "cap") {
@@ -283,6 +283,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   const [periodDays, setPeriodDays] = useState(30);
   const [warning, setWarning] = useState("");
   const [loading, setLoading] = useState(false);
+  const [soloClientMode, setSoloClientMode] = useState(false);
   const [clients, setClients] = useState<ClientOut[]>([]);
   const [selectedClientId, setSelectedClientId] = useState("");
   const [activePlatform, setActivePlatform] = useState<PlatformKey>("google");
@@ -313,15 +314,29 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
         setWarning("Сессия недействительна или истекла. Войдите снова.");
         return;
       }
-      if (context.role !== "client") {
+      if (context.role !== "client" && context.role !== "solo_client") {
         setWarning("Этот кабинет доступен только клиенту. Для администратора и агентства используется рабочая консоль.");
         return;
       }
 
-      const clientPayload = await req<unknown>("/clients?status=active");
       const availableIds = Array.isArray(context.accessible_client_ids)
         ? context.accessible_client_ids.filter((id): id is string => typeof id === "string")
         : [];
+      if (context.role === "solo_client" && new Set(availableIds).size !== 1) {
+        setClients([]);
+        setSelectedClientId("");
+        setOverview(null);
+        setAccounts([]);
+        setBudgets([]);
+        setActions([]);
+        setStats([]);
+        setInsights([]);
+        setWarning("Для самостоятельного кабинета должен быть назначен ровно один активный клиент.");
+        return;
+      }
+      setSoloClientMode(context.role === "solo_client");
+
+      const clientPayload = await req<unknown>("/clients?status=active");
       const availableClients = normalizeListPayload(
         clientPayload,
         isClientItem,
@@ -569,7 +584,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       <div className="app-shell">
         <AppSidebar
           active="dashboard"
-          subtitle={selectedClient?.name ? `${selectedClient.name} · клиентский кабинет` : "Клиентский кабинет"}
+          subtitle={selectedClient?.name
+            ? `${selectedClient.name} · ${soloClientMode ? "самостоятельный кабинет" : "клиентский кабинет"}`
+            : soloClientMode ? "Самостоятельный кабинет" : "Клиентский кабинет"}
         />
 
         <main className="content">
@@ -811,7 +828,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                 </article>
 
                 <aside className="panel">
-                  <h3>Что делает агентство</h3>
+                  <h3>{soloClientMode ? "Что нужно сделать" : "Что делает агентство"}</h3>
                   {headlineAction ? (
                     <div className="insight-card">
                       <div className="insight-head">
@@ -828,7 +845,11 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   ) : (
                     <div className="blueprint-note">
                       <strong>Активных действий нет</strong>
-                      <p>Когда агентство поставит изменение в работу, его состояние появится здесь.</p>
+                      <p>
+                        {soloClientMode
+                          ? "Когда появится необходимое действие, его состояние будет показано здесь."
+                          : "Когда агентство поставит изменение в работу, его состояние появится здесь."}
+                      </p>
                     </div>
                   )}
                 </aside>
@@ -959,7 +980,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                       <p><strong>{advertisingInsightCopy?.title}</strong></p>
                       <p>{advertisingInsightCopy?.reason}</p>
                       <p>
-                        <strong>Рекомендация агентству:</strong>
+                        <strong>{soloClientMode ? "Рекомендация:" : "Рекомендация агентству:"}</strong>
                         <br />
                         {actionLabel(advertisingInsight.action)}
                       </p>

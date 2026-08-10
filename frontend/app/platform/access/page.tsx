@@ -87,16 +87,26 @@ export default function PlatformAccessMapPage() {
         .includes(query);
     });
   }, [access, clientsById, search, usersById]);
+  const selectedUser = usersById.get(userId);
+  const selectedIsSoloClient = selectedUser?.role === "solo_client";
+  const selectedSoloAssignment = selectedIsSoloClient
+    ? access.find((item) => item.user_id === userId)
+    : undefined;
+  const effectiveClientId = selectedSoloAssignment?.client_id || clientId;
 
   async function assignAccess() {
-    if (!userId || !clientId) {
+    if (!userId || !effectiveClientId) {
       push("Выберите пользователя и клиента", "error");
       return;
     }
     try {
       await req<UserClientAccessOut>("/auth/internal/access", {
         method: "POST",
-        body: JSON.stringify({ user_id: userId, client_id: clientId, role }),
+        body: JSON.stringify({
+          user_id: userId,
+          client_id: effectiveClientId,
+          role: selectedIsSoloClient ? "client" : role,
+        }),
       });
       await loadData();
       push("Доступ назначен", "success");
@@ -137,19 +147,36 @@ export default function PlatformAccessMapPage() {
               </label>
               <label>
                 Клиент
-                <select value={clientId} onChange={(event) => setClientId(event.target.value)}>
+                <select
+                  value={effectiveClientId}
+                  onChange={(event) => setClientId(event.target.value)}
+                  disabled={Boolean(selectedSoloAssignment)}
+                >
                   {clients.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
                 </select>
               </label>
               <label>
                 Уровень
-                <select value={role} onChange={(event) => setRole(event.target.value as "agency" | "client")}>
-                  <option value="client">Клиент — только свой контур</option>
-                  <option value="agency">Агентство — рабочий доступ</option>
+                <select
+                  value={selectedIsSoloClient ? "client" : role}
+                  onChange={(event) => setRole(event.target.value as "agency" | "client")}
+                  disabled={selectedIsSoloClient}
+                >
+                  <option value="client">
+                    {selectedIsSoloClient ? "Соло-владелец — один клиент" : "Клиент — только свой контур"}
+                  </option>
+                  {!selectedIsSoloClient ? <option value="agency">Агентство — рабочий доступ</option> : null}
                 </select>
               </label>
               <button className="primary-btn" onClick={() => void assignAccess()}>Назначить</button>
             </div>
+            {selectedIsSoloClient ? (
+              <div className="muted-note">
+                {selectedSoloAssignment
+                  ? "Этот соло-владелец уже закреплён за клиентом. Чтобы сменить клиента, сначала удалите текущее назначение."
+                  : "Соло-владелец может быть связан ровно с одним активным клиентом. Он сможет управлять только его подключениями, синхронизацией и бюджетами."}
+              </div>
+            ) : null}
           </section>
 
           <section className="panel" style={{ marginTop: 12 }}>
@@ -185,7 +212,13 @@ export default function PlatformAccessMapPage() {
                         <td>{user?.name || item.user_id}<div className="muted-note">{user?.email || ""}</div></td>
                         <td>{user?.role || "—"}</td>
                         <td>{client?.name || item.client_id}</td>
-                        <td><span className="badge">{item.role === "agency" ? "Рабочий" : "Просмотр"}</span></td>
+                        <td>
+                          <span className="badge">
+                            {user?.role === "solo_client"
+                              ? "Соло-владелец"
+                              : item.role === "agency" ? "Рабочий" : "Просмотр"}
+                          </span>
+                        </td>
                         <td>{new Date(item.updated_at).toLocaleString("ru-RU")}</td>
                       </tr>
                     );

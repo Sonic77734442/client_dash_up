@@ -188,7 +188,10 @@ export default function SyncMonitorPage() {
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
-  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
+  const soloClient = agencyContext.role === "solo_client";
+  const beginScopedRequest = useScopeRequestGuard(
+    agencyContext.selectedAgencyId || agencyContext.managedClientId || agencyContext.role || "unknown",
+  );
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -211,6 +214,7 @@ export default function SyncMonitorPage() {
   const [overwriteConnectionKey, setOverwriteConnectionKey] = useState("");
   const [historyProgress, setHistoryProgress] = useState("");
   const currentRole = agencyContext.role || "unknown";
+  const actionClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -234,8 +238,17 @@ export default function SyncMonitorPage() {
           : agencyContext.portfolioError || agencyContext.error || "Для пользователя не найдено активное агентство.",
       );
     }
+    if (soloClient && !agencyContext.soloClientReady) {
+      setJobs([]);
+      setAccounts([]);
+      setClients([]);
+      setConnections([]);
+      setDiagnostics(null);
+      throw new Error("Для самостоятельного кабинета должен быть назначен ровно один активный клиент.");
+    }
+    const effectiveClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
     const diagParams = new URLSearchParams({ status: "active", limit: "500" });
-    if (discoverClientId) diagParams.set("client_id", discoverClientId);
+    if (effectiveClientId) diagParams.set("client_id", effectiveClientId);
     const [jobRows, accRows, clientRows, integrationsRows, diagnosticsRows, connectionsRows] = await Promise.all([
       req<{ items: AdAccountSyncJob[] }>(`/ad-accounts/sync/jobs?status=all&limit=500`),
       req<{ items: AdAccount[] }>("/ad-accounts?status=all"),
@@ -264,7 +277,7 @@ export default function SyncMonitorPage() {
     const allAccounts = requireItems<AdAccount>(accRows, "Рекламные аккаунты");
     const allClients = requireItems<ClientOut>(clientRows, "Клиенты");
     const allConnections = requireItems<IntegrationConnection>(connectionsRows, "Подключения");
-    const allowedClientIds = agencyContext.role === "agency"
+    const allowedClientIds = agencyContext.role === "agency" || soloClient
       ? new Set(agencyContext.clientIds)
       : null;
     const visibleClients = allowedClientIds
@@ -294,7 +307,7 @@ export default function SyncMonitorPage() {
       : diagnosticsRows;
     const visibleConnections = allowedClientIds
       ? allConnections.filter((connection) => (
-          (connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
+          (agencyContext.role === "agency" && connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
           || (connection.scope_type === "client" && !!connection.scope_id && allowedClientIds.has(connection.scope_id))
         ))
       : allConnections;
@@ -323,9 +336,12 @@ export default function SyncMonitorPage() {
     agencyContext.role,
     agencyContext.selectedAgencyId,
     agencyContext.selectionRequired,
+    agencyContext.managedClientId,
+    agencyContext.soloClientReady,
     beginScopedRequest,
     req,
     discoverClientId,
+    soloClient,
   ]);
 
   useEffect(() => {
@@ -467,6 +483,10 @@ export default function SyncMonitorPage() {
       push(agencySelectionRequiredMessage(), "info");
       return;
     }
+    if (soloClient && !agencyContext.soloClientReady) {
+      push("Для подключения должен быть назначен ровно один активный клиент.", "info");
+      return;
+    }
     setConnectProviderName(providerName);
     setConnectMode("add");
     setOverwriteConnectionKey("");
@@ -496,6 +516,10 @@ export default function SyncMonitorPage() {
       push(agencySelectionRequiredMessage(), "info");
       return;
     }
+    if (soloClient && !agencyContext.soloClientReady) {
+      push("Для подключения должен быть назначен ровно один активный клиент.", "info");
+      return;
+    }
     const key = overwriteConnectionKey.trim();
     if (connectMode === "overwrite" && !key) {
       push("Не удалось определить существующее подключение. Обновите страницу и попробуйте снова.", "info");
@@ -512,6 +536,8 @@ export default function SyncMonitorPage() {
     }
     if (currentRole === "agency") {
       q.set("agency_id", agencyContext.selectedAgencyId);
+    } else if (soloClient) {
+      q.set("client_id", agencyContext.managedClientId);
     }
     localStorage.setItem("ops_api_base", base);
     window.location.href = `${base}/auth/${connectProviderName}/start?${q.toString()}`;
@@ -526,9 +552,14 @@ export default function SyncMonitorPage() {
       push(agencyContext.portfolioError || agencySelectionRequiredMessage(), "info");
       return;
     }
-    const selectedClientId = clients.some((client) => client.id === discoverClientId) ? discoverClientId : "";
+    if (soloClient && !agencyContext.soloClientReady) {
+      push("Для обновления должен быть назначен ровно один активный клиент.", "info");
+      return;
+    }
+    const requestedClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
+    const selectedClientId = clients.some((client) => client.id === requestedClientId) ? requestedClientId : "";
     if (opts?.accountId && !accounts.some((account) => account.id === opts.accountId)) {
-      push("Этот рекламный аккаунт не входит в выбранное агентство.", "error");
+      push(soloClient ? "Этот рекламный аккаунт не входит в ваш кабинет." : "Этот рекламный аккаунт не входит в выбранное агентство.", "error");
       return;
     }
     if (!opts?.accountId && !selectedClientId) {
@@ -543,13 +574,13 @@ export default function SyncMonitorPage() {
       if (opts?.accountId) {
         payload.account_ids = [opts.accountId];
         payload.force = true;
-      } else if (currentRole === "agency") {
+      } else if (currentRole === "agency" || soloClient) {
         const scopedAccountIds = accounts
           .filter((account) => account.client_id === selectedClientId)
           .filter((account) => !opts?.platform || asSyncPlatform(account.platform) === opts.platform)
           .map((account) => account.id);
         if (!scopedAccountIds.length) {
-          push("У выбранного клиента нет рекламных аккаунтов для обновления.", "info");
+          push(soloClient ? "В вашем кабинете нет рекламных аккаунтов для обновления." : "У выбранного клиента нет рекламных аккаунтов для обновления.", "info");
           return;
         }
         payload.account_ids = scopedAccountIds;
@@ -583,15 +614,20 @@ export default function SyncMonitorPage() {
       push(agencySelectionRequiredMessage(), "info");
       return;
     }
-    if (discoverClientId && !clients.some((client) => client.id === discoverClientId)) {
+    if (soloClient && !agencyContext.soloClientReady) {
+      push("Для поиска аккаунтов должен быть назначен ровно один активный клиент.", "info");
+      return;
+    }
+    const targetClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
+    if (targetClientId && !clients.some((client) => client.id === targetClientId)) {
       setDiscoverClientId("");
-      push("Выберите клиента из текущего агентства.", "info");
+      push(soloClient ? "Ваш клиентский кабинет недоступен. Обновите страницу." : "Выберите клиента из текущего агентства.", "info");
       return;
     }
     try {
       setSyncLoading(true);
       const payload: Record<string, unknown> = { upsert_existing: true };
-      if (discoverClientId) payload.client_id = discoverClientId;
+      if (targetClientId) payload.client_id = targetClientId;
       if (currentRole === "agency") payload.agency_id = agencyContext.selectedAgencyId;
       if (providerName) payload.provider = providerName;
       const res = await req<AdAccountDiscoverResponse>("/ad-accounts/discover", {
@@ -619,7 +655,12 @@ export default function SyncMonitorPage() {
       push(agencyContext.portfolioError || agencySelectionRequiredMessage(), "info");
       return;
     }
-    const selectedClientId = clients.some((client) => client.id === discoverClientId) ? discoverClientId : "";
+    if (soloClient && !agencyContext.soloClientReady) {
+      push("Для загрузки истории должен быть назначен ровно один активный клиент.", "info");
+      return;
+    }
+    const requestedClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
+    const selectedClientId = clients.some((client) => client.id === requestedClientId) ? requestedClientId : "";
     if (!selectedClientId) {
       push("Выберите клиента перед загрузкой истории", "info");
       return;
@@ -652,12 +693,12 @@ export default function SyncMonitorPage() {
           date_from: b.date_from,
           date_to: b.date_to,
         };
-        if (currentRole === "agency") {
+        if (currentRole === "agency" || soloClient) {
           const scopedAccountIds = accounts
             .filter((account) => account.client_id === selectedClientId)
             .map((account) => account.id);
           if (!scopedAccountIds.length) {
-            push("У выбранного клиента нет рекламных аккаунтов для загрузки истории.", "info");
+            push(soloClient ? "В вашем кабинете нет рекламных аккаунтов для загрузки истории." : "У выбранного клиента нет рекламных аккаунтов для загрузки истории.", "info");
             return;
           }
           payload.account_ids = scopedAccountIds;
@@ -806,7 +847,12 @@ export default function SyncMonitorPage() {
                 </div>
               </div>
               <div className="data-connection-actions">
-                <label>
+                {soloClient ? (
+                  <div className="data-next-step success">
+                    <strong>Данные попадут в ваш кабинет</strong>
+                    <span>{clients.find((client) => client.id === agencyContext.managedClientId)?.name || "Проверяем назначенного клиента…"}</span>
+                  </div>
+                ) : <label>
                   <span>Клиент для найденных аккаунтов</span>
                 <select
                   value={discoverClientId}
@@ -820,11 +866,15 @@ export default function SyncMonitorPage() {
                     </option>
                   ))}
                 </select>
-                </label>
+                </label>}
                 <button
                   className="ghost-btn"
                   onClick={() => void discoverAccounts()}
-                  disabled={syncLoading || (currentRole === "agency" && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady))}
+                  disabled={
+                    syncLoading
+                    || (currentRole === "agency" && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady))
+                    || (soloClient && !agencyContext.soloClientReady)
+                  }
                 >
                   Найти аккаунты
                 </button>
@@ -887,8 +937,8 @@ export default function SyncMonitorPage() {
                             }
                             void runSync({ platform });
                           }}
-                          disabled={syncLoading || !discoverClientId}
-                          title={!discoverClientId ? "Сначала выберите клиента" : undefined}
+                          disabled={syncLoading || !actionClientId}
+                          title={!actionClientId ? "Сначала должен быть назначен клиент" : undefined}
                         >
                           Обновить {providerLabel(p.provider)}
                         </button>
@@ -917,16 +967,16 @@ export default function SyncMonitorPage() {
               <button
                 className="primary-btn"
                 onClick={() => void runSync()}
-                disabled={syncLoading || !discoverClientId}
-                title={!discoverClientId ? "Сначала выберите клиента" : undefined}
+                disabled={syncLoading || !actionClientId}
+                title={!actionClientId ? "Сначала должен быть назначен клиент" : undefined}
               >
                 {syncLoading ? "Обновляем…" : "Обновить данные за 30 дней"}
               </button>
               <button
                 className="ghost-btn"
                 onClick={() => void runFullHistorySync()}
-                disabled={syncLoading || !discoverClientId}
-                title={!discoverClientId ? "Сначала выберите клиента" : undefined}
+                disabled={syncLoading || !actionClientId}
+                title={!actionClientId ? "Сначала должен быть назначен клиент" : undefined}
               >
                 Загрузить историю
               </button>

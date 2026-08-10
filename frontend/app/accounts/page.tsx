@@ -97,8 +97,11 @@ export default function AccountsPage() {
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
-  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
-  const activeScopeKey = agencyContext.selectedAgencyId || agencyContext.role || "unknown";
+  const soloClient = agencyContext.role === "solo_client";
+  const beginScopedRequest = useScopeRequestGuard(
+    agencyContext.selectedAgencyId || agencyContext.managedClientId || agencyContext.role || "unknown",
+  );
+  const activeScopeKey = agencyContext.selectedAgencyId || agencyContext.managedClientId || agencyContext.role || "unknown";
   const activeScopeKeyRef = useRef(activeScopeKey);
   activeScopeKeyRef.current = activeScopeKey;
   const { toasts, push } = useToast();
@@ -150,6 +153,9 @@ export default function AccountsPage() {
           : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
       );
     }
+    if (soloClient && !agencyContext.soloClientReady) {
+      throw new Error("Для самостоятельного кабинета должен быть назначен ровно один активный клиент.");
+    }
     const conflictPath = agencyContext.role === "agency"
       ? `/ad-accounts/assignment-conflicts?agency_id=${encodeURIComponent(agencyContext.selectedAgencyId)}`
       : "/ad-accounts/assignment-conflicts";
@@ -162,7 +168,9 @@ export default function AccountsPage() {
         : Promise.resolve(EMPTY_CONFLICTS),
     ]);
     if (!isCurrentRequest()) return;
-    const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    const allowedClientIds = agencyContext.role === "agency" || soloClient
+      ? new Set(agencyContext.clientIds)
+      : null;
     const visibleClients = requireItems<ClientOut>(cls, "Клиенты").filter(
       (client) => !allowedClientIds || allowedClientIds.has(client.id),
     );
@@ -185,9 +193,11 @@ export default function AccountsPage() {
     agencyContext.role,
     agencyContext.selectedAgencyId,
     agencyContext.selectionRequired,
+    agencyContext.soloClientReady,
     beginScopedRequest,
     canManageConflicts,
     req,
+    soloClient,
   ]);
 
   useEffect(() => {
@@ -408,9 +418,14 @@ export default function AccountsPage() {
     const requestedIds = accountIds?.length ? accountIds : accounts.filter((account) => account.status === "active").map((account) => account.id);
     const targetIds = safeTargetIds(requestedIds);
     if (!targetIds.length) {
-      throw new Error("Нет рекламных аккаунтов, которые можно безопасно обновить. Сначала разберите конфликты привязки.");
+      throw new Error(
+        soloClient
+          ? "В вашем кабинете пока нет рекламных аккаунтов для обновления."
+          : "Нет рекламных аккаунтов, которые можно безопасно обновить. Сначала разберите конфликты привязки.",
+      );
     }
     if (targetIds.length) payload.account_ids = targetIds;
+    if (soloClient) payload.client_id = agencyContext.managedClientId;
     const result = await req<AdAccountSyncRunResponse>("/ad-accounts/sync/run", { method: "POST", body: JSON.stringify(payload) });
     await loadData();
     return result;
@@ -545,7 +560,9 @@ export default function AccountsPage() {
               <AppTopTabs active="accounts" sectionLabel="Источники рекламы" />
               <div className="topbar-title">Рекламные аккаунты</div>
               <div className="panel-subtitle">
-                Все кабинеты из подключённых платформ и их привязка к клиентам
+                {soloClient
+                  ? "Ваши рекламные кабинеты, их состояние и последние обновления"
+                  : "Все кабинеты из подключённых платформ и их привязка к клиентам"}
               </div>
             </div>
             <div className="session-controls">
@@ -588,10 +605,10 @@ export default function AccountsPage() {
 
           <section className="kpi-grid" style={{ marginTop: 12 }}>
             <article className="kpi-card"><div className="kpi-title">Всего в реестре</div><div className="kpi-value">{dataLoading ? "—" : kpis.total}</div><div className="kpi-meta">Все статусы: активные, неактивные и архивные</div></article>
-            <article className="kpi-card good"><div className="kpi-title">Привязаны к клиентам</div><div className="kpi-value">{dataLoading ? "—" : kpis.mapped}</div></article>
-            <article className="kpi-card warn"><div className="kpi-title">Без клиента</div><div className="kpi-value">{dataLoading ? "—" : kpis.unmapped}</div></article>
+            <article className="kpi-card good"><div className="kpi-title">{soloClient ? "В вашем кабинете" : "Привязаны к клиентам"}</div><div className="kpi-value">{dataLoading ? "—" : kpis.mapped}</div></article>
+            {!soloClient ? <article className="kpi-card warn"><div className="kpi-title">Без клиента</div><div className="kpi-value">{dataLoading ? "—" : kpis.unmapped}</div></article> : null}
             <article className={`kpi-card ${dataLoading ? "" : kpis.dataIssues ? "bad" : "good"}`}><div className="kpi-title">Проблемы данных</div><div className="kpi-value">{dataLoading ? "—" : kpis.dataIssues}</div><div className="kpi-meta">Ошибки, устаревшие или ещё не загруженные данные</div></article>
-            <article className={`kpi-card ${dataLoading ? "" : kpis.conflicted ? "bad" : "good"}`}>
+            {!soloClient ? <article className={`kpi-card ${dataLoading ? "" : kpis.conflicted ? "bad" : "good"}`}>
               <div className="kpi-title">Конфликты привязки</div>
               <div className="kpi-value">{dataLoading ? "—" : kpis.conflicted}</div>
               <div className="kpi-meta">Эти аккаунты исключены из обновления и отчётов до выбора правильного клиента</div>
@@ -604,10 +621,10 @@ export default function AccountsPage() {
                   Разобрать конфликты
                 </button>
               ) : null}
-            </article>
+            </article> : null}
           </section>
 
-          <section className="panel assignment-conflicts-panel" id="assignment-conflicts" style={{ marginTop: 12 }}>
+          {!soloClient ? <section className="panel assignment-conflicts-panel" id="assignment-conflicts" style={{ marginTop: 12 }}>
             <div className="assignment-conflicts-head">
               <div>
                 <div className="kpi-title">Контроль владельца рекламного аккаунта</div>
@@ -761,17 +778,17 @@ export default function AccountsPage() {
                 </article>
               );
             }) : null}
-          </section>
+          </section> : null}
 
           <section className="accounts-grid">
             <article className="panel accounts-main">
               <div className="chip-row" style={{ marginTop: 0 }}>
                 <button className={`chip-btn ${chip === "all" ? "active" : ""}`} onClick={() => setChip("all")}>Все</button>
-                <button className={`chip-btn ${chip === "unmapped" ? "active" : ""}`} onClick={() => setChip("unmapped")}>Без клиента</button>
+                {!soloClient ? <button className={`chip-btn ${chip === "unmapped" ? "active" : ""}`} onClick={() => setChip("unmapped")}>Без клиента</button> : null}
                 <button className={`chip-btn ${chip === "issues" ? "active" : ""}`} onClick={() => setChip("issues")}>С проблемами данных</button>
-                <button className={`chip-btn ${chip === "conflicts" ? "active" : ""}`} onClick={() => setChip("conflicts")}>
+                {!soloClient ? <button className={`chip-btn ${chip === "conflicts" ? "active" : ""}`} onClick={() => setChip("conflicts")}>
                   Конфликты {conflicts.summary.conflicted_accounts ? `(${conflicts.summary.conflicted_accounts})` : ""}
-                </button>
+                </button> : null}
                 <label>
                   Платформа
                   <select value={platform} onChange={(e) => setPlatform(e.target.value)}>
@@ -780,7 +797,7 @@ export default function AccountsPage() {
                     ))}
                   </select>
                 </label>
-                <label>
+                {!soloClient ? <label>
                   Клиент
                   <select value={clientId} onChange={(e) => setClientId(e.target.value)}>
                     <option value="all">Все</option>
@@ -788,21 +805,21 @@ export default function AccountsPage() {
                       <option key={c.id} value={c.id}>{c.name}</option>
                     ))}
                   </select>
-                </label>
+                </label> : null}
                 <input className="clientops-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Найти по названию или ID" />
               </div>
 
               <div className="alert-actions" style={{ marginTop: 10 }}>
                 <span className="muted-note" style={{ alignSelf: "center", marginRight: 8 }}>Для выбранных:</span>
-                <button
+                {!soloClient ? <button
                   className="mini-btn"
                   data-testid="bulk-assign-client"
                   disabled={!selectedCount}
                   onClick={() => openMapping()}
                 >
                   Назначить клиента
-                </button>
-                <button className="mini-btn" disabled={!selectedCount} onClick={() => void bulkArchive()}>Переместить в архив</button>
+                </button> : null}
+                {!soloClient ? <button className="mini-btn" disabled={!selectedCount} onClick={() => void bulkArchive()}>Переместить в архив</button> : null}
                 <button className="mini-btn" disabled={!selectedCount} onClick={() => void retrySyncSelected()}>Повторить обновление</button>
               </div>
 
@@ -892,7 +909,7 @@ export default function AccountsPage() {
                   </div>
 
                   <div className="panel" style={{ marginTop: 10 }}>
-                    <div className="kpi-title">Привязка к клиенту</div>
+                      <div className="kpi-title">{soloClient ? "Клиентский кабинет" : "Привязка к клиенту"}</div>
                     <div className="budgets-money-line">
                       <strong>
                         {conflictAccountIds.has(selected.id)
@@ -940,7 +957,7 @@ export default function AccountsPage() {
                     </div>
                   </div>
 
-                  {conflictAccountIds.has(selected.id) ? (
+                    {conflictAccountIds.has(selected.id) ? (
                     <div className="alert-card high">
                       <div className="alert-priority high">КОНФЛИКТ ПРИВЯЗКИ</div>
                       <div className="insight-text" style={{ marginTop: 8 }}>
@@ -955,9 +972,9 @@ export default function AccountsPage() {
                       </button>
                     </div>
                   ) : (
-                    <div className="budgets-detail-actions">
-                      <button className="primary-btn" onClick={() => openMapping([selected.id])}>Назначить клиента</button>
-                      <button className="ghost-btn" onClick={() => void retrySyncSelected([selected.id])}>Обновить ещё раз</button>
+                      <div className="budgets-detail-actions">
+                        {!soloClient ? <button className="primary-btn" onClick={() => openMapping([selected.id])}>Назначить клиента</button> : null}
+                        <button className="ghost-btn" onClick={() => void retrySyncSelected([selected.id])}>Обновить ещё раз</button>
                     </div>
                   )}
                 </>
@@ -967,7 +984,7 @@ export default function AccountsPage() {
         </main>
       </div>
 
-      <div className={`modal-backdrop ${mapOpen ? "" : "hidden-view"}`} onClick={() => !mapLoading && setMapOpen(false)}>
+      {!soloClient ? <div className={`modal-backdrop ${mapOpen ? "" : "hidden-view"}`} onClick={() => !mapLoading && setMapOpen(false)}>
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
@@ -995,7 +1012,7 @@ export default function AccountsPage() {
             </button>
           </div>
         </div>
-      </div>
+      </div> : null}
 
       <ToastHost toasts={toasts} />
     </>

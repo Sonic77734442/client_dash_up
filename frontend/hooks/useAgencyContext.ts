@@ -183,9 +183,11 @@ export function useAgencyContext(options: AgencyContextOptions = {}) {
     () => (
       role === "agency" && loadPortfolio && portfolioAgencyId === selectedAgencyId
         ? bindings.map((binding) => binding.client_id)
+        : role === "solo_client"
+          ? Array.from(new Set(sessionContext?.accessible_client_ids || []))
         : []
     ),
-    [bindings, loadPortfolio, portfolioAgencyId, role, selectedAgencyId],
+    [bindings, loadPortfolio, portfolioAgencyId, role, selectedAgencyId, sessionContext?.accessible_client_ids],
   );
   const loading = sessionLoading
     || (role === "agency" && agenciesLoading)
@@ -196,6 +198,8 @@ export function useAgencyContext(options: AgencyContextOptions = {}) {
       && (portfolioLoading || (!portfolioReady && !portfolioError))
     );
   const selectionRequired = role === "agency" && agencies.length > 1 && !selectedAgencyId;
+  const soloClientReady = role !== "solo_client" || clientIds.length === 1;
+  const managedClientId = role === "solo_client" && soloClientReady ? clientIds[0] : "";
 
   return {
     role,
@@ -209,6 +213,8 @@ export function useAgencyContext(options: AgencyContextOptions = {}) {
     portfolioReady,
     portfolioError,
     selectionRequired,
+    soloClientReady,
+    managedClientId,
     loading,
     error,
     setSelectedAgencyId,

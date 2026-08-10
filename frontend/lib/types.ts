@@ -350,7 +350,7 @@ export type SessionContext = {
   reason?: string | null;
   session_id?: string | null;
   user_id?: string | null;
-  role?: "admin" | "agency" | "client" | null;
+  role?: "admin" | "agency" | "client" | "solo_client" | null;
   global_access: boolean;
   access_scope?: "all" | "assigned" | null;
   accessible_client_ids: string[];
@@ -361,7 +361,7 @@ export type AuthUser = {
   id: string;
   email?: string | null;
   name: string;
-  role: "admin" | "agency" | "client";
+  role: "admin" | "agency" | "client" | "solo_client";
   status: "active" | "inactive";
   created_at?: string;
   updated_at?: string;

@@ -1,4 +1,4 @@
-export type AppRole = "admin" | "agency" | "client";
+export type AppRole = "admin" | "agency" | "client" | "solo_client";
 
 const SAFE_URL_ORIGIN = "https://client-dash-up.local";
 const PUBLIC_PATHS = new Set(["/login", "/login/success"]);
@@ -18,7 +18,7 @@ function matchesRoute(pathname: string, route: string): boolean {
 }
 
 export function isAppRole(value: unknown): value is AppRole {
-  return value === "admin" || value === "agency" || value === "client";
+  return value === "admin" || value === "agency" || value === "client" || value === "solo_client";
 }
 
 function pathnameFromRelativePath(path: string): string {
@@ -55,7 +55,7 @@ export function isPublicPath(pathname: string): boolean {
 
 export function homeForRole(role: AppRole): string {
   if (role === "admin") return "/platform";
-  if (role === "client") return "/portal";
+  if (role === "client" || role === "solo_client") return "/portal";
   return "/";
 }
 
@@ -67,7 +67,14 @@ export function isPathAllowedForRole(role: AppRole, pathname: string): boolean {
   }
 
   if (matchesRoute(pathname, "/portal")) {
-    return role === "client";
+    return role === "client" || role === "solo_client";
+  }
+
+  if (
+    role === "solo_client"
+    && ["/integrations", "/accounts", "/sync-monitor", "/budgets"].some((route) => matchesRoute(pathname, route))
+  ) {
+    return true;
   }
 
   if (pathname === "/" || WORKSPACE_PREFIXES.some((route) => matchesRoute(pathname, route))) {

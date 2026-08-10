@@ -21,7 +21,7 @@ function readRole(payload: unknown): AppRole | null {
   const user = (payload as { user?: unknown }).user;
   if (!user || typeof user !== "object") return null;
   const role = (user as { role?: unknown }).role;
-  return role === "admin" || role === "agency" || role === "client" ? role : null;
+  return role === "admin" || role === "agency" || role === "client" || role === "solo_client" ? role : null;
 }
 
 export default function LoginPage() {

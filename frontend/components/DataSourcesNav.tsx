@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useSessionContext } from "../hooks/useSessionContext";
 
 type DataSourcesSection = "overview" | "accounts" | "sync";
 
@@ -35,6 +36,8 @@ const sections: Array<{
 ];
 
 export function DataSourcesNav({ active }: { active: DataSourcesSection }) {
+  const { context } = useSessionContext();
+  const soloClient = context?.role === "solo_client";
   return (
     <nav className="data-sources-nav" aria-label="Разделы источников рекламы">
       {sections.map((section) => {
@@ -49,7 +52,13 @@ export function DataSourcesNav({ active }: { active: DataSourcesSection }) {
             <span className="data-sources-nav-step">{section.step}</span>
             <span className="data-sources-nav-copy">
               <strong>{section.title}</strong>
-              <small>{section.description}</small>
+              <small>
+                {soloClient && section.key === "accounts"
+                  ? "Ваши подключённые кабинеты"
+                  : soloClient && section.key === "sync"
+                    ? "Обновление ваших данных и ошибки"
+                    : section.description}
+              </small>
             </span>
           </Link>
         );

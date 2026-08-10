@@ -20,7 +20,11 @@ async function postWithRateLimitRetry(
   return request.post(url, options);
 }
 
-async function createUser(request: APIRequestContext, role: "admin" | "agency" | "client", email: string) {
+async function createUser(
+  request: APIRequestContext,
+  role: "admin" | "agency" | "client" | "solo_client",
+  email: string,
+) {
   const res = await postWithRateLimitRetry(request, `${API_BASE}/auth/internal/users`, {
     data: { email, name: `${role}-smoke`, role, status: "active" },
   });
@@ -78,6 +82,48 @@ export async function createClientSessionWithAccess(request: APIRequestContext) 
   if (!grantRes.ok()) throw new Error(`assign_access_failed:${grantRes.status()}`);
 
   return issueToken(request, user.id);
+}
+
+export async function createSoloClientSessionWithAccess(request: APIRequestContext) {
+  const adminToken = await createAdminSession(request);
+  const adminAuth = { Authorization: `Bearer ${adminToken}` };
+  const stamp = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const clientName = `solo-tenant-${stamp}`;
+  const clientRes = await request.post(`${API_BASE}/clients`, {
+    headers: adminAuth,
+    data: { name: clientName, status: "active", default_currency: "USD" },
+  });
+  if (!clientRes.ok()) throw new Error(`create_solo_client_failed:${clientRes.status()}`);
+  const client = (await clientRes.json()) as { id: string };
+
+  const user = await createUser(request, "solo_client", `solo-owner-${stamp}@test.local`);
+  const grantRes = await postWithRateLimitRetry(request, `${API_BASE}/auth/internal/access`, {
+    headers: adminAuth,
+    data: { user_id: user.id, client_id: client.id, role: "client" },
+  });
+  if (!grantRes.ok()) throw new Error(`assign_solo_access_failed:${grantRes.status()}`);
+
+  const accountRes = await postWithRateLimitRetry(request, `${API_BASE}/ad-accounts`, {
+    headers: adminAuth,
+    data: {
+      client_id: client.id,
+      platform: "google",
+      external_account_id: `solo-${stamp}`,
+      name: `Solo Google Ads ${stamp}`,
+      currency: "USD",
+      status: "active",
+    },
+  });
+  if (!accountRes.ok()) throw new Error(`create_solo_account_failed:${accountRes.status()}`);
+  const account = (await accountRes.json()) as { id: string };
+
+  return {
+    token: await issueToken(request, user.id),
+    clientId: client.id,
+    clientName,
+    accountId: account.id,
+  };
 }
 
 export async function createAgencySessionWithAccess(request: APIRequestContext) {

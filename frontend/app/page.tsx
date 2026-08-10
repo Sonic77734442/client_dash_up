@@ -205,7 +205,7 @@ export default function HomePage() {
 
   const [warning, setWarning] = useState("");
   const [authResolved, setAuthResolved] = useState(false);
-  const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "unknown">("unknown");
+  const [currentRole, setCurrentRole] = useState<"admin" | "agency" | "client" | "solo_client" | "unknown">("unknown");
   const [adminMetricsMode, setAdminMetricsMode] = useState(false);
 
   const [clientOpsSearch, setClientOpsSearch] = useState("");
@@ -362,7 +362,7 @@ export default function HomePage() {
     if (!ready || agencyContext.loading) return;
     void resolveAuth()
       .then((role) => {
-        if (role === "client") {
+        if (role === "client" || role === "solo_client") {
           router.replace("/portal");
           return;
         }

@@ -8,7 +8,7 @@ import time
 import os
 from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
@@ -249,6 +249,7 @@ app = FastAPI(
 
 app.state.login_auto_sync_state = {}
 app.state.login_auto_sync_lock = threading.Lock()
+app.state.solo_workspace_lock = threading.Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -280,6 +281,19 @@ def _resolve_provider_credentials(
     agency_id: Optional[UUID] = None,
 ) -> Optional[dict]:
     rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    if user_id is not None:
+        requesting_user = _auth_store().get_user(user_id)
+        if requesting_user and requesting_user.role == "solo_client":
+            owned_client_id = _solo_owner_client_id_for_user(user_id)
+            if client_id != owned_client_id:
+                raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential tenant mismatch"})
+            rows = [
+                row
+                for row in rows
+                if row.scope_type == "client"
+                and row.scope_id == owned_client_id
+                and row.created_by == user_id
+            ]
     if agency_id is not None:
         rows = [
             row
@@ -298,6 +312,19 @@ def _resolve_provider_credentials_candidates(
     agency_id: Optional[UUID] = None,
 ) -> List[dict]:
     rows = integration_credential_store.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+    if user_id is not None:
+        requesting_user = _auth_store().get_user(user_id)
+        if requesting_user and requesting_user.role == "solo_client":
+            owned_client_id = _solo_owner_client_id_for_user(user_id)
+            if client_id != owned_client_id:
+                raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential tenant mismatch"})
+            rows = [
+                row
+                for row in rows
+                if row.scope_type == "client"
+                and row.scope_id == owned_client_id
+                and row.created_by == user_id
+            ]
     if agency_id is not None:
         rows = [
             row
@@ -508,8 +535,20 @@ def _visible_integration_credentials_for_ctx(
     rows = _integration_credential_store().list(status=status, provider=provider)
     if ctx.role == "admin":
         return rows
+    if ctx.role == "solo_client":
+        client_id = _solo_owner_client_id_for_context(ctx)
+        return [
+            row
+            for row in rows
+            if row.scope_type == "client"
+            and row.scope_id == client_id
+            and row.created_by == ctx.user_id
+        ]
     if ctx.role != "agency":
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "This role cannot manage advertising connections"},
+        )
     agency_ids = {str(x) for x in _agency_scope_ids_for_user(ctx.user_id)}
     return [
         x
@@ -521,8 +560,23 @@ def _visible_integration_credentials_for_ctx(
 def _ensure_credential_manage_access(ctx: RequestContext, row: IntegrationCredentialOut) -> None:
     if ctx.role == "admin":
         return
+    if ctx.role == "solo_client":
+        client_id = _solo_owner_client_id_for_context(ctx)
+        if (
+            row.scope_type == "client"
+            and row.scope_id == client_id
+            and row.created_by == ctx.user_id
+        ):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Credential scope access denied"},
+        )
     if ctx.role != "agency":
-        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Agency/admin access required"})
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "This role cannot manage advertising connections"},
+        )
     if row.scope_type != "agency" or not row.scope_id:
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential scope access denied"})
     _resolve_agency_context_for_user(ctx.user_id, row.scope_id, require_manage=True)
@@ -791,6 +845,19 @@ def use_inmemory_stores():
         agency_id: Optional[UUID] = None,
     ) -> Optional[dict]:
         rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        if user_id is not None:
+            requesting_user = _auth_store().get_user(user_id)
+            if requesting_user and requesting_user.role == "solo_client":
+                owned_client_id = _solo_owner_client_id_for_user(user_id)
+                if client_id != owned_client_id:
+                    raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential tenant mismatch"})
+                rows = [
+                    row
+                    for row in rows
+                    if row.scope_type == "client"
+                    and row.scope_id == owned_client_id
+                    and row.created_by == user_id
+                ]
         if agency_id is not None:
             rows = [
                 row
@@ -807,6 +874,19 @@ def use_inmemory_stores():
         agency_id: Optional[UUID] = None,
     ) -> List[dict]:
         rows = integration_creds.resolve_many_for_client(provider=provider, client_id=client_id, user_id=user_id)
+        if user_id is not None:
+            requesting_user = _auth_store().get_user(user_id)
+            if requesting_user and requesting_user.role == "solo_client":
+                owned_client_id = _solo_owner_client_id_for_user(user_id)
+                if client_id != owned_client_id:
+                    raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Credential tenant mismatch"})
+                rows = [
+                    row
+                    for row in rows
+                    if row.scope_type == "client"
+                    and row.scope_id == owned_client_id
+                    and row.created_by == user_id
+                ]
         if agency_id is not None:
             rows = [
                 row
@@ -1035,11 +1115,19 @@ def _run_login_auto_sync(user_id: UUID, client_ids: List[UUID], state_key: str) 
 def _schedule_login_auto_sync(background_tasks: Optional[BackgroundTasks], session: SessionContextResponse) -> None:
     if not LOGIN_AUTO_SYNC_ENABLED or _sync_automation_enabled() or background_tasks is None:
         return
-    if not session.valid or session.role != "agency" or not session.user_id or not session.accessible_client_ids:
+    if (
+        not session.valid
+        or session.role not in {"agency", "solo_client"}
+        or not session.user_id
+        or not session.accessible_client_ids
+    ):
         return
 
     user_id = session.user_id
-    client_ids = sorted(set(session.accessible_client_ids), key=lambda value: str(value))
+    if session.role == "solo_client":
+        client_ids = [_solo_owner_client_id_for_user(user_id, session.accessible_client_ids)]
+    else:
+        client_ids = sorted(set(session.accessible_client_ids), key=lambda value: str(value))
     state_key = f"{user_id}:{','.join(str(client_id) for client_id in client_ids)}"
     now_ts = time.time()
     with app.state.login_auto_sync_lock:
@@ -1302,16 +1390,36 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
     )
 
 
-def _active_agency_memberships_for_user(user_id: UUID) -> List[tuple[UUID, AgencyMemberOut]]:
+def _active_agency_memberships_for_user(
+    user_id: UUID,
+    *,
+    fail_closed: bool = False,
+) -> List[tuple[UUID, AgencyMemberOut]]:
     out: List[tuple[UUID, AgencyMemberOut]] = []
     try:
         agencies = _platform_admin_store().list_agencies(status="active")
     except Exception as exc:
+        if fail_closed:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "agency_membership_check_failed",
+                    "message": "Cannot verify solo owner agency isolation",
+                },
+            ) from exc
         return out
     for agency in agencies:
         try:
             members = _platform_admin_store().list_members(agency.id)
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "agency_membership_check_failed",
+                        "message": "Cannot verify solo owner agency isolation",
+                    },
+                ) from exc
             continue
         member = next((m for m in members if m.user_id == user_id and m.status == "active"), None)
         if member:
@@ -1321,6 +1429,78 @@ def _active_agency_memberships_for_user(user_id: UUID) -> List[tuple[UUID, Agenc
 
 def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
     return [agency_id for agency_id, _member in _active_agency_memberships_for_user(user_id)]
+
+
+def _solo_owner_client_id_for_user(
+    user_id: UUID,
+    accessible_client_ids: Optional[Iterable[UUID]] = None,
+) -> UUID:
+    """Resolve the only active tenant a solo owner may operate.
+
+    Role alone never grants write capability. The user must have exactly one
+    active assigned client and no active agency membership. This fail-closed
+    check is repeated at every provider/budget write boundary and again after
+    an OAuth round trip.
+    """
+    user = _auth_store().get_user(user_id)
+    if not user or user.status != "active" or user.role != "solo_client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "solo_owner_required", "message": "Solo client owner access required"},
+        )
+    if _active_agency_memberships_for_user(user_id, fail_closed=True):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "solo_owner_agency_conflict",
+                "message": "A solo client owner cannot have an active agency membership",
+            },
+        )
+    live_access_rows = [
+        row
+        for row in _auth_store().list_client_access(user_id=user_id)
+        if (client := _client_store().get(row.client_id)) is not None and client.status == "active"
+    ]
+    active_ids = {row.client_id for row in live_access_rows}
+    valid_access_role = len(live_access_rows) == 1 and live_access_rows[0].role == "client"
+    if len(active_ids) != 1 or not valid_access_role:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "solo_owner_scope_invalid",
+                "message": "Solo client owner must have exactly one active client workspace",
+                "details": {
+                    "active_client_count": len(active_ids),
+                    "access_role": live_access_rows[0].role if len(live_access_rows) == 1 else None,
+                },
+            },
+        )
+    selected_client_id = next(iter(active_ids))
+    if accessible_client_ids is not None and set(accessible_client_ids) != {selected_client_id}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "solo_owner_scope_stale",
+                "message": "Solo client session scope no longer matches live tenant access",
+            },
+        )
+    return selected_client_id
+
+
+def _solo_owner_client_id_for_context(ctx: RequestContext) -> UUID:
+    if ctx.role != "solo_client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "solo_owner_required", "message": "Solo client owner access required"},
+        )
+    return _solo_owner_client_id_for_user(ctx.user_id, ctx.accessible_client_ids)
+
+
+def _ensure_budget_write_access(ctx: RequestContext) -> None:
+    if ctx.role == "solo_client":
+        _solo_owner_client_id_for_context(ctx)
+        return
+    ensure_tenant_write_access(ctx)
 
 
 def _resolve_agency_context_for_user(
@@ -1462,6 +1642,7 @@ def _auto_upsert_integration_credentials(
     connect_mode: str = "add",
     requested_connection_key: Optional[str] = None,
     agency_id: Optional[UUID],
+    client_id: Optional[UUID],
     oauth_tokens: Optional[dict],
     cfg: OAuthProviderConfig,
 ) -> None:
@@ -1496,6 +1677,56 @@ def _auto_upsert_integration_credentials(
                 provider=provider_norm,
                 scope_type="agency",
                 scope_id=selected_agency_id,
+                connection_key=connection_key,
+                credentials=credentials,
+                created_by=user.id,
+            )
+        )
+        return
+    if user.role == "solo_client":
+        selected_client_id = _solo_owner_client_id_for_user(user.id)
+        if client_id is None or client_id != selected_client_id or agency_id is not None:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "solo_owner_client_mismatch",
+                    "message": "OAuth client scope changed before the connection was saved",
+                },
+            )
+        base_connection_key = _connection_key_for_credentials()
+        owner_prefix = f"solo:{user.id}:"
+        if connect_mode == "overwrite":
+            if not base_connection_key.startswith(owner_prefix):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "credential_overwrite_forbidden",
+                        "message": "Solo client can overwrite only a connection created by the same owner",
+                    },
+                )
+            existing = _integration_credential_store().list(
+                status="all",
+                provider=provider_norm,
+                scope_type="client",
+                scope_id=selected_client_id,
+            )
+            target = next((row for row in existing if row.connection_key == base_connection_key), None)
+            if not target or target.created_by != user.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "credential_overwrite_forbidden",
+                        "message": "Solo client can overwrite only an existing own connection",
+                    },
+                )
+            connection_key = base_connection_key
+        else:
+            connection_key = f"{owner_prefix}{base_connection_key}"
+        _integration_credential_store().upsert(
+            IntegrationCredentialCreate(
+                provider=provider_norm,
+                scope_type="client",
+                scope_id=selected_client_id,
                 connection_key=connection_key,
                 credentials=credentials,
                 created_by=user.id,
@@ -1859,12 +2090,20 @@ def _with_oauth_connect_options(
     connect_mode: str,
     connection_key: Optional[str],
     agency_id: Optional[UUID],
+    client_id: Optional[UUID],
 ) -> str:
     parsed = urlsplit(_normalize_next_path(next_path))
     query_items = [
         (k, v)
         for (k, v) in parse_qsl(parsed.query, keep_blank_values=True)
-        if k not in {"ops_oauth_intent", "ops_connect_mode", "ops_connection_key", "ops_agency_id"}
+        if k
+        not in {
+            "ops_oauth_intent",
+            "ops_connect_mode",
+            "ops_connection_key",
+            "ops_agency_id",
+            "ops_client_id",
+        }
     ]
     normalized_intent = (intent or "login").strip().lower()
     if normalized_intent not in {"login", "connect"}:
@@ -1879,17 +2118,20 @@ def _with_oauth_connect_options(
         query_items.append(("ops_connection_key", key))
     if normalized_intent == "connect" and agency_id is not None:
         query_items.append(("ops_agency_id", str(agency_id)))
+    if normalized_intent == "connect" and client_id is not None:
+        query_items.append(("ops_client_id", str(client_id)))
     return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
 
 
 def _extract_oauth_connect_options(
     next_path: str,
-) -> tuple[str, str, str, Optional[str], Optional[UUID]]:
+) -> tuple[str, str, str, Optional[str], Optional[UUID], Optional[UUID]]:
     parsed = urlsplit(_normalize_next_path(next_path))
     intent = "login"
     mode = "add"
     key: Optional[str] = None
     agency_id: Optional[UUID] = None
+    client_id: Optional[UUID] = None
     clean_items: List[tuple[str, str]] = []
     for k, v in parse_qsl(parsed.query, keep_blank_values=True):
         if k == "ops_oauth_intent":
@@ -1915,11 +2157,19 @@ def _extract_oauth_connect_options(
                 except ValueError:
                     agency_id = None
             continue
+        if k == "ops_client_id":
+            candidate = str(v or "").strip()
+            if candidate:
+                try:
+                    client_id = UUID(candidate)
+                except ValueError:
+                    client_id = None
+            continue
         clean_items.append((k, v))
     if mode == "overwrite" and not key:
         mode = "add"
     clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
-    return clean_next, intent, mode, key, agency_id
+    return clean_next, intent, mode, key, agency_id, client_id
 
 
 def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
@@ -1986,7 +2236,7 @@ def _auto_provision_facebook_client(
             UserCreate(
                 email=canonical_email,
                 name=display_name,
-                role="client",
+                role="solo_client",
                 status="active",
             )
         )
@@ -2032,6 +2282,110 @@ def _auto_provision_facebook_client(
         if concurrent_user:
             return concurrent_user
         raise
+
+
+def _ensure_solo_client_workspace(user: UserOut, *, provider: str) -> UUID:
+    """Provision exactly one workspace for a direct OAuth signup.
+
+    Invited users are created separately with the read-only ``client`` role;
+    this helper is only called for an explicit ``solo_client`` identity.
+    """
+    if user.role != "solo_client" or user.status != "active":
+        raise HTTPException(status_code=403, detail="Active solo client owner required")
+    auth = _auth_store()
+    clients = _client_store()
+    if (
+        isinstance(auth, SqliteAuthStore)
+        and isinstance(clients, SqliteClientStore)
+        and auth.db_path == clients.db_path
+    ):
+        now = _utcnow().isoformat()
+        created_client_id: Optional[UUID] = None
+        with sqlite_conn(auth.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_user = conn.execute(
+                "SELECT role, status FROM users WHERE id=?",
+                (str(user.id),),
+            ).fetchone()
+            if not current_user or current_user["role"] != "solo_client" or current_user["status"] != "active":
+                raise HTTPException(status_code=403, detail="Active solo client owner required")
+            agency_membership = conn.execute(
+                """
+                SELECT 1 FROM agency_members am
+                JOIN agencies a ON a.id=am.agency_id
+                WHERE am.user_id=? AND am.status='active' AND a.status='active'
+                LIMIT 1
+                """,
+                (str(user.id),),
+            ).fetchone()
+            if agency_membership:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "solo_owner_agency_conflict", "message": "Solo owner cannot belong to an agency"},
+                )
+            access_rows = conn.execute(
+                "SELECT client_id FROM user_client_access WHERE user_id=?",
+                (str(user.id),),
+            ).fetchall()
+            if not access_rows:
+                created_client_id = uuid4()
+                conn.execute(
+                    """
+                    INSERT INTO clients
+                      (id, name, legal_name, status, default_currency, timezone, notes, created_at, updated_at)
+                    VALUES (?, ?, NULL, 'active', 'USD', NULL, ?, ?, ?)
+                    """,
+                    (
+                        str(created_client_id),
+                        user.name,
+                        f"Auto-provisioned via {provider.title()} Login",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO user_client_access
+                      (id, user_id, client_id, role, created_at, updated_at)
+                    VALUES (?, ?, ?, 'client', ?, ?)
+                    """,
+                    (str(uuid4()), str(user.id), str(created_client_id), now, now),
+                )
+            conn.commit()
+        if created_client_id is not None:
+            return created_client_id
+        return _solo_owner_client_id_for_user(user.id)
+
+    # In-memory/test stores use a process lock to preserve the same invariant.
+    with app.state.solo_workspace_lock:
+        access_rows = auth.list_client_access(user_id=user.id)
+        if access_rows:
+            return _solo_owner_client_id_for_user(user.id, [row.client_id for row in access_rows])
+        if _active_agency_memberships_for_user(user.id, fail_closed=True):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "solo_owner_agency_conflict", "message": "Solo owner cannot belong to an agency"},
+            )
+        created_client = clients.create(
+            ClientCreate(
+                name=user.name,
+                status="active",
+                default_currency="USD",
+                notes=f"Auto-provisioned via {provider.title()} Login",
+            )
+        )
+        try:
+            auth.assign_client_access(
+                UserClientAccessCreate(
+                    user_id=user.id,
+                    client_id=created_client.id,
+                    role="client",
+                )
+            )
+        except Exception:
+            clients.archive(created_client.id)
+            raise
+        return created_client.id
 
 
 def _cookie_samesite_value() -> str:
@@ -2091,10 +2445,14 @@ def _restrict_archived_client_scope(session: SessionContextResponse) -> SessionC
     # Agencies keep archived-client scope so they can restore workspaces. A
     # client user must lose live tenant access as soon as that workspace is
     # archived or suspended.
-    if session.role != "client" or session.global_access:
+    if session.role not in {"client", "solo_client"} or session.global_access:
         return session
     active_client_ids = {client.id for client in _client_store().list(status="active")}
     accessible = [client_id for client_id in session.accessible_client_ids if client_id in active_client_ids]
+    if session.role == "solo_client" and len(set(accessible)) != 1:
+        # A mis-provisioned solo owner must never gain a multi-tenant read
+        # scope. Capability endpoints provide an actionable 409 separately.
+        accessible = []
     if accessible == list(session.accessible_client_ids):
         return session
     return session.model_copy(update={"accessible_client_ids": accessible})
@@ -2332,6 +2690,24 @@ def _resolve_discovery_client_id(
     requested_client_id: Optional[UUID],
     requested_agency_id: Optional[UUID] = None,
 ) -> UUID:
+    if ctx.role == "solo_client":
+        if requested_agency_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "agency_context_not_applicable", "message": "Solo client has no agency context"},
+            )
+        owned_client_id = _solo_owner_client_id_for_context(ctx)
+        if requested_client_id is not None and requested_client_id != owned_client_id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "forbidden",
+                    "message": "Discovery target is outside the owned client workspace",
+                    "details": {"client_id": str(requested_client_id)},
+                },
+            )
+        return owned_client_id
+
     selected_agency_id: Optional[UUID] = None
     if ctx.role == "agency":
         if not ctx.user_id:
@@ -2587,6 +2963,28 @@ def auth_patch_user(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
+    if payload.role == "solo_client" and (payload.status is None or payload.status == "active"):
+        if _active_agency_memberships_for_user(user_id, fail_closed=True):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "solo_owner_agency_conflict",
+                    "message": "Remove active agency memberships before assigning solo client role",
+                },
+            )
+        active_access = [
+            row
+            for row in _auth_store().list_client_access(user_id=user_id)
+            if (client := _client_store().get(row.client_id)) is not None and client.status == "active"
+        ]
+        if len(active_access) > 1 or any(row.role != "client" for row in active_access):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "solo_owner_provisioning_conflict",
+                    "message": "Solo client may have at most one active client grant with client access role",
+                },
+            )
     return _auth_store().patch_user(user_id, payload)
 
 
@@ -2639,6 +3037,17 @@ def auth_assign_access(
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
     _enforce_internal_admin(ctx)
+    target_user = _auth_store().get_user(payload.user_id)
+    target_client = _client_store().get(payload.client_id)
+    if target_user and target_user.role == "solo_client":
+        if payload.role != "client" or not target_client or target_client.status != "active":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "solo_owner_provisioning_conflict",
+                    "message": "Solo client access requires an active client and client access role",
+                },
+            )
     row = _auth_store().assign_client_access(payload)
     _audit_event(
         event_type="access.assigned",
@@ -2674,7 +3083,7 @@ def auth_issue_session(
 ):
     _enforce_internal_admin(ctx)
     issued = _auth_store().issue_session(payload)
-    session_ctx = _auth_facade().get_session_context(issued.token)
+    session_ctx = _restrict_archived_client_scope(_auth_facade().get_session_context(issued.token))
     _schedule_login_auto_sync(background_tasks, session_ctx)
     return issued
 
@@ -2776,7 +3185,7 @@ def auth_password_login(payload: AuthPasswordLoginRequest, background_tasks: Bac
             metadata={"auth_method": "password"},
         )
     )
-    session_ctx = _auth_facade().get_session_context(issued.token)
+    session_ctx = _restrict_archived_client_scope(_auth_facade().get_session_context(issued.token))
     if not session_ctx.valid:
         raise HTTPException(status_code=500, detail="Session context failed")
     _schedule_login_auto_sync(background_tasks, session_ctx)
@@ -2884,12 +3293,14 @@ def auth_oauth_start(
     connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
     connection_key: Optional[str] = Query(default=None),
     agency_id: Optional[UUID] = Query(default=None),
+    client_id: Optional[UUID] = Query(default=None),
 ):
     adapters = _oauth_adapters()
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
     selected_agency_id: Optional[UUID] = None
+    selected_client_id: Optional[UUID] = None
     initiator_user_id: Optional[UUID] = None
     if intent == "connect":
         current_token = _get_session_token(
@@ -2904,23 +3315,53 @@ def auth_oauth_start(
                 status_code=401,
                 detail={"code": "session_required", "message": "Sign in before connecting an advertising account"},
             )
-        if current_ctx.role not in {"admin", "agency"}:
+        if current_ctx.role not in {"admin", "agency", "solo_client"}:
             raise HTTPException(
                 status_code=403,
                 detail={"code": "provider_connect_forbidden", "message": "This role cannot connect advertising accounts"},
             )
         if current_ctx.role == "agency":
+            if client_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "client_context_not_applicable",
+                        "message": "Agency OAuth connections use agency scope and do not accept client_id",
+                    },
+                )
             selected_agency_id = _resolve_agency_context_for_user(
                 current_ctx.user_id,
                 agency_id,
                 require_manage=True,
             )
-        elif agency_id is not None:
+        elif current_ctx.role == "solo_client":
+            if agency_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "agency_context_not_applicable",
+                        "message": "Solo client OAuth connections do not accept agency_id",
+                    },
+                )
+            selected_client_id = _solo_owner_client_id_for_user(
+                current_ctx.user_id,
+                current_ctx.accessible_client_ids,
+            )
+            if client_id is None or client_id != selected_client_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "solo_owner_client_mismatch",
+                        "message": "Select the sole active client workspace before connecting",
+                        "details": {"client_id": str(selected_client_id)},
+                    },
+                )
+        elif agency_id is not None or client_id is not None:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "code": "agency_context_not_applicable",
-                    "message": "Admin OAuth connections use global scope and do not accept agency_id",
+                    "code": "tenant_context_not_applicable",
+                    "message": "Admin OAuth connections use global scope and do not accept agency_id or client_id",
                 },
             )
         initiator_user_id = current_ctx.user_id
@@ -2931,6 +3372,7 @@ def auth_oauth_start(
         connect_mode=connect_mode,
         connection_key=connection_key,
         agency_id=selected_agency_id,
+        client_id=selected_client_id,
     )
     nonce = secrets.token_urlsafe(24)
     state = _oauth_state_store().create_state(
@@ -2990,6 +3432,7 @@ def auth_oauth_callback(
         connect_mode,
         requested_connection_key,
         requested_agency_id,
+        requested_client_id,
     ) = _extract_oauth_connect_options(consumed.next_path or "/")
     current_ctx = None
     if oauth_intent == "connect":
@@ -3008,6 +3451,20 @@ def auth_oauth_callback(
             or current_ctx.user_id != consumed.initiator_user_id
         ):
             return _oauth_error_redirect("session_mismatch")
+        if current_ctx.role == "solo_client":
+            try:
+                current_client_id = _solo_owner_client_id_for_user(
+                    current_ctx.user_id,
+                    current_ctx.accessible_client_ids,
+                )
+            except HTTPException:
+                return _oauth_error_redirect("access_denied")
+            if requested_client_id is None or requested_client_id != current_client_id:
+                return _oauth_error_redirect("access_denied")
+            if requested_agency_id is not None:
+                return _oauth_error_redirect("access_denied")
+        elif requested_client_id is not None:
+            return _oauth_error_redirect("access_denied")
     if error:
         return _oauth_error_redirect(error)
     if not code:
@@ -3025,7 +3482,7 @@ def auth_oauth_callback(
         current_user = _auth_store().get_user(current_ctx.user_id)
         if not current_user:
             return _oauth_error_redirect("session_required")
-        if current_user.role not in {"admin", "agency"}:
+        if current_user.role not in {"admin", "agency", "solo_client"}:
             return _oauth_error_redirect("provider_error")
         _auto_upsert_integration_credentials(
             provider=provider,
@@ -3034,6 +3491,7 @@ def auth_oauth_callback(
             connect_mode=connect_mode,
             requested_connection_key=requested_connection_key,
             agency_id=requested_agency_id,
+            client_id=requested_client_id,
             oauth_tokens=identity.oauth_tokens,
             cfg=cfg,
         )
@@ -3079,13 +3537,21 @@ def auth_oauth_callback(
                 email_verified=identity.email_verified,
                 name=identity.name,
                 raw_profile=identity.raw_profile,
-                default_role="client",
+                default_role="solo_client",
                 issue_session=True,
                 session_ttl_minutes=settings.oauth_session_ttl_minutes,
             )
         )
         oauth_user = resolved.user
         oauth_session = resolved.session
+        if oauth_user.role == "solo_client":
+            try:
+                _ensure_solo_client_workspace(oauth_user, provider=provider)
+            except Exception:
+                if oauth_session:
+                    _auth_store().revoke_session(oauth_session.token)
+                logger.exception("Failed to provision solo client workspace for OAuth user %s", oauth_user.id)
+                return _oauth_error_redirect("provider_error")
     if not oauth_session:
         raise HTTPException(status_code=500, detail="OAuth session was not issued")
 
@@ -3931,10 +4397,10 @@ def archive_ad_account(account_id: UUID, ctx: RequestContext = Depends(auth_cont
     ),
 )
 def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext = Depends(auth_context)):
-    if ctx.role not in {"admin", "agency"}:
+    if ctx.role not in {"admin", "agency", "solo_client"}:
         raise HTTPException(
             status_code=403,
-            detail={"code": "forbidden", "message": "Only admin/agency can run account discovery"},
+            detail={"code": "forbidden", "message": "This role cannot run account discovery"},
         )
     selected_agency_id = (
         _resolve_agency_context_for_user(ctx.user_id, payload.agency_id, require_manage=True)
@@ -3992,10 +4458,20 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
     ),
 )
 def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext = Depends(auth_context)):
-    if ctx.role not in {"admin", "agency"}:
+    if ctx.role not in {"admin", "agency", "solo_client"}:
         raise HTTPException(
             status_code=403,
-            detail={"code": "forbidden", "message": "Only admin/agency can run account sync"},
+            detail={"code": "forbidden", "message": "This role cannot run account sync"},
+        )
+    solo_client_id = _solo_owner_client_id_for_context(ctx) if ctx.role == "solo_client" else None
+    if solo_client_id is not None and payload.client_id != solo_client_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "solo_owner_client_mismatch",
+                "message": "Solo client sync requires the sole active client_id",
+                "details": {"client_id": str(solo_client_id)},
+            },
         )
     all_accounts = _ad_account_store().list(status="all")
     active_clients = _active_client_ids()
@@ -4009,6 +4485,17 @@ def run_ad_accounts_sync(payload: AdAccountSyncRunRequest, ctx: RequestContext =
         requested_accounts = [a for a in requested_accounts if a.client_id == payload.client_id]
     if payload.account_ids is not None:
         requested_ids = set(payload.account_ids)
+        known_ids = {account.id for account in all_accounts}
+        unknown_ids = requested_ids - known_ids
+        if unknown_ids:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ad_accounts_not_found",
+                    "message": "One or more requested ad accounts do not exist",
+                    "details": {"account_ids": [str(x) for x in sorted(unknown_ids, key=str)]},
+                },
+            )
         if not ctx.global_access:
             explicitly_disallowed = [
                 a.id
@@ -4308,11 +4795,12 @@ def ad_account_sync_diagnostics(
     ),
 )
 def integrations_overview(ctx: RequestContext = Depends(auth_context)):
-    if ctx.role not in {"admin", "agency"}:
+    if ctx.role not in {"admin", "agency", "solo_client"}:
         raise HTTPException(
             status_code=403,
-            detail={"code": "forbidden", "message": "Integration management is available to admin and agency roles"},
+            detail={"code": "forbidden", "message": "This role cannot manage integrations"},
         )
+    solo_client_id = _solo_owner_client_id_for_context(ctx) if ctx.role == "solo_client" else None
     active_clients = _active_client_ids()
     accounts = [
         account
@@ -4329,7 +4817,16 @@ def integrations_overview(ctx: RequestContext = Depends(auth_context)):
     provider_configs = _auth_store().list_provider_configs()
     identities = _auth_store().list_identities()
     credential_rows = _integration_credential_store().list(status="active")
-    if not ctx.global_access:
+    if solo_client_id is not None:
+        credential_rows = [
+            row
+            for row in credential_rows
+            if row.scope_type == "client"
+            and row.scope_id == solo_client_id
+            and row.created_by == ctx.user_id
+        ]
+        identities = [identity for identity in identities if identity.user_id == ctx.user_id]
+    elif not ctx.global_access:
         agency_ids = set(_agency_scope_ids_for_user(ctx.user_id))
         credential_rows = [
             row
@@ -4457,7 +4954,9 @@ def list_ad_stats(
     responses={409: {"description": "Active budget overlap conflict for scope key."}},
 )
 def create_budget(payload: BudgetCreate, ctx: RequestContext = Depends(auth_context)):
-    ensure_tenant_write_access(ctx)
+    _ensure_budget_write_access(ctx)
+    if ctx.role == "solo_client":
+        payload = payload.model_copy(update={"created_by": ctx.user_id})
     ensure_client_access(ctx, payload.client_id)
     _ensure_client_currency(payload.client_id, payload.currency, resource="Budget")
     if payload.account_id:
@@ -4547,7 +5046,9 @@ def get_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
     responses={409: {"description": "Active budget overlap conflict for scope key."}},
 )
 def patch_budget(budget_id: UUID, payload: BudgetPatch, ctx: RequestContext = Depends(auth_context)):
-    ensure_tenant_write_access(ctx)
+    _ensure_budget_write_access(ctx)
+    if ctx.role == "solo_client":
+        payload = payload.model_copy(update={"changed_by": ctx.user_id})
     existing = _budget_store().get(budget_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -4605,7 +5106,7 @@ def get_budget_history(budget_id: UUID, ctx: RequestContext = Depends(auth_conte
 
 @app.delete("/budgets/{budget_id}", summary="Archive budget")
 def delete_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
-    ensure_tenant_write_access(ctx)
+    _ensure_budget_write_access(ctx)
     row = _budget_store().get(budget_id)
     if not row:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -4624,7 +5125,9 @@ def delete_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
 
 @app.post("/budgets/{budget_id}/transfer", response_model=BudgetTransferResponse, summary="Transfer budget between accounts")
 def transfer_budget(budget_id: UUID, payload: BudgetTransferRequest, ctx: RequestContext = Depends(auth_context)):
-    ensure_tenant_write_access(ctx)
+    _ensure_budget_write_access(ctx)
+    if ctx.role == "solo_client":
+        payload = payload.model_copy(update={"changed_by": ctx.user_id})
     source = _budget_store().get(budget_id)
     if not source:
         raise HTTPException(status_code=404, detail="Budget not found")
@@ -4909,6 +5412,11 @@ def list_operational_actions(
 
 @app.get("/agency/overview", response_model=AgencyOverviewResponse, summary="Agency aggregation overview")
 def agency_overview(date_from: date, date_to: date, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role == "solo_client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "forbidden", "message": "Solo client has no agency workspace"},
+        )
     active_clients = _active_client_ids()
     allowed_client_ids = active_clients if ctx.global_access else active_clients.intersection(ctx.accessible_client_ids)
     return _overview_service().agency_overview(

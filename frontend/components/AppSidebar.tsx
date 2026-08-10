@@ -19,7 +19,7 @@ export type SidebarSection =
   | "clients"
   | "platform_admin";
 
-type Role = "admin" | "agency" | "client";
+type Role = "admin" | "agency" | "client" | "solo_client";
 
 type IconName =
   | "dashboard"
@@ -170,6 +170,32 @@ function menuForRole(role: Role): NavGroup[] {
     ];
   }
 
+  if (role === "solo_client") {
+    return [
+      {
+        label: "Мои результаты",
+        items: [
+          { href: "/portal", label: "Главное", icon: "dashboard" },
+          { href: "/portal/advertising", label: "Реклама", icon: "accounts" },
+          { href: "/portal/leads", label: "Лиды", icon: "leads" },
+          { href: "/portal/reports", label: "Отчёты", icon: "reports" },
+        ],
+      },
+      {
+        label: "Мои рекламные данные",
+        items: [
+          {
+            href: "/integrations",
+            label: "Источники рекламы",
+            icon: "database",
+            match: ["/accounts", "/sync-monitor"],
+          },
+          { href: "/budgets", label: "Мои бюджеты", icon: "budgets" },
+        ],
+      },
+    ];
+  }
+
   return [
     {
       label: "Ежедневная работа",
@@ -228,6 +254,8 @@ export function AppSidebar({
       ? "Администратор платформы"
       : role === "client"
       ? "Клиентский кабинет"
+      : role === "solo_client"
+      ? "Самостоятельный кабинет"
       : "Рабочее пространство агентства");
 
   async function handleLogout() {

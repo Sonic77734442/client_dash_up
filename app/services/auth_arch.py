@@ -49,6 +49,13 @@ ROLE_ACCESS_MODEL = {
         "scope": "assigned-tenants",
         "description": "Can access only own assigned clients, no cross-tenant visibility.",
     },
+    "solo_client": {
+        "scope": "assigned-tenants",
+        "description": (
+            "Owns one active client tenant and may manage provider connections and sync "
+            "inside that tenant only."
+        ),
+    },
 }
 
 
@@ -250,6 +257,34 @@ class SqliteAuthStore:
             name = patch.get("name", row["name"])
             role = patch.get("role", row["role"])
             status = patch.get("status", row["status"])
+            if role == "solo_client" and status == "active":
+                agency_membership = conn.execute(
+                    """
+                    SELECT 1
+                    FROM agency_members am
+                    JOIN agencies a ON a.id=am.agency_id
+                    WHERE am.user_id=? AND am.status='active' AND a.status='active'
+                    LIMIT 1
+                    """,
+                    (str(user_id),),
+                ).fetchone()
+                active_access = conn.execute(
+                    """
+                    SELECT uca.client_id, uca.role
+                    FROM user_client_access uca
+                    JOIN clients c ON c.id=uca.client_id
+                    WHERE uca.user_id=? AND c.status='active'
+                    """,
+                    (str(user_id),),
+                ).fetchall()
+                if agency_membership or len(active_access) > 1 or any(x["role"] != "client" for x in active_access):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "solo_owner_provisioning_conflict",
+                            "message": "Solo client must have no agency membership and at most one active client grant",
+                        },
+                    )
             removes_active_admin = (
                 row["role"] == "admin"
                 and row["status"] == "active"
@@ -429,15 +464,54 @@ class SqliteAuthStore:
         return [self._to_identity(r) for r in rows]
 
     def assign_client_access(self, payload: UserClientAccessCreate) -> UserClientAccessOut:
-        if not self.get_user(payload.user_id):
-            raise HTTPException(status_code=400, detail="user_id does not exist")
-
         now = _utcnow().isoformat()
         access_id = str(uuid4())
         with sqlite_conn(self.db_path) as conn:
-            client_exists = conn.execute("SELECT id FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            user = conn.execute("SELECT role, status FROM users WHERE id=?", (str(payload.user_id),)).fetchone()
+            if not user:
+                raise HTTPException(status_code=400, detail="user_id does not exist")
+            client_exists = conn.execute("SELECT id, status FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
             if not client_exists:
                 raise HTTPException(status_code=400, detail="client_id does not exist")
+            if user["role"] == "solo_client":
+                if payload.role != "client":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "solo_owner_access_role_invalid", "message": "Solo client grant must use client access role"},
+                    )
+                if client_exists["status"] != "active":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "solo_owner_client_inactive", "message": "Solo client grant requires an active client"},
+                    )
+                active_other = conn.execute(
+                    """
+                    SELECT 1
+                    FROM user_client_access uca
+                    JOIN clients c ON c.id=uca.client_id
+                    WHERE uca.user_id=? AND uca.client_id<>? AND c.status='active'
+                    LIMIT 1
+                    """,
+                    (str(payload.user_id), str(payload.client_id)),
+                ).fetchone()
+                agency_membership = conn.execute(
+                    """
+                    SELECT 1 FROM agency_members am
+                    JOIN agencies a ON a.id=am.agency_id
+                    WHERE am.user_id=? AND am.status='active' AND a.status='active'
+                    LIMIT 1
+                    """,
+                    (str(payload.user_id),),
+                ).fetchone()
+                if active_other or agency_membership:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "solo_owner_provisioning_conflict",
+                            "message": "Solo client already has another active client or agency membership",
+                        },
+                    )
 
             existing = conn.execute(
                 "SELECT * FROM user_client_access WHERE user_id=? AND client_id=?",
@@ -675,6 +749,16 @@ class InMemoryAuthStore:
                     raise HTTPException(status_code=409, detail="User conflict: duplicate email")
             patch["email"] = new_email
         updated = existing.model_copy(update={**patch, "updated_at": _utcnow()})
+        if updated.role == "solo_client" and updated.status == "active":
+            access_rows = [x for x in self.access.values() if x.user_id == user_id]
+            if len(access_rows) > 1 or any(x.role != "client" for x in access_rows):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "solo_owner_provisioning_conflict",
+                        "message": "Solo client must have at most one client grant",
+                    },
+                )
         removes_active_admin = (
             existing.role == "admin"
             and existing.status == "active"
@@ -795,17 +879,33 @@ class InMemoryAuthStore:
         return rows
 
     def assign_client_access(self, payload: UserClientAccessCreate) -> UserClientAccessOut:
-        if payload.user_id not in self.users:
-            raise HTTPException(status_code=400, detail="user_id does not exist")
-        key = f"{payload.user_id}:{payload.client_id}"
-        now = _utcnow()
-        existing = self.access.get(key)
-        if existing:
-            rec = existing.model_copy(update={"role": payload.role, "updated_at": now})
-        else:
-            rec = UserClientAccessOut(id=uuid4(), user_id=payload.user_id, client_id=payload.client_id, role=payload.role, created_at=now, updated_at=now)
-        self.access[key] = rec
-        return rec
+        with self._user_lock:
+            user = self.users.get(payload.user_id)
+            if not user:
+                raise HTTPException(status_code=400, detail="user_id does not exist")
+            if user.role == "solo_client":
+                if payload.role != "client":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "solo_owner_access_role_invalid", "message": "Solo client grant must use client access role"},
+                    )
+                if any(
+                    row.user_id == payload.user_id and row.client_id != payload.client_id
+                    for row in self.access.values()
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"code": "solo_owner_provisioning_conflict", "message": "Solo client already has another client grant"},
+                    )
+            key = f"{payload.user_id}:{payload.client_id}"
+            now = _utcnow()
+            existing = self.access.get(key)
+            if existing:
+                rec = existing.model_copy(update={"role": payload.role, "updated_at": now})
+            else:
+                rec = UserClientAccessOut(id=uuid4(), user_id=payload.user_id, client_id=payload.client_id, role=payload.role, created_at=now, updated_at=now)
+            self.access[key] = rec
+            return rec
 
     def list_client_access(self, user_id: Optional[UUID] = None) -> List[UserClientAccessOut]:
         rows = list(self.access.values())

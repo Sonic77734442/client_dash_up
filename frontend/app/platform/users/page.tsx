@@ -13,7 +13,7 @@ type UserItem = {
   id: string;
   email?: string | null;
   name: string;
-  role: "admin" | "agency" | "client";
+  role: "admin" | "agency" | "client" | "solo_client";
   status: "active" | "inactive";
   created_at?: string;
   updated_at?: string;
@@ -26,9 +26,10 @@ function fmtDate(v?: string) {
   return d.toLocaleString();
 }
 
-function roleLabel(role: "admin" | "agency" | "client") {
+function roleLabel(role: "admin" | "agency" | "client" | "solo_client") {
   if (role === "admin") return "Администратор";
   if (role === "agency") return "Агентство";
+  if (role === "solo_client") return "Соло-владелец";
   return "Клиент";
 }
 
@@ -44,7 +45,7 @@ export default function PlatformUsersPage() {
   const [search, setSearch] = useState("");
   const [createEmail, setCreateEmail] = useState("");
   const [createName, setCreateName] = useState("");
-  const [createRole, setCreateRole] = useState<"admin" | "agency" | "client">("client");
+  const [createRole, setCreateRole] = useState<"admin" | "agency" | "client" | "solo_client">("client");
   const [createStatus, setCreateStatus] = useState<"active" | "inactive">("active");
 
   const req = useCallback(
@@ -170,8 +171,9 @@ export default function PlatformUsersPage() {
             <div className="session-controls" style={{ marginTop: 10 }}>
               <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)} placeholder="email@company.com (необязательно)" />
               <input value={createName} onChange={(e) => setCreateName(e.target.value)} placeholder="Имя и фамилия" />
-              <select value={createRole} onChange={(e) => setCreateRole(e.target.value as "admin" | "agency" | "client")}>
-                <option value="client">Клиент</option>
+              <select value={createRole} onChange={(e) => setCreateRole(e.target.value as UserItem["role"])}>
+                <option value="client">Клиент — только просмотр</option>
+                <option value="solo_client">Соло-владелец — подключения и синхронизация</option>
                 <option value="agency">Агентство</option>
                 <option value="admin">Администратор</option>
               </select>
@@ -209,6 +211,7 @@ export default function PlatformUsersPage() {
                         <select value={u.role} onChange={(e) => void patchUser(u.id, { role: e.target.value as UserItem["role"] })}>
                           <option value="admin">{roleLabel("admin")}</option>
                           <option value="agency">{roleLabel("agency")}</option>
+                          <option value="solo_client">{roleLabel("solo_client")}</option>
                           <option value="client">{roleLabel("client")}</option>
                         </select>
                       </td>

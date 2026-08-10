@@ -96,7 +96,10 @@ export default function IntegrationsPage() {
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const { session, setSession, persist, ready } = useSession(defaultApiBase);
   const agencyContext = useAgencyContext({ apiBase: session.apiBase, token: session.token, loadPortfolio: true });
-  const beginScopedRequest = useScopeRequestGuard(agencyContext.selectedAgencyId || agencyContext.role || "unknown");
+  const soloClient = agencyContext.role === "solo_client";
+  const beginScopedRequest = useScopeRequestGuard(
+    agencyContext.selectedAgencyId || agencyContext.managedClientId || agencyContext.role || "unknown",
+  );
   const { toasts, push } = useToast();
 
   const [warning, setWarning] = useState("");
@@ -123,6 +126,9 @@ export default function IntegrationsPage() {
             : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
         );
       }
+      if (soloClient && !agencyContext.soloClientReady) {
+        throw new Error("Для самостоятельного кабинета должен быть назначен ровно один активный клиент.");
+      }
       const [overview, accountRows, connectionRows] = await Promise.all([
         req<IntegrationsOverview>("/integrations/overview"),
         req<{ items?: AdAccount[] }>("/ad-accounts?status=all"),
@@ -138,14 +144,16 @@ export default function IntegrationsPage() {
         throw new Error("Сервис вернул некорректные данные о подключениях");
       }
       const allAccounts = Array.isArray(accountRows?.items) ? accountRows.items : [];
-      const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+      const allowedClientIds = agencyContext.role === "agency" || soloClient
+        ? new Set(agencyContext.clientIds)
+        : null;
       const visibleAccounts = allowedClientIds
         ? allAccounts.filter((account) => allowedClientIds.has(account.client_id))
         : allAccounts;
       if (allowedClientIds) {
         const allConnections = Array.isArray(connectionRows?.items) ? connectionRows.items : [];
         const visibleConnections = allConnections.filter((connection) => (
-          (connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
+          (agencyContext.role === "agency" && connection.scope_type === "agency" && connection.scope_id === agencyContext.selectedAgencyId)
           || (connection.scope_type === "client" && !!connection.scope_id && allowedClientIds.has(connection.scope_id))
         ));
         const scopedProviders = overview.providers.map((provider) => {
@@ -205,8 +213,10 @@ export default function IntegrationsPage() {
     agencyContext.role,
     agencyContext.selectedAgencyId,
     agencyContext.selectionRequired,
+    agencyContext.soloClientReady,
     beginScopedRequest,
     req,
+    soloClient,
   ]);
 
   useEffect(() => {
@@ -254,8 +264,17 @@ export default function IntegrationsPage() {
         return accountProvider === selectedKey;
       })
       .map((account) => account.id);
-    if (agencyContext.role === "agency" && (!agencyContext.portfolioReady || !scopedAccountIds.length)) {
-      push("У выбранного агентства нет аккаунтов этой платформы для обновления.", "info");
+    if (
+      (agencyContext.role === "agency" && !agencyContext.portfolioReady)
+      || (soloClient && !agencyContext.soloClientReady)
+      || ((agencyContext.role === "agency" || soloClient) && !scopedAccountIds.length)
+    ) {
+      push(
+        soloClient
+          ? "В вашем кабинете нет аккаунтов этой платформы для обновления."
+          : "У выбранного агентства нет аккаунтов этой платформы для обновления.",
+        "info",
+      );
       return;
     }
     setSyncLoading(true);
@@ -266,7 +285,8 @@ export default function IntegrationsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           platform: selected.provider,
-          ...(agencyContext.role === "agency" ? { account_ids: scopedAccountIds } : {}),
+          ...(agencyContext.role === "agency" || soloClient ? { account_ids: scopedAccountIds } : {}),
+          ...(soloClient ? { client_id: agencyContext.managedClientId } : {}),
         }),
       });
       await loadData();
@@ -279,7 +299,7 @@ export default function IntegrationsPage() {
     } finally {
       setSyncLoading(false);
     }
-  }, [accounts, agencyContext.portfolioReady, agencyContext.role, loadData, push, req, selected, syncLoading]);
+  }, [accounts, agencyContext.managedClientId, agencyContext.portfolioReady, agencyContext.role, agencyContext.soloClientReady, loadData, push, req, selected, soloClient, syncLoading]);
 
   const recentEvents = useMemo(() => {
     const items = Array.isArray(data?.events) ? data.events : [];
@@ -334,9 +354,11 @@ export default function IntegrationsPage() {
         unassigned,
         issues,
         completed,
-        title: `Распределите аккаунты по клиентам`,
-        description: `Без клиента осталось аккаунтов: ${unassigned}. Назначьте клиентов, чтобы данные попали в правильные отчёты.`,
-        action: "Распределить аккаунты",
+        title: soloClient ? "Завершите привязку аккаунтов" : "Распределите аккаунты по клиентам",
+        description: soloClient
+          ? "Некоторые найденные аккаунты ещё не попали в ваш кабинет. Повторите поиск или обратитесь к администратору."
+          : `Без клиента осталось аккаунтов: ${unassigned}. Назначьте клиентов, чтобы данные попали в правильные отчёты.`,
+        action: soloClient ? "Проверить аккаунты" : "Распределить аккаунты",
         href: "/accounts",
       };
     }
@@ -364,12 +386,12 @@ export default function IntegrationsPage() {
       action: "Открыть рекламные аккаунты",
       href: "/accounts",
     };
-  }, [accounts, data]);
+  }, [accounts, data, soloClient]);
 
   const setupSteps = [
     { label: "Платформа подключена", done: setup.connected > 0 },
     { label: "Аккаунты импортированы", done: setup.accountCount > 0 },
-    { label: "Клиенты назначены", done: setup.accountCount > 0 && setup.unassigned === 0 },
+    { label: soloClient ? "Аккаунты закреплены за вашим кабинетом" : "Клиенты назначены", done: setup.accountCount > 0 && setup.unassigned === 0 },
     {
       label: "Есть свежая успешная загрузка",
       done: setup.connected > 0 && setup.accountCount > 0 && setup.issues === 0,
@@ -436,7 +458,7 @@ export default function IntegrationsPage() {
 
           <DataSourcesNav active="overview" />
 
-          {assignmentConflictCount > 0 ? (
+          {!soloClient && assignmentConflictCount > 0 ? (
             <section className="alert-card high" style={{ marginTop: 12 }}>
               <div className="alert-priority high">ТРЕБУЕТСЯ РЕШЕНИЕ</div>
               <div className="insight-text" style={{ marginTop: 8 }}>
@@ -486,10 +508,14 @@ export default function IntegrationsPage() {
               <strong>{accounts.length}</strong>
               <small>доступны в рабочем пространстве</small>
             </article>
-            <article className={setup.unassigned ? "warn" : ""}>
-              <span>Без клиента</span>
-              <strong>{setup.unassigned}</strong>
-              <small>{setup.unassigned ? "нужно распределить" : "все аккаунты распределены"}</small>
+            <article className={!soloClient && setup.unassigned ? "warn" : ""}>
+              <span>{soloClient ? "В вашем кабинете" : "Без клиента"}</span>
+              <strong>{soloClient ? setup.accountCount : setup.unassigned}</strong>
+              <small>
+                {soloClient
+                  ? setup.unassigned ? "нужно проверить привязку" : "все аккаунты закреплены"
+                  : setup.unassigned ? "нужно распределить" : "все аккаунты распределены"}
+              </small>
             </article>
             <article className={setup.issues ? "bad" : ""}>
               <span>Требуют внимания</span>

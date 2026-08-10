@@ -586,14 +586,14 @@ class OperationalActionOut(BaseModel):
 class UserCreate(BaseModel):
     email: Optional[str] = None
     name: str
-    role: Literal["admin", "agency", "client"]
+    role: Literal["admin", "agency", "client", "solo_client"]
     status: Literal["active", "inactive"] = "active"
 
 
 class UserPatch(BaseModel):
     email: Optional[str] = None
     name: Optional[str] = None
-    role: Optional[Literal["admin", "agency", "client"]] = None
+    role: Optional[Literal["admin", "agency", "client", "solo_client"]] = None
     status: Optional[Literal["active", "inactive"]] = None
 
 
@@ -601,7 +601,7 @@ class UserOut(BaseModel):
     id: UUID
     email: Optional[str] = None
     name: str
-    role: Literal["admin", "agency", "client"]
+    role: Literal["admin", "agency", "client", "solo_client"]
     status: Literal["active", "inactive"]
     created_at: datetime
     updated_at: datetime
@@ -819,7 +819,7 @@ class SessionValidationResponse(BaseModel):
     reason: Optional[str] = None
     session_id: Optional[UUID] = None
     user_id: Optional[UUID] = None
-    user_role: Optional[Literal["admin", "agency", "client"]] = None
+    user_role: Optional[Literal["admin", "agency", "client", "solo_client"]] = None
     expires_at: Optional[datetime] = None
 
 
@@ -930,7 +930,7 @@ class ExternalIdentityResolveRequest(BaseModel):
     email_verified: Optional[bool] = None
     name: Optional[str] = None
     raw_profile: Optional[Dict[str, Any]] = None
-    default_role: Literal["admin", "agency", "client"] = "client"
+    default_role: Literal["admin", "agency", "client", "solo_client"] = "client"
     issue_session: bool = True
     session_ttl_minutes: int = Field(60, ge=1, le=60 * 24 * 7)
     allow_email_merge: bool = False
@@ -947,7 +947,7 @@ class SessionContextResponse(BaseModel):
     reason: Optional[str] = None
     session_id: Optional[UUID] = None
     user_id: Optional[UUID] = None
-    role: Optional[Literal["admin", "agency", "client"]] = None
+    role: Optional[Literal["admin", "agency", "client", "solo_client"]] = None
     global_access: bool = False
     access_scope: Optional[Literal["all", "assigned"]] = None
     accessible_client_ids: List[UUID] = Field(default_factory=list)

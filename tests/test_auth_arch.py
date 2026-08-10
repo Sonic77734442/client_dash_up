@@ -37,7 +37,7 @@ def test_auth_access_model_endpoint():
     r = client.get("/auth/access-model")
     assert r.status_code == 200
     body = r.json()
-    assert set(body["roles"].keys()) == {"admin", "agency", "client"}
+    assert set(body["roles"].keys()) == {"admin", "agency", "client", "solo_client"}
     assert "tenant_isolation_enforced_by_backend" in body["security_assumptions"]
 
 

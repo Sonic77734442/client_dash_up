@@ -693,7 +693,7 @@ def test_facebook_login_auto_provisions_isolated_client_workspace(monkeypatch):
     me = client.get("/auth/me")
     assert me.status_code == 200
     me_body = me.json()
-    assert me_body["user"]["role"] == "client"
+    assert me_body["user"]["role"] == "solo_client"
     assert me_body["user"]["status"] == "active"
     assert me_body["session"]["global_access"] is False
     assert me_body["session"]["access_scope"] == "assigned"
@@ -847,7 +847,7 @@ def test_facebook_login_without_email_still_gets_isolated_client_workspace(monke
     assert me.status_code == 200
     body = me.json()
     assert body["user"]["email"] is None
-    assert body["user"]["role"] == "client"
+    assert body["user"]["role"] == "solo_client"
     assert body["session"]["global_access"] is False
     assert len(body["session"]["accessible_client_ids"]) == 1
 

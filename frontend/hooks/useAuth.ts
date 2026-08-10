@@ -12,7 +12,7 @@ const SESSION_UPDATED_EVENT = "ops-session-updated";
 export function useAuth(defaultApiBase: string) {
   const [ready, setReady] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
-  const [role, setRole] = useState<"admin" | "agency" | "client" | null>(null);
+  const [role, setRole] = useState<"admin" | "agency" | "client" | "solo_client" | null>(null);
   const [me, setMe] = useState<AuthMeResponse | null>(null);
   const [error, setError] = useState("");
 

@@ -213,17 +213,21 @@ export default function BudgetsPage() {
           : agencyContext.portfolioError || "Не удалось загрузить портфель агентства.",
       );
     }
+    if (agencyContext.role === "solo_client" && !agencyContext.soloClientReady) {
+      throw new Error("Для самостоятельного кабинета должен быть назначен ровно один активный клиент.");
+    }
     const range = rangeFromPreset(preset);
+    const scopedClientId = agencyContext.role === "solo_client" ? agencyContext.managedClientId : clientId;
     const budgetQuery = getQuery({
       status,
-      client_id: clientId || undefined,
+      client_id: scopedClientId || undefined,
       date_from: range.date_from,
       date_to: range.date_to,
     });
     const statsQuery = getQuery({
       date_from: range.date_from,
       date_to: range.date_to,
-      client_id: clientId || undefined,
+      client_id: scopedClientId || undefined,
     });
     const [c, a, b, statPayload] = await Promise.all([
       req<{ items: Client[] }>("/clients?status=active"),
@@ -232,17 +236,26 @@ export default function BudgetsPage() {
       req<{ items: AdStat[] }>(`/ad-stats${statsQuery}`),
     ]);
     if (!isCurrentRequest()) return;
-    const allowedClientIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    const allowedClientIds = agencyContext.role === "agency" || agencyContext.role === "solo_client"
+      ? new Set(agencyContext.clientIds)
+      : null;
     setClients((c.items || []).filter((client) => !allowedClientIds || allowedClientIds.has(client.id)));
     setAccounts((a.items || []).filter((account) => !allowedClientIds || allowedClientIds.has(account.client_id)));
     setBudgets((b.items || []).filter((budget) => !allowedClientIds || allowedClientIds.has(budget.client_id)));
-    setStats(statPayload.items || []);
+    const visibleAccountIds = new Set(
+      (a.items || [])
+        .filter((account) => !allowedClientIds || allowedClientIds.has(account.client_id))
+        .map((account) => account.id),
+    );
+    setStats((statPayload.items || []).filter((stat) => visibleAccountIds.has(String(stat.ad_account_id || ""))));
     setWarning("");
   }, [
     agencyContext.clientIds,
     agencyContext.portfolioError,
     agencyContext.portfolioReady,
     agencyContext.role,
+    agencyContext.managedClientId,
+    agencyContext.soloClientReady,
     agencyContext.selectionRequired,
     beginScopedRequest,
     req,
@@ -271,6 +284,12 @@ export default function BudgetsPage() {
   useEffect(() => {
     if (clientId && !clients.some((client) => client.id === clientId)) setClientId("");
   }, [clientId, clients]);
+
+  useEffect(() => {
+    if (agencyContext.role === "solo_client" && clients.length === 1 && clientId !== clients[0].id) {
+      setClientId(clients[0].id);
+    }
+  }, [agencyContext.role, clientId, clients]);
 
   const clientMap = useMemo(() => new Map(clients.map((c) => [c.id, c.name])), [clients]);
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
@@ -325,7 +344,7 @@ export default function BudgetsPage() {
 
   const selected = useMemo(() => rows.find((x) => x.id === selectedBudgetId) || null, [rows, selectedBudgetId]);
   const selectedIsScoped = !!selected
-    && (agencyContext.role !== "agency"
+    && (!["agency", "solo_client"].includes(agencyContext.role || "")
       || (agencyContext.portfolioReady && agencyContext.clientIds.includes(selected.client_id)));
 
   const loadTransferHistory = useCallback(async (budgetId: string, direction: "all" | "incoming" | "outgoing") => {
@@ -419,13 +438,18 @@ export default function BudgetsPage() {
   function openCreateModal() {
     setCreateError("");
     setCreateCapHint({ loading: false, level: "info", text: "" });
-    setCreateForm(defaultCreateForm());
+    const next = defaultCreateForm();
+    if (agencyContext.role === "solo_client" && clients.length === 1) {
+      next.client_id = clients[0].id;
+      next.currency = clients[0].default_currency || "USD";
+    }
+    setCreateForm(next);
     setCreateOpen(true);
   }
 
   async function createBudget() {
     if (
-      agencyContext.role === "agency"
+      (agencyContext.role === "agency" || agencyContext.role === "solo_client")
       && (
         !agencyContext.portfolioReady
         || !agencyContext.clientIds.includes(createForm.client_id)
@@ -435,7 +459,11 @@ export default function BudgetsPage() {
         )
       )
     ) {
-      setCreateError("Клиент или аккаунт не входит в выбранное агентство.");
+      setCreateError(
+        agencyContext.role === "solo_client"
+          ? "Клиент или рекламный аккаунт не входит в ваш кабинет."
+          : "Клиент или аккаунт не входит в выбранное агентство.",
+      );
       return;
     }
     if (!isAmountValid) {
@@ -597,7 +625,7 @@ export default function BudgetsPage() {
     if (!accounts.some(
       (account) => account.id === transferTargetAccountId && account.client_id === selected.client_id,
     )) {
-      setTransferError("Целевой аккаунт не входит в выбранное агентство.");
+      setTransferError("Целевой аккаунт не входит в ваш клиентский кабинет.");
       return;
     }
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -783,7 +811,11 @@ export default function BudgetsPage() {
             <div className="topbar-left">
               <AppTopTabs active="budgets" />
               <div className="topbar-title">Реестр бюджетов</div>
-              <div className="panel-subtitle">Контроль бюджетов клиентов и рекламных аккаунтов.</div>
+              <div className="panel-subtitle">
+                {agencyContext.role === "solo_client"
+                  ? "Контроль бюджета вашего клиента и рекламных аккаунтов."
+                  : "Контроль бюджетов клиентов и рекламных аккаунтов."}
+              </div>
             </div>
             <div className="session-controls">
               {tokenLoginEnabled ? (

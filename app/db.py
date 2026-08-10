@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NULL UNIQUE,
   name TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('admin','agency','client')),
+  role TEXT NOT NULL CHECK (role IN ('admin','agency','client','solo_client')),
   password_hash TEXT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive')),
   created_at TEXT NOT NULL,
@@ -525,6 +525,63 @@ def _migrate_sqlite(conn: sqlite3.Connection) -> None:
     user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     if user_cols and "password_hash" not in user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT NULL")
+        conn.commit()
+
+    users_table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    users_table_sql = str(users_table_sql_row[0] or "") if users_table_sql_row else ""
+    if users_table_sql and "solo_client" not in users_table_sql:
+        # SQLite cannot alter a CHECK constraint in place. Rebuild only the
+        # users table, preserving identifiers and password hashes, so existing
+        # production databases can accept the new role without changing any
+        # tenant/access relationships.
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Re-check under the write lock: another process may have completed
+            # the same startup migration while this process was waiting.
+            locked_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+            ).fetchone()
+            locked_sql = str(locked_sql_row[0] or "") if locked_sql_row else ""
+            if locked_sql and "solo_client" not in locked_sql:
+                conn.execute(
+                    """
+                    CREATE TABLE users_solo_role_migration (
+                      id TEXT PRIMARY KEY,
+                      email TEXT NULL UNIQUE,
+                      name TEXT NOT NULL,
+                      role TEXT NOT NULL CHECK (role IN ('admin','agency','client','solo_client')),
+                      password_hash TEXT NULL,
+                      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive')),
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO users_solo_role_migration
+                      (id, email, name, role, password_hash, status, created_at, updated_at)
+                    SELECT id, email, name, role, password_hash, status, created_at, updated_at
+                    FROM users
+                    """
+                )
+                conn.execute("DROP TABLE users")
+                conn.execute("ALTER TABLE users_solo_role_migration RENAME TO users")
+                foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if foreign_key_errors:
+                    raise sqlite3.IntegrityError(
+                        f"users role migration left {len(foreign_key_errors)} foreign-key violation(s)"
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     cols = {row[1] for row in conn.execute("PRAGMA table_info(budgets)").fetchall()}
     if cols and "scope" not in cols:
