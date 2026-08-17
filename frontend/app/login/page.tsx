@@ -292,10 +292,10 @@ function LoginPageContent() {
                   <span>{loading ? tr("Signing in...", "Входим…") : tr("Sign in", "Войти")}</span>
                   <ArrowIcon />
                 </button>
-                <div className={styles.divider}><span>{tr("or", "или")}</span></div>
+                <div className={styles.divider}><span>OR</span></div>
                 <button className={styles.metaButton} type="button" onClick={() => startOAuthLogin("facebook")} disabled={loading}>
                   <span className={styles.metaMark}>f</span>
-                  <span>{tr("Continue with Meta", "Продолжить через Meta")}</span>
+                  <span>Continue with Meta</span>
                 </button>
               </form>
             )}

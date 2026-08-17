@@ -16,7 +16,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
-  const { ready, authenticated, role, error, refresh } = useAuth(defaultApiBase);
+  const { ready, authenticated, role, error } = useAuth(defaultApiBase);
 
   const currentPath = pathname || "";
   const isPublic = isPublicPath(currentPath);
@@ -24,7 +24,18 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const roleAllowed = Boolean(currentRole && isPathAllowedForRole(currentRole, currentPath));
 
   useEffect(() => {
-    if (!ready || error) return;
+    if (!ready) return;
+
+    if (error) {
+      if (!authenticated && !isPublic) {
+        const requestedPath = safeRelativePath(
+          `${currentPath}${window.location.search}${window.location.hash}`,
+          currentPath || "/",
+        );
+        router.replace(`/login?next=${encodeURIComponent(requestedPath)}`);
+      }
+      return;
+    }
 
     if (!authenticated && !isPublic) {
       const requestedPath = safeRelativePath(
@@ -49,19 +60,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   }, [ready, authenticated, currentPath, currentRole, error, isPublic, roleAllowed, router]);
 
   if (ready && error && !authenticated && !isPublic) {
-    return (
-      <main className="login-shell">
-        <section className="login-card" role="alert">
-          <h1>Платформа обновляется</h1>
-          <p className="panel-subtitle">
-            Не удалось проверить вход. Ваш сеанс не сброшен — подождите несколько секунд и повторите.
-          </p>
-          <button className="primary-btn" type="button" onClick={() => void refresh()}>
-            Повторить проверку
-          </button>
-        </section>
-      </main>
-    );
+    return null;
   }
 
   // Public auth pages must stay usable even while the API is waking up or
