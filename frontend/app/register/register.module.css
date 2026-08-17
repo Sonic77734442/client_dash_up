@@ -294,6 +294,16 @@
   font-size: 20px;
 }
 
+.visibilityButton svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .submit {
   position: relative;
   display: inline-flex;
@@ -361,6 +371,12 @@
 .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #e8e1d9; }
 .metaButton { display: inline-flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 56px; border: 1px solid #d8dce8; border-radius: 10px; background: #fff; color: #202124; text-decoration: none; font-size: 15px; font-weight: 800; }
 .metaMark { display: inline-flex; align-items: flex-end; justify-content: center; width: 24px; height: 24px; border-radius: 999px; background: #0866ff; color: #fff; font: 800 22px/22px Arial, sans-serif; }
+
+.tokenTools {
+  margin-top: 22px;
+  display: grid;
+  gap: 16px;
+}
 
 .bottomLinks {
   margin-top: 24px;
