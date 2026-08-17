@@ -1,10 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import logging
-import re
 import secrets
 import threading
 import time
@@ -15,7 +12,6 @@ from typing import Iterable, List, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -92,9 +88,6 @@ from app.schemas import (
     SessionIssueResponse,
     AuthMeResponse,
     AuthPasswordLoginRequest,
-    AuthPhoneVerificationConfirmRequest,
-    AuthPhoneVerificationSendRequest,
-    AuthRegisterRequest,
     SessionContextResponse,
     SessionValidateRequest,
     SessionValidationResponse,
@@ -185,9 +178,6 @@ from app.db import sqlite_conn
 logger = logging.getLogger(__name__)
 settings = get_settings()
 LOGIN_AUTO_SYNC_ENABLED = str(os.getenv("LOGIN_AUTO_SYNC_ENABLED", "true")).strip().lower() not in {"0", "false", "no", "off"}
-PHONE_CODE_TTL_SECONDS = max(300, int(os.getenv("WHATSAPP_CODE_TTL_SEC", "600") or "600"))
-PHONE_CODE_RESEND_SECONDS = max(30, int(os.getenv("WHATSAPP_CODE_RESEND_SEC", "60") or "60"))
-PHONE_CODE_MAX_ATTEMPTS = max(3, int(os.getenv("WHATSAPP_CODE_MAX_ATTEMPTS", "5") or "5"))
 LOGIN_AUTO_SYNC_TTL_SECONDS = max(0, int(os.getenv("LOGIN_AUTO_SYNC_TTL_SECONDS", "1800")))
 LOGIN_AUTO_SYNC_LOOKBACK_DAYS = max(1, int(os.getenv("LOGIN_AUTO_SYNC_LOOKBACK_DAYS", "30")))
 
@@ -401,7 +391,6 @@ app.state.operational_action_store = SqliteOperationalActionStore(settings.budge
 app.state.audit_log_store = audit_log_store
 app.state.alert_store = SqliteAlertStore(settings.budgets_db_path)
 app.state.rate_limiter = InMemoryRateLimiter()
-app.state.registration_lock = threading.Lock()
 
 
 class RuntimeMetrics:
@@ -814,9 +803,6 @@ async def auth_security_middleware(request: Request, call_next):
         csrf_exempt = {
             "/auth/invites/accept",
             "/auth/password/login",
-            "/auth/phone-verification/send",
-            "/auth/phone-verification/confirm",
-            "/auth/register",
             "/auth/logout",
             "/auth/internal/sessions/issue",
             "/auth/internal/sessions/validate",
@@ -989,7 +975,6 @@ def use_inmemory_stores():
     app.state.audit_log_store = audit_log
     app.state.alert_store = InMemoryAlertStore()
     app.state.rate_limiter = InMemoryRateLimiter()
-    app.state.registration_lock = threading.Lock()
     app.state.runtime_metrics = RuntimeMetrics()
     return {"status": "ok"}
 
@@ -3178,354 +3163,6 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     if not user:
         raise HTTPException(status_code=401, detail="Session user not found")
     return AuthMeResponse(user=user, session=session)
-
-
-def _normalize_registration_email(value: object) -> str:
-    email = str(value or "").strip().lower()
-    if not email or "@" not in email or email.startswith("@") or email.endswith("@"):
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "registration_email_invalid", "message": "Enter a valid email address"},
-        )
-    return email
-
-
-def _normalize_registration_phone(value: object) -> str:
-    digits = re.sub(r"\D", "", str(value or "").strip())
-    if len(digits) == 11 and digits.startswith("8"):
-        digits = f"7{digits[1:]}"
-    if len(digits) < 10 or len(digits) > 15:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "registration_phone_invalid", "message": "Enter a valid phone number with country code"},
-        )
-    return f"+{digits}"
-
-
-def _phone_verification_secret() -> str:
-    secret = (os.getenv("WHATSAPP_VERIFICATION_SECRET") or "").strip()
-    if len(secret) < 24:
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "phone_verification_unavailable", "message": "Phone verification is not configured"},
-        )
-    return secret
-
-
-def _phone_verification_hash(value: str) -> str:
-    return hmac.new(
-        _phone_verification_secret().encode("utf-8"),
-        value.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _parse_registration_timestamp(value: object) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
-
-
-def _send_whatsapp_verification_code(phone: str, code: str) -> None:
-    access_token = (os.getenv("WHATSAPP_ACCESS_TOKEN") or "").strip()
-    phone_number_id = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
-    template_name = (os.getenv("WHATSAPP_TEMPLATE_NAME") or "phone_verification").strip()
-    template_language = (os.getenv("WHATSAPP_TEMPLATE_LANGUAGE") or "ru").strip()
-    graph_version = (os.getenv("META_GRAPH_API_VERSION") or "v25.0").strip()
-    if not access_token or not phone_number_id:
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "phone_verification_unavailable", "message": "WhatsApp verification is not configured"},
-        )
-
-    try:
-        response = httpx.post(
-            f"https://graph.facebook.com/{graph_version}/{phone_number_id}/messages",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={
-                "messaging_product": "whatsapp",
-                "to": phone.lstrip("+"),
-                "type": "template",
-                "template": {
-                    "name": template_name,
-                    "language": {"code": template_language},
-                    "components": [
-                        {
-                            "type": "body",
-                            "parameters": [{"type": "text", "text": code}],
-                        },
-                        {
-                            "type": "button",
-                            "sub_type": "url",
-                            "index": "0",
-                            "parameters": [{"type": "text", "text": code}],
-                        },
-                    ],
-                },
-            },
-            timeout=20,
-        )
-    except Exception as exc:
-        logger.exception("WhatsApp verification request failed")
-        raise HTTPException(
-            status_code=502,
-            detail={"code": "phone_verification_send_failed", "message": "Could not send the verification code"},
-        ) from exc
-    if response.status_code < 200 or response.status_code >= 300:
-        logger.error("WhatsApp verification rejected with status %s", response.status_code)
-        raise HTTPException(
-            status_code=502,
-            detail={"code": "phone_verification_rejected", "message": "WhatsApp rejected the verification message"},
-        )
-
-
-@app.post("/auth/phone-verification/send")
-def auth_phone_verification_send(payload: AuthPhoneVerificationSendRequest):
-    phone = _normalize_registration_phone(payload.phone)
-    now = _utcnow()
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    code_hash = _phone_verification_hash(f"{phone}:{code}")
-
-    with app.state.registration_lock:
-        with sqlite_conn(settings.budgets_db_path) as conn:
-            registered = conn.execute(
-                "SELECT user_id FROM registration_profiles WHERE phone=?",
-                (phone,),
-            ).fetchone()
-            if registered:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "phone_already_registered", "message": "This phone number is already registered"},
-                )
-            verification = conn.execute(
-                "SELECT last_sent_at FROM phone_verifications WHERE phone=?",
-                (phone,),
-            ).fetchone()
-            if verification:
-                last_sent_at = _parse_registration_timestamp(verification["last_sent_at"])
-                if last_sent_at:
-                    retry_after = PHONE_CODE_RESEND_SECONDS - int((now - last_sent_at).total_seconds())
-                    if retry_after > 0:
-                        raise HTTPException(
-                            status_code=429,
-                            detail={
-                                "code": "phone_code_rate_limited",
-                                "message": f"Wait {retry_after} seconds before requesting another code",
-                                "details": {"retry_after_seconds": retry_after},
-                            },
-                        )
-
-        _send_whatsapp_verification_code(phone, code)
-        expires_at = now + timedelta(seconds=PHONE_CODE_TTL_SECONDS)
-        with sqlite_conn(settings.budgets_db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO phone_verifications
-                  (phone, code_hash, expires_at, attempts, verified_at, verification_token_hash,
-                   consumed_at, last_sent_at, created_at)
-                VALUES (?, ?, ?, 0, NULL, NULL, NULL, ?, ?)
-                ON CONFLICT(phone) DO UPDATE SET
-                  code_hash=excluded.code_hash,
-                  expires_at=excluded.expires_at,
-                  attempts=0,
-                  verified_at=NULL,
-                  verification_token_hash=NULL,
-                  consumed_at=NULL,
-                  last_sent_at=excluded.last_sent_at
-                """,
-                (phone, code_hash, expires_at.isoformat(), now.isoformat(), now.isoformat()),
-            )
-            conn.commit()
-    return {
-        "status": "sent",
-        "expires_in": PHONE_CODE_TTL_SECONDS,
-        "retry_after": PHONE_CODE_RESEND_SECONDS,
-    }
-
-
-@app.post("/auth/phone-verification/confirm")
-def auth_phone_verification_confirm(payload: AuthPhoneVerificationConfirmRequest):
-    phone = _normalize_registration_phone(payload.phone)
-    code = re.sub(r"\D", "", payload.code)
-    if len(code) != 6:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "phone_code_invalid", "message": "Enter the 6-digit code"},
-        )
-    now = _utcnow()
-
-    with app.state.registration_lock:
-        with sqlite_conn(settings.budgets_db_path) as conn:
-            verification = conn.execute(
-                "SELECT * FROM phone_verifications WHERE phone=?",
-                (phone,),
-            ).fetchone()
-            if not verification or verification["consumed_at"]:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"code": "phone_code_missing", "message": "Request a new verification code"},
-                )
-            expires_at = _parse_registration_timestamp(verification["expires_at"])
-            if not expires_at or expires_at <= now:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"code": "phone_code_expired", "message": "The verification code has expired"},
-                )
-            attempts = int(verification["attempts"] or 0)
-            if attempts >= PHONE_CODE_MAX_ATTEMPTS:
-                raise HTTPException(
-                    status_code=429,
-                    detail={"code": "phone_code_attempts_exceeded", "message": "Too many attempts. Request a new code"},
-                )
-            expected_hash = _phone_verification_hash(f"{phone}:{code}")
-            if not hmac.compare_digest(str(verification["code_hash"]), expected_hash):
-                conn.execute(
-                    "UPDATE phone_verifications SET attempts=attempts+1 WHERE phone=?",
-                    (phone,),
-                )
-                conn.commit()
-                remaining = max(0, PHONE_CODE_MAX_ATTEMPTS - attempts - 1)
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "phone_code_incorrect",
-                        "message": f"Incorrect code. Attempts remaining: {remaining}",
-                    },
-                )
-
-            verification_token = secrets.token_urlsafe(32)
-            conn.execute(
-                """
-                UPDATE phone_verifications
-                SET verified_at=?, verification_token_hash=?, attempts=attempts+1
-                WHERE phone=?
-                """,
-                (now.isoformat(), _phone_verification_hash(verification_token), phone),
-            )
-            conn.commit()
-    return {"status": "verified", "verification_token": verification_token}
-
-
-@app.post(
-    "/auth/register",
-    response_model=AuthMeResponse,
-    summary="Create a self-service client workspace",
-)
-def auth_register(payload: AuthRegisterRequest, background_tasks: BackgroundTasks):
-    email = _normalize_registration_email(payload.email)
-    phone = _normalize_registration_phone(payload.phone)
-    name = payload.name.strip()
-    company = (payload.company or "").strip() or None
-    verification_token = payload.phone_verification_token.strip()
-    if not name:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "registration_name_required", "message": "Name is required"},
-        )
-
-    created_user: Optional[UserOut] = None
-    created_client_id: Optional[UUID] = None
-    with app.state.registration_lock:
-        now = _utcnow()
-        with sqlite_conn(settings.budgets_db_path) as conn:
-            verification = conn.execute(
-                "SELECT * FROM phone_verifications WHERE phone=?",
-                (phone,),
-            ).fetchone()
-            verified_at = _parse_registration_timestamp(verification["verified_at"]) if verification else None
-            valid_until = verified_at + timedelta(seconds=PHONE_CODE_TTL_SECONDS) if verified_at else None
-            valid_token = bool(
-                verification
-                and not verification["consumed_at"]
-                and valid_until
-                and valid_until > now
-                and verification["verification_token_hash"]
-                and hmac.compare_digest(
-                    str(verification["verification_token_hash"]),
-                    _phone_verification_hash(verification_token),
-                )
-            )
-            if not valid_token:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"code": "phone_verification_invalid", "message": "Phone verification is invalid or expired"},
-                )
-            if conn.execute("SELECT 1 FROM registration_profiles WHERE phone=?", (phone,)).fetchone():
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "phone_already_registered", "message": "This phone number is already registered"},
-                )
-        if _auth_store().find_user_by_email(email):
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "email_already_registered", "message": "This email is already registered"},
-            )
-
-        try:
-            created_user = _auth_store().create_user(
-                UserCreate(email=email, name=name, role="solo_client", status="active")
-            )
-            _auth_store().set_password(created_user.id, payload.password)
-            created_client_id = _ensure_solo_client_workspace(created_user, provider="password")
-            if company:
-                _client_store().patch(
-                    created_client_id,
-                    ClientPatch(name=company, legal_name=company),
-                )
-            with sqlite_conn(settings.budgets_db_path) as conn:
-                conn.execute(
-                    "INSERT INTO registration_profiles (user_id, company, phone, created_at) VALUES (?, ?, ?, ?)",
-                    (str(created_user.id), company, phone, now.isoformat()),
-                )
-                conn.execute(
-                    "UPDATE phone_verifications SET consumed_at=? WHERE phone=?",
-                    (now.isoformat(), phone),
-                )
-                conn.commit()
-        except Exception:
-            if created_user:
-                try:
-                    _auth_store().delete_user(created_user.id)
-                except Exception:
-                    logger.exception("Failed to roll back self-registered user")
-            if created_client_id:
-                try:
-                    _client_store().archive(created_client_id)
-                except Exception:
-                    logger.exception("Failed to roll back self-registered client workspace")
-            raise
-
-    issued = _auth_store().issue_session(
-        SessionIssueRequest(
-            user_id=created_user.id,
-            ttl_minutes=settings.oauth_session_ttl_minutes,
-            metadata={"auth_method": "self_registration"},
-        )
-    )
-    session_ctx = _restrict_archived_client_scope(_auth_facade().get_session_context(issued.token))
-    if not session_ctx.valid:
-        raise HTTPException(status_code=500, detail="Session context failed")
-    _schedule_login_auto_sync(background_tasks, session_ctx)
-    body = AuthMeResponse(user=created_user, session=session_ctx)
-    response = JSONResponse(content=body.model_dump(mode="json"), background=background_tasks)
-    max_age = max(60, int((issued.expires_at - _utcnow()).total_seconds()))
-    response.set_cookie(
-        key=settings.auth_cookie_name,
-        value=issued.token,
-        httponly=True,
-        samesite=_cookie_samesite_value(),
-        secure=settings.auth_cookie_secure,
-        max_age=max_age,
-        path="/",
-    )
-    _set_csrf_cookie(response, _new_csrf_token())
-    return response
 
 
 @app.post(

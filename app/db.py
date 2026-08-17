@@ -337,29 +337,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
-CREATE TABLE IF NOT EXISTS phone_verifications (
-  phone TEXT PRIMARY KEY,
-  code_hash TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  verified_at TEXT NULL,
-  verification_token_hash TEXT NULL,
-  consumed_at TEXT NULL,
-  last_sent_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS registration_profiles (
-  user_id TEXT PRIMARY KEY,
-  company TEXT NULL,
-  phone TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_phone_verifications_last_sent
-ON phone_verifications(last_sent_at);
-
 CREATE TABLE IF NOT EXISTS oauth_states (
   state TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
