@@ -3,9 +3,10 @@ import { AuthGate } from "../components/AuthGate";
 import { ImpersonationBanner } from "../components/ImpersonationBanner";
 import { RuntimeI18n } from "../components/RuntimeI18n";
 import "./globals.css";
+import "./envidicy-march.css";
 
 export const metadata: Metadata = {
-  title: "Client Dash Up",
+  title: "Envidicy",
   description: "Операционный центр эффективности рекламы",
 };
 

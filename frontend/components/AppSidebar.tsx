@@ -285,7 +285,7 @@ export function AppSidebar({
 
   return (
     <aside className={`${className} role-sidebar`.trim()}>
-      <div className="brand" data-i18n-skip>Client Dash Up</div>
+      <div className="brand" data-i18n-skip>Envidicy</div>
       <div className="panel-subtitle">{roleSubtitle}</div>
 
       {role === "agency" && agencyContext.agencies.length ? (
