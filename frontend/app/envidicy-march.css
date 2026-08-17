@@ -1208,3 +1208,20 @@ table tbody tr:hover {
     box-shadow: none;
   }
 }
+
+.login-register-link {
+  margin-top: 22px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+.login-register-link a {
+  color: var(--accent);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.login-register-link a:hover {
+  text-decoration: underline;
+}

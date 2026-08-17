@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect } from "react";
+import { Suspense, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { safeRelativePath } from "../../../lib/authRedirect";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
-export default function LoginSuccessPage() {
+function LoginSuccessPageContent() {
   const router = useRouter();
   const search = useSearchParams();
 
@@ -23,5 +23,13 @@ export default function LoginSuccessPage() {
         <p className="panel-subtitle">Проверяем OAuth-сессию и открываем нужный раздел.</p>
       </section>
     </main>
+  );
+}
+
+export default function LoginSuccessPage() {
+  return (
+    <Suspense fallback={<main className="login-shell" />}>
+      <LoginSuccessPageContent />
+    </Suspense>
   );
 }

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
 import { type Locale } from "../../lib/i18n";
@@ -24,7 +25,7 @@ function readRole(payload: unknown): AppRole | null {
   return role === "admin" || role === "agency" || role === "client" || role === "solo_client" ? role : null;
 }
 
-export default function LoginPage() {
+function LoginPageContent() {
   const router = useRouter();
   const search = useSearchParams();
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
@@ -261,7 +262,18 @@ export default function LoginPage() {
             Войти через Google
           </button>
         </div>
+        <div className="login-register-link">
+          Нужен доступ? <Link href="/register">Создать аккаунт</Link>
+        </div>
       </section>
     </main>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<main className="login-shell" />}>
+      <LoginPageContent />
+    </Suspense>
   );
 }

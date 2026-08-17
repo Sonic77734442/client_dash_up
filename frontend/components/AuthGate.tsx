@@ -64,6 +64,13 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     );
   }
 
+  // Public auth pages must stay usable even while the API is waking up or
+  // temporarily unreachable. Once the session check completes, authenticated
+  // users are still redirected by the rules below.
+  if (!ready && isPublic) {
+    return <>{children}</>;
+  }
+
   if (!ready) {
     return null;
   }

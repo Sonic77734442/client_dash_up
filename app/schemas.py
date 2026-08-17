@@ -832,6 +832,23 @@ class AuthPasswordLoginRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class AuthPhoneVerificationSendRequest(BaseModel):
+    phone: str = Field(min_length=7, max_length=32)
+
+
+class AuthPhoneVerificationConfirmRequest(AuthPhoneVerificationSendRequest):
+    code: str = Field(min_length=6, max_length=12)
+
+
+class AuthRegisterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    company: Optional[str] = Field(default=None, max_length=200)
+    phone: str = Field(min_length=7, max_length=32)
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+    phone_verification_token: str = Field(min_length=16, max_length=256)
+
+
 class AuthProviderConfigCreate(BaseModel):
     provider: str
     client_id: str

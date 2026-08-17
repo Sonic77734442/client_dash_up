@@ -1,7 +1,7 @@
 export type AppRole = "admin" | "agency" | "client" | "solo_client";
 
 const SAFE_URL_ORIGIN = "https://client-dash-up.local";
-const PUBLIC_PATHS = new Set(["/login", "/login/success"]);
+const PUBLIC_PATHS = new Set(["/login", "/login/success", "/register"]);
 const WORKSPACE_PREFIXES = [
   "/clients",
   "/accounts",
