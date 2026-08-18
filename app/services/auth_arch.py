@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.db import init_sqlite, provider_budget_retention_summary, sqlite_conn
 from app.schemas import (
     AuthIdentityLink,
     AuthIdentityOut,
@@ -378,6 +378,20 @@ class SqliteAuthStore:
                     raise HTTPException(status_code=409, detail="Cannot delete last active admin")
             if row["role"] in {"agency", "admin"} and row["status"] == "active":
                 self._assert_agency_owner_exit_allowed(conn, user_id)
+
+            retention = provider_budget_retention_summary(conn, actor_user_id=user_id)
+            if retention["history_count"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "provider_budget_ledger_retention_required",
+                        "message": (
+                            "This user is referenced by immutable provider budget history; "
+                            "deactivate the user instead of deleting it."
+                        ),
+                        "details": retention,
+                    },
+                )
 
             conn.execute("DELETE FROM agency_members WHERE user_id=?", (str(user_id),))
             conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))

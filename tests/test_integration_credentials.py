@@ -43,6 +43,75 @@ def mk_account(client_id: str, platform: str, external: str):
     return res.json()
 
 
+def test_integration_credential_api_returns_only_allowlisted_diagnostics():
+    reset_state()
+    secret = "meta-token-with-identifying-last-four-Z9X8"
+    created = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "meta",
+            "scope_type": "global",
+            "credentials": {
+                "access_token": secret,
+                "authorization_header": f"Bearer {secret}",
+                "cookie": {"session": secret},
+                "unknown_diagnostic": {"nested_secret": secret},
+                "meta_validation_version": 1,
+                "meta_validated_at": "2026-08-19T10:11:12+00:00",
+                "meta_app_id": "3177364462435934",
+                "meta_business_config_id": "1560512595854726",
+                "meta_business_config_source": "oauth_state",
+                "meta_user_id": "999999999",
+                "meta_scopes": ["ads_read", {"cookie": secret}],
+                "meta_granted_permissions": ["ads_read", "business_management"],
+                "meta_granular_scopes": [
+                    {
+                        "scope": "ads_management",
+                        "target_ids": ["123456789", {"secret": secret}],
+                        "authorization_header": f"Bearer {secret}",
+                    },
+                    {"scope": {"cookie": secret}, "target_ids": ["111"]},
+                ],
+                "meta_expires_at": 4_102_444_800,
+                "meta_data_access_expires_at": 4_102_444_800,
+                "meta_absolute_expires_at": 4_102_444_800,
+                "business_ids": ["569428086900853", {"cookie": secret}],
+                "login_customer_id": "123-456-7890",
+            },
+        },
+    )
+    assert created.status_code == 200
+    assert secret not in created.text
+    assert "Z9X8" not in created.text
+    payload = created.json()
+    preview = payload["credentials_preview"]
+    assert "access_token" not in preview
+    assert "authorization_header" not in preview
+    assert "cookie" not in preview
+    assert "unknown_diagnostic" not in preview
+    assert "meta_user_id" not in preview
+    assert preview["meta_app_id"] == "3177364462435934"
+    assert preview["meta_business_config_id"] == "1560512595854726"
+    assert preview["meta_granted_permissions"] == ["ads_read", "business_management"]
+    assert preview["business_ids"] == ["569428086900853"]
+    assert preview["login_customer_id"] == "123-456-7890"
+    assert preview["meta_granular_scopes"] == [
+        {"scope": "ads_management", "target_ids": ["123456789"]}
+    ]
+    assert payload["credential_keys"] == sorted(preview)
+
+    listed = client.get("/platform/integration-credentials?provider=meta&status=all")
+    assert listed.status_code == 200
+    assert secret not in listed.text
+    assert "Z9X8" not in listed.text
+    assert listed.json()["items"][0]["credentials_preview"] == preview
+
+    # Public serialization is separate from internal provider credentials.
+    internal = app.state.integration_credential_store.list(status="all", provider="meta")[0]
+    assert internal.credentials["access_token"] == secret
+    assert internal.credentials["cookie"]["session"] == secret
+
+
 def test_integration_credentials_resolution_priority_client_over_agency_over_global():
     reset_state()
     c = mk_client("Acme")

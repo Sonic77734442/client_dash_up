@@ -26,6 +26,14 @@ class AccountDiscoverer(Protocol):
     def __call__(self, credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]: ...
 
 
+@dataclass(frozen=True)
+class DiscoveredCredentialBinding:
+    ad_account_id: UUID
+    provider: str
+    external_account_id: str
+    credential_id: UUID
+
+
 @dataclass
 class DiscoveryResult:
     requested_provider: str
@@ -37,6 +45,10 @@ class DiscoveryResult:
     providers_attempted: List[str]
     providers_failed: Dict[str, str]
     items: List[AdAccountOut]
+    # Internal server-only evidence from this exact provider run. It is not
+    # included by ``to_response`` and must never be reconstructed from stored
+    # ad-account metadata.
+    credential_bindings: List[DiscoveredCredentialBinding]
 
 
 def _normalize_provider(value: Optional[str]) -> str:
@@ -253,10 +265,39 @@ class AdAccountDiscoveryService:
         skipped = 0
         discovered = 0
         items: List[AdAccountOut] = []
+        credential_bindings: List[DiscoveredCredentialBinding] = []
         providers_failed: Dict[str, str] = {}
         provider_conflicts: Dict[str, int] = {}
         provider_currency_mismatches: Dict[str, int] = {}
         normalized_expected_currency = str(expected_currency or "").strip().upper()
+
+        def _record_current_binding(
+            account: AdAccountOut,
+            *,
+            provider_name: str,
+            external_account_id: str,
+            credential_id: Optional[str],
+            meta_diagnostic: Optional[MetaCredentialDiagnostic],
+        ) -> None:
+            if (
+                provider_name != "meta"
+                or meta_diagnostic is None
+                or meta_diagnostic.status not in {"ready", "warning"}
+                or not credential_id
+            ):
+                return
+            try:
+                parsed_credential_id = UUID(credential_id)
+            except (TypeError, ValueError):
+                return
+            credential_bindings.append(
+                DiscoveredCredentialBinding(
+                    ad_account_id=account.id,
+                    provider="meta",
+                    external_account_id=external_account_id,
+                    credential_id=parsed_credential_id,
+                )
+            )
 
         for p in providers:
             discoverer = self.discoverers.get(p)
@@ -395,6 +436,13 @@ class AdAccountDiscoveryService:
                                 active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
+                            _record_current_binding(
+                                patched,
+                                provider_name=p,
+                                external_account_id=external_account_id,
+                                credential_id=cred_id,
+                                meta_diagnostic=meta_diagnostic,
+                            )
                         except HTTPException as exc:
                             if exc.status_code == 409:
                                 skipped += 1
@@ -419,6 +467,13 @@ class AdAccountDiscoveryService:
                         active_assignments.setdefault((p, external_account_id), []).append(created_row)
                         items.append(created_row)
                         created += 1
+                        _record_current_binding(
+                            created_row,
+                            provider_name=p,
+                            external_account_id=external_account_id,
+                            credential_id=cred_id,
+                            meta_diagnostic=meta_diagnostic,
+                        )
                     except HTTPException as exc:
                         # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
                         if exc.status_code == 409:
@@ -457,6 +512,13 @@ class AdAccountDiscoveryService:
                                 active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
+                            _record_current_binding(
+                                patched,
+                                provider_name=p,
+                                external_account_id=external_account_id,
+                                credential_id=cred_id,
+                                meta_diagnostic=meta_diagnostic,
+                            )
                             continue
                         raise
 
@@ -490,6 +552,7 @@ class AdAccountDiscoveryService:
             providers_attempted=providers,
             providers_failed=providers_failed,
             items=items,
+            credential_bindings=credential_bindings,
         )
 
     @staticmethod

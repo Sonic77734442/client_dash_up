@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.db import init_sqlite, provider_budget_retention_summary, sqlite_conn
 from app.schemas import (
     AgencyClientAccessCreate,
     AgencyClientAccessOut,
@@ -495,7 +495,25 @@ class SqlitePlatformAdminStore:
     def delete_agency(self, agency_id: UUID) -> None:
         now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
+            # Keep the immutable-ledger retention check, binding cleanup and
+            # agency deletion in one serialized write transaction. Otherwise a
+            # new command could be queued after the check and turn the final
+            # delete into an unhandled foreign-key failure.
+            conn.execute("BEGIN IMMEDIATE")
             self._agency_or_404(conn, agency_id)
+            retention = provider_budget_retention_summary(conn, agency_id=agency_id)
+            if retention["history_count"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "provider_budget_ledger_retention_required",
+                        "message": (
+                            "This agency is referenced by immutable provider budget history; "
+                            "archive the agency instead of deleting it."
+                        ),
+                        "details": retention,
+                    },
+                )
             member_rows = conn.execute(
                 "SELECT DISTINCT user_id FROM agency_members WHERE agency_id=?",
                 (str(agency_id),),
@@ -505,6 +523,23 @@ class SqlitePlatformAdminStore:
             conn.execute("DELETE FROM agency_invites WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_client_access WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_members WHERE agency_id=?", (str(agency_id),))
+            binding_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='provider_account_credential_bindings'
+                """
+            ).fetchone()
+            if binding_table:
+                conn.execute(
+                    """
+                    DELETE FROM provider_account_credential_bindings
+                    WHERE credential_id IN (
+                      SELECT id FROM integration_credentials
+                      WHERE scope_type='agency' AND scope_id=?
+                    )
+                    """,
+                    (str(agency_id),),
+                )
             conn.execute(
                 "DELETE FROM integration_credentials WHERE scope_type='agency' AND scope_id=?",
                 (str(agency_id),),

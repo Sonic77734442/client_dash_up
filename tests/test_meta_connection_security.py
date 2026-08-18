@@ -219,6 +219,30 @@ def test_local_diagnostic_requires_reconnect_after_app_or_config_rotation():
     )
 
 
+def test_legacy_business_config_allows_read_migration_but_explicit_write_check_rejects(monkeypatch):
+    monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "replacement-config")
+    monkeypatch.setenv("FACEBOOK_LOGIN_LEGACY_CONFIG_IDS", "business-config, older-config")
+    credentials = _validated_credentials()
+
+    read_diagnostic = diagnose_meta_credentials(credentials, now=NOW)
+    write_diagnostic = diagnose_meta_credentials(
+        credentials,
+        expected_config_id="replacement-config",
+        now=NOW,
+    )
+
+    assert (read_diagnostic.status, read_diagnostic.code, read_diagnostic.reconnect_required) == (
+        "warning",
+        "meta_business_config_legacy",
+        False,
+    )
+    assert (write_diagnostic.status, write_diagnostic.code, write_diagnostic.reconnect_required) == (
+        "error",
+        "meta_business_config_mismatch",
+        True,
+    )
+
+
 def test_meta_discovery_uses_only_selected_agency_credential_and_pins_account():
     clients, accounts, _stats, _jobs, tenant = _stores()
     selected_agency = uuid4()
@@ -264,6 +288,44 @@ def test_meta_discovery_uses_only_selected_agency_credential_and_pins_account():
     assert observed == [{key: value for key, value in candidates[1].items() if not key.startswith("__")}]
     assert result.items[0].metadata["integration_credential_id"] == str(selected_id)
     assert result.items[0].metadata["meta_connection_status"] == "ready"
+    assert len(result.credential_bindings) == 1
+    assert result.credential_bindings[0].ad_account_id == result.items[0].id
+    assert result.credential_bindings[0].external_account_id == "123"
+    assert result.credential_bindings[0].credential_id == selected_id
+
+
+def test_meta_discovery_never_emits_write_binding_evidence_for_legacy_unverified_credential():
+    clients, accounts, _stats, _jobs, tenant = _stores()
+    legacy_id = uuid4()
+    service = AdAccountDiscoveryService(
+        accounts,
+        client_store=clients,
+        discoverers={
+            "meta": lambda _credentials: [
+                {"external_account_id": "act_456", "name": "Legacy Meta", "currency": "USD"}
+            ]
+        },
+        credential_candidates_resolver=lambda *_args: [
+            {
+                "access_token": "legacy-read-only-token",
+                "__credential_id": str(legacy_id),
+                "__scope_type": "client",
+                "__scope_id": str(tenant.id),
+                "__created_by": str(uuid4()),
+            }
+        ],
+    )
+
+    result = service.discover(
+        provider="meta",
+        client_id=tenant.id,
+        user_id=None,
+        expected_currency="USD",
+    )
+
+    assert result.created == 1
+    assert result.items[0].metadata["meta_connection_status"] == "unverified"
+    assert result.credential_bindings == []
 
 
 def test_meta_sync_never_falls_back_when_bound_credential_is_missing():

@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _normalize_currency_code(value: str) -> str:
@@ -148,6 +148,196 @@ class BudgetTransferOut(BaseModel):
     note: Optional[str] = None
     changed_by: Optional[UUID] = None
     created_at: datetime
+
+
+class MetaBudgetChangeInput(BaseModel):
+    """Public budget intent. Provider account and credential IDs stay server-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_id: UUID
+    ad_account_id: UUID
+    agency_id: Optional[UUID] = None
+    target_type: Literal["campaign", "ad_set", "account"]
+    provider_target_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9]+$")
+    field: Literal["daily_budget", "lifetime_budget", "spend_cap"]
+    amount_minor: int = Field(..., strict=True, ge=0, le=9_000_000_000_000_000)
+    expected_current_minor: Optional[int] = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=9_000_000_000_000_000,
+    )
+    currency: str
+    reason: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("currency")
+    @classmethod
+    def normalize_meta_budget_currency(cls, value: str) -> str:
+        return _normalize_currency_code(value)
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_meta_budget_reason(cls, value: str) -> str:
+        normalized = " ".join(str(value or "").split())
+        if not normalized:
+            raise ValueError("reason is required")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_target_field(self):
+        allowed = {
+            "campaign": {"daily_budget", "lifetime_budget"},
+            "ad_set": {"daily_budget", "lifetime_budget"},
+            "account": {"spend_cap"},
+        }
+        if self.field not in allowed[self.target_type]:
+            raise ValueError("field is not valid for target_type")
+        if self.field != "spend_cap" and self.amount_minor == 0:
+            raise ValueError("campaign and ad set budgets must be greater than zero")
+        return self
+
+
+class MetaBudgetConfirmRequest(MetaBudgetChangeInput):
+    confirm: Literal[True]
+    preview_token: str = Field(..., min_length=40, max_length=4096)
+
+
+class MetaBudgetPublicRequest(BaseModel):
+    client_id: UUID
+    ad_account_id: UUID
+    agency_id: Optional[UUID] = None
+    target_type: Literal["campaign", "ad_set", "account"]
+    provider_target_id: str
+    field: Literal["daily_budget", "lifetime_budget", "spend_cap"]
+    amount_minor: int
+    expected_current_minor: Optional[int] = None
+    currency: str
+    reason: str
+
+
+class MetaBudgetWarningOut(BaseModel):
+    code: str
+    message: str
+    severity: Literal["info", "warning", "critical"] = "warning"
+
+
+class MetaBudgetPreviewResponse(BaseModel):
+    preview_token: str
+    issued_at: datetime
+    expires_at: datetime
+    current_minor: int
+    requested_minor: int
+    delta_minor: int
+    currency: str
+    request: MetaBudgetPublicRequest
+    warnings: List[MetaBudgetWarningOut] = Field(default_factory=list)
+
+
+class MetaBudgetCommandErrorOut(BaseModel):
+    code: str
+    message: str
+    subcode: Optional[str] = None
+    trace_id: Optional[str] = None
+    retryable: bool = False
+
+
+class MetaBudgetCommandAttemptOut(BaseModel):
+    attempt_no: int
+    started_at: datetime
+    finished_at: datetime
+    outcome: Literal["applied", "conflict", "failed", "unknown"]
+    observed_before_minor: Optional[int] = None
+    confirmed_after_minor: Optional[int] = None
+    provider_trace_id: Optional[str] = None
+    error: Optional[MetaBudgetCommandErrorOut] = None
+    reconciliation: bool = False
+
+
+class MetaBudgetResolveUnknownRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal[True]
+    resolution: Literal["accept_current_state"]
+
+
+class MetaBudgetCommandOut(BaseModel):
+    id: UUID
+    status: Literal["queued", "in_progress", "applied", "conflict", "failed", "unknown"]
+    request: MetaBudgetPublicRequest
+    observed_before_minor: int
+    confirmed_after_minor: Optional[int] = None
+    provider_trace_id: Optional[str] = None
+    error: Optional[MetaBudgetCommandErrorOut] = None
+    attempt_count: int
+    attempts: List[MetaBudgetCommandAttemptOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
+class MetaBudgetCommandResponse(BaseModel):
+    command: MetaBudgetCommandOut
+    replayed: bool = False
+
+
+class MetaBudgetCommandListResponse(BaseModel):
+    items: List[MetaBudgetCommandOut]
+    count: int
+
+
+class MetaBudgetTargetFieldOut(BaseModel):
+    field: Literal["daily_budget", "lifetime_budget"]
+    current_minor: int
+    currency: str
+    observed_at: datetime
+    editable: bool
+    reason_code: Optional[str] = None
+    message: Optional[str] = None
+
+
+class MetaBudgetTargetOut(BaseModel):
+    target_type: Literal["campaign", "ad_set"]
+    provider_target_id: str
+    name: str
+    status: str
+    budget_fields: List[MetaBudgetTargetFieldOut]
+
+
+class MetaBudgetTargetsResponse(BaseModel):
+    provider: Literal["meta"] = "meta"
+    account_id: UUID
+    items: List[MetaBudgetTargetOut]
+    count: int
+
+
+class MetaBudgetReadinessAccountOut(BaseModel):
+    id: UUID
+    name: str
+    provider_account_id: str
+    currency: str
+
+
+class MetaBudgetAllowedOut(BaseModel):
+    target_types: List[Literal["campaign", "ad_set", "account"]]
+    fields_by_target: Dict[str, List[str]]
+
+
+class MetaBudgetReadinessResponse(BaseModel):
+    provider: Literal["meta"] = "meta"
+    feature_enabled: bool
+    visible: bool
+    can_read_history: bool
+    can_preview: bool
+    can_confirm: bool
+    can_reconcile: bool
+    credential_ready: bool
+    binding_ready: bool
+    reason_code: Optional[str] = None
+    message: Optional[str] = None
+    role: Literal["admin", "agency", "client", "solo_client"]
+    account: Optional[MetaBudgetReadinessAccountOut] = None
+    allowed: MetaBudgetAllowedOut
 
 
 class ClientCreate(BaseModel):

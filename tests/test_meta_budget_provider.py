@@ -8,6 +8,7 @@ import pytest
 
 from app.services.provider_budget_commands import (
     BudgetChangeRequest,
+    BudgetConflictError,
     BudgetField,
     BudgetTargetType,
     ProviderBudgetError,
@@ -48,6 +49,145 @@ def make_adapter(handler) -> tuple[MetaBudgetAdapter, httpx.Client]:
         ),
         client,
     )
+
+
+def test_budget_target_list_returns_only_effective_campaign_and_ad_set_budget_owners():
+    calls = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        calls.append((http_request.method, http_request.url.path, dict(http_request.url.params)))
+        assert http_request.method == "GET"
+        assert http_request.headers["Authorization"] == f"Bearer {TOKEN}"
+        assert "access_token" not in str(http_request.url)
+        if http_request.url.path == "/v25.0/act_123456" and "campaigns" not in http_request.url.path:
+            return httpx.Response(
+                200,
+                json={"id": "act_123456", "account_id": "123456", "currency": "USD"},
+            )
+        if http_request.url.path == "/v25.0/act_123456/campaigns":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "700",
+                            "name": "CBO campaign",
+                            "effective_status": "ACTIVE",
+                            "account_id": "123456",
+                            "daily_budget": "5000",
+                            "lifetime_budget": "0",
+                        },
+                        {
+                            "id": "701",
+                            "name": "ABO campaign",
+                            "effective_status": "ACTIVE",
+                            "account_id": "123456",
+                            "daily_budget": "0",
+                            "lifetime_budget": "0",
+                        },
+                    ]
+                },
+            )
+        assert http_request.url.path == "/v25.0/act_123456/adsets"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "800",
+                        "campaign_id": "700",
+                        "name": "CBO child (not an owner)",
+                        "effective_status": "ACTIVE",
+                        "account_id": "123456",
+                        "daily_budget": "1000",
+                        "lifetime_budget": "0",
+                    },
+                    {
+                        "id": "801",
+                        "campaign_id": "701",
+                        "name": "ABO owner",
+                        "effective_status": "PAUSED",
+                        "account_id": "123456",
+                        "daily_budget": "0",
+                        "lifetime_budget": "12000",
+                    },
+                ]
+            },
+        )
+
+    adapter, client = make_adapter(handler)
+    try:
+        targets = adapter.list_budget_targets("123456")
+    finally:
+        client.close()
+
+    assert [(target.target_type.value, target.provider_target_id) for target in targets] == [
+        ("ad_set", "801"),
+        ("campaign", "700"),
+    ]
+    assert targets[0].budget_fields[0].field == BudgetField.LIFETIME_BUDGET
+    assert targets[0].budget_fields[0].current_minor == 12000
+    assert targets[1].budget_fields[0].field == BudgetField.DAILY_BUDGET
+    assert len(calls) == 3
+
+
+def test_budget_target_pagination_rebuilds_fixed_graph_url_from_validated_cursor():
+    page = 0
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        nonlocal page
+        if http_request.url.path == "/v25.0/act_123456":
+            return httpx.Response(
+                200,
+                json={"id": "act_123456", "account_id": "123456", "currency": "USD"},
+            )
+        if http_request.url.path.endswith("/campaigns"):
+            page += 1
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [],
+                        "paging": {
+                            "next": (
+                                "https://graph.facebook.com/v25.0/act_123456/campaigns"
+                                "?after=opaque_CURSOR-1&access_token=must-not-be-forwarded"
+                            )
+                        },
+                    },
+                )
+            assert http_request.url.params["after"] == "opaque_CURSOR-1"
+            assert "access_token" not in http_request.url.params
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(200, json={"data": []})
+
+    adapter, client = make_adapter(handler)
+    try:
+        assert adapter.list_budget_targets("123456") == []
+    finally:
+        client.close()
+    assert page == 2
+
+
+def test_budget_target_pagination_rejects_non_graph_next_host():
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/v25.0/act_123456":
+            return httpx.Response(
+                200,
+                json={"id": "act_123456", "account_id": "123456", "currency": "USD"},
+            )
+        return httpx.Response(
+            200,
+            json={"data": [], "paging": {"next": "https://evil.example/v25.0/act_123456/campaigns?after=x"}},
+        )
+
+    adapter, client = make_adapter(handler)
+    try:
+        with pytest.raises(ProviderBudgetError) as exc_info:
+            adapter.list_budget_targets("123456")
+    finally:
+        client.close()
+    assert exc_info.value.code == "meta_pagination_invalid"
 
 
 def test_account_spend_cap_read_and_write_use_allowlisted_object_and_field():
@@ -208,6 +348,56 @@ def test_ad_set_budget_read_succeeds_only_when_campaign_does_not_own_budget():
     assert snapshot.target_type == BudgetTargetType.AD_SET
 
 
+def test_ad_set_budget_read_accepts_parent_campaign_with_omitted_unset_budgets():
+    request = make_request(target_type=BudgetTargetType.AD_SET, provider_target_id="888")
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path.endswith("/888"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "888",
+                    "account_id": "123456",
+                    "campaign_id": "777",
+                    "daily_budget": "1000",
+                },
+            )
+        if http_request.url.path.endswith("/777"):
+            return httpx.Response(200, json={"id": "777", "account_id": "123456"})
+        return httpx.Response(
+            200,
+            json={"id": "act_123456", "account_id": "123456", "currency": "USD"},
+        )
+
+    adapter, client = make_adapter(handler)
+    try:
+        snapshot = adapter.read_budget(request)
+    finally:
+        client.close()
+    assert snapshot.amount_minor == 1000
+
+
+def test_exact_target_proof_cannot_relabel_an_ad_set_id_as_campaign():
+    request = make_request(target_type=BudgetTargetType.CAMPAIGN, provider_target_id="888")
+    calls = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        calls.append(http_request)
+        assert http_request.url.path == "/v25.0/act_123456/campaigns"
+        assert http_request.url.params["limit"] == "2"
+        assert http_request.url.params["filtering"] == '[{"field":"id","operator":"IN","value":["888"]}]'
+        return httpx.Response(200, json={"data": []})
+
+    adapter, client = make_adapter(handler)
+    try:
+        with pytest.raises(BudgetConflictError) as exc_info:
+            adapter.verify_budget_target(request)
+    finally:
+        client.close()
+    assert exc_info.value.code == "meta_budget_target_not_editable"
+    assert len(calls) == 1
+
+
 def test_campaign_budget_mode_switch_is_never_implicit():
     request = make_request(field=BudgetField.DAILY_BUDGET)
 
@@ -230,6 +420,33 @@ def test_campaign_budget_mode_switch_is_never_implicit():
         client.close()
 
     assert exc_info.value.code == "meta_budget_mode_switch_required"
+
+
+def test_campaign_read_accepts_missing_unset_alternate_budget_field():
+    request = make_request()
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path.endswith("/777"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "777",
+                    "account_id": "123456",
+                    "daily_budget": "1000",
+                    # Meta may omit an unset lifetime_budget entirely.
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"id": "act_123456", "account_id": "123456", "currency": "USD"},
+        )
+
+    adapter, client = make_adapter(handler)
+    try:
+        snapshot = adapter.read_budget(request)
+    finally:
+        client.close()
+    assert snapshot.amount_minor == 1000
 
 
 def test_provider_target_from_another_account_is_fail_closed():
@@ -314,6 +531,50 @@ def test_meta_error_is_sanitized_without_raw_response_or_token():
     assert TOKEN not in error.message
     assert "second-secret" not in error.message
     assert "[REDACTED]" in error.message
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "provider_subcode"),
+    [
+        ("access_token=provider-secret", "463&access_token=provider-secret"),
+        ("12345678901", "99999999999"),
+        (True, False),
+    ],
+)
+def test_meta_error_code_and_subcode_are_strict_bounded_numeric_values(
+    provider_code,
+    provider_subcode,
+):
+    request = make_request(
+        target_type=BudgetTargetType.ACCOUNT,
+        provider_target_id="123456",
+        field=BudgetField.SPEND_CAP,
+    )
+
+    def handler(_http_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "code": provider_code,
+                    "error_subcode": provider_subcode,
+                    "message": "Meta rejected the request",
+                }
+            },
+        )
+
+    adapter, client = make_adapter(handler)
+    try:
+        with pytest.raises(ProviderBudgetError) as exc_info:
+            adapter.read_budget(request)
+    finally:
+        client.close()
+
+    error = exc_info.value.provider_error
+    assert error.code == "meta_http_400"
+    assert error.subcode is None
+    assert "provider-secret" not in error.code
+    assert "provider-secret" not in str(error.subcode)
 
 
 def test_post_transport_timeout_is_unknown_not_a_retry_signal():

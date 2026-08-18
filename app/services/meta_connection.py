@@ -395,18 +395,34 @@ def diagnose_meta_credentials(
             reconnect_required=True,
         )
     stored_config_id = str(values.get("meta_business_config_id") or "").strip()
+    explicit_config_check = expected_config_id is not None
     required_config_id = str(
         expected_config_id
-        if expected_config_id is not None
+        if explicit_config_check
         else os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "")
     ).strip()
-    if required_config_id and stored_config_id != required_config_id:
+    accepted_config_ids = {required_config_id} if required_config_id else set()
+    legacy_config_ids: set[str] = set()
+    if not explicit_config_check:
+        legacy_config_ids = {
+            part.strip()
+            for part in os.getenv("FACEBOOK_LOGIN_LEGACY_CONFIG_IDS", "").split(",")
+            if part.strip()
+        }
+        accepted_config_ids.update(legacy_config_ids)
+    if accepted_config_ids and stored_config_id not in accepted_config_ids:
         return MetaCredentialDiagnostic(
             status="error",
             code="meta_business_config_mismatch",
             message="This Meta connection uses an outdated Business Login configuration. Reconnect Meta Ads.",
             reconnect_required=True,
         )
+    uses_legacy_config = bool(
+        not explicit_config_check
+        and stored_config_id
+        and stored_config_id in legacy_config_ids
+        and stored_config_id != required_config_id
+    )
     if not str(values.get("meta_user_id") or "").strip():
         return MetaCredentialDiagnostic(
             status="error",
@@ -454,6 +470,14 @@ def diagnose_meta_credentials(
             status="warning",
             code="meta_token_expiring",
             message="The Meta authorization expires soon. Reconnect Meta Ads to avoid interrupted sync.",
+            reconnect_required=False,
+            expires_at=expires_at,
+        )
+    if uses_legacy_config:
+        return MetaCredentialDiagnostic(
+            status="warning",
+            code="meta_business_config_legacy",
+            message="This Meta connection remains available for read synchronization but must be reconnected to the current Business Login configuration.",
             reconnect_required=False,
             expires_at=expires_at,
         )

@@ -2,18 +2,19 @@
 
 import asyncio
 import logging
+import re
 import secrets
 import threading
 import time
 import os
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -66,6 +67,15 @@ from app.schemas import (
     BudgetTransferOut,
     BudgetTransferRequest,
     BudgetTransferResponse,
+    MetaBudgetChangeInput,
+    MetaBudgetCommandListResponse,
+    MetaBudgetCommandOut,
+    MetaBudgetCommandResponse,
+    MetaBudgetConfirmRequest,
+    MetaBudgetPreviewResponse,
+    MetaBudgetReadinessResponse,
+    MetaBudgetResolveUnknownRequest,
+    MetaBudgetTargetsResponse,
     ClientCreate,
     ClientInviteAcceptResponse,
     ClientInviteAcceptPublicResponse,
@@ -137,8 +147,14 @@ from app.services.integration_credentials import (
     InMemoryIntegrationCredentialStore,
     IntegrationCredentialStore,
     SqliteIntegrationCredentialStore,
+    public_credential_diagnostics,
 )
-from app.services.meta_connection import MetaConnectionValidationError, validate_meta_business_connection
+from app.services.meta_connection import (
+    MetaConnectionValidationError,
+    MetaCredentialReconnectRequiredError,
+    require_usable_validated_meta_credentials,
+    validate_meta_business_connection,
+)
 from app.services.overview import OverviewService
 from app.services.operational_insights import OperationalInsightsService
 from app.services.operational_actions import (
@@ -154,6 +170,33 @@ from app.services.acl import (
     ensure_tenant_write_access,
 )
 from app.services.providers import google_ads
+from app.services.provider_budget_commands import (
+    ActorRole,
+    AgencyMemberRole,
+    BudgetActorContext,
+    BudgetChangeRequest,
+    BudgetCommandStatus,
+    BudgetConflictError,
+    BudgetCredentialContext,
+    BudgetExecutionAuthorization,
+    BudgetField,
+    BudgetPolicyError,
+    BudgetTargetType,
+    BudgetTenantContext,
+    BudgetValidationError,
+    CommandNotExecutableError,
+    CredentialScope,
+    IdempotencyConflictError,
+    InMemoryBudgetCommandStore,
+    PreviewExpiredError,
+    PreviewSigner,
+    PreviewTokenError,
+    ProviderBudgetCommand,
+    ProviderBudgetCommandError,
+    ProviderBudgetCommandService,
+    ProviderBudgetError,
+)
+from app.services.providers.meta_budget import MetaBudgetAdapter
 from app.services.audit_log import AuditLogStore, InMemoryAuditLogStore, SqliteAuditLogStore
 from app.services.alerts import AlertSignal, AlertStore, InMemoryAlertStore, SqliteAlertStore
 from app.services.platform_admin import (
@@ -173,7 +216,7 @@ from app.services.oauth import (
     SqliteOAuthStateStore,
 )
 from app.settings import get_settings, load_accounts
-from app.db import sqlite_conn
+from app.db import SqliteProviderBudgetCommandStore, sqlite_conn
 
 
 logger = logging.getLogger(__name__)
@@ -362,6 +405,7 @@ ad_account_discovery_service = AdAccountDiscoveryService(
     credential_candidates_resolver=_resolve_provider_credentials_candidates,
 )
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
+provider_budget_command_store = SqliteProviderBudgetCommandStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
 platform_admin_store: PlatformAdminStore = SqlitePlatformAdminStore(settings.budgets_db_path, auth_store)
 audit_log_store: AuditLogStore = SqliteAuditLogStore(settings.budgets_db_path)
@@ -387,6 +431,9 @@ app.state.ad_account_sync_service = ad_account_sync_service
 app.state.ad_account_discovery_service = ad_account_discovery_service
 app.state.ad_stats_store = ad_stats_store
 app.state.budget_store = budget_store
+app.state.provider_budget_command_store = provider_budget_command_store
+app.state.provider_budget_target_locks = {}
+app.state.provider_budget_target_locks_guard = threading.RLock()
 app.state.auth_store = auth_store
 app.state.platform_admin_store = platform_admin_store
 app.state.assignment_conflict_service = assignment_conflict_service
@@ -444,7 +491,9 @@ def _attach_cors_headers(request: Request, response: Response) -> Response:
         return response
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "authorization,content-type,x-csrf-token"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "authorization,content-type,idempotency-key,x-csrf-token,x-request-id"
+    )
     response.headers["Access-Control-Allow-Methods"] = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
     response.headers["Vary"] = "Origin"
     return response
@@ -461,23 +510,6 @@ def _attach_security_headers(response: Response) -> Response:
     return response
 
 
-def _mask_secret_value(value: object) -> object:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return ""
-    if len(text) <= 8:
-        return "********"
-    return f"{'*' * (len(text) - 4)}{text[-4:]}"
-
-
-def _is_sensitive_credential_key(key: str) -> bool:
-    lowered = (key or "").lower()
-    tokens = ("token", "secret", "password", "api_key", "key", "refresh")
-    return any(t in lowered for t in tokens)
-
-
 def _to_public_provider_config(cfg: AuthProviderConfigOut) -> AuthProviderConfigPublicOut:
     return AuthProviderConfigPublicOut(
         id=cfg.id,
@@ -492,14 +524,7 @@ def _to_public_provider_config(cfg: AuthProviderConfigOut) -> AuthProviderConfig
 
 
 def _to_public_integration_credential(row: IntegrationCredentialOut) -> IntegrationCredentialPublicOut:
-    preview: dict = {}
-    keys = sorted(row.credentials.keys())
-    for k in keys:
-        v = row.credentials.get(k)
-        if _is_sensitive_credential_key(k):
-            preview[k] = _mask_secret_value(v)
-        else:
-            preview[k] = v
+    keys, preview = public_credential_diagnostics(row.credentials)
     connected_label: Optional[str] = None
     if row.created_by:
         provider_norm = str(row.provider or "").strip().lower()
@@ -767,17 +792,42 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
+    safe_errors = []
+    safe_type_characters = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+    safe_location_roots = frozenset({"body", "query", "path", "header", "cookie"})
+
+    for error in exc.errors():
+        raw_type = error.get("type")
+        error_type = (
+            raw_type
+            if isinstance(raw_type, str)
+            and 0 < len(raw_type) <= 128
+            and all(character in safe_type_characters for character in raw_type)
+            else "validation_error"
+        )
+
+        raw_location = error.get("loc")
+        safe_location = []
+        if isinstance(raw_location, (list, tuple)):
+            for index, segment in enumerate(raw_location):
+                if isinstance(segment, int) and not isinstance(segment, bool):
+                    safe_location.append(segment)
+                elif index == 0 and isinstance(segment, str) and segment in safe_location_roots:
+                    safe_location.append(segment)
+                else:
+                    safe_location.append("field")
+
+        safe_errors.append({"type": error_type, "loc": safe_location, "msg": "Invalid value"})
+
     return JSONResponse(
         status_code=422,
-        content=jsonable_encoder(
-            {
-                "error": {
-                    "code": "validation_error",
-                    "message": "Validation failed",
-                    "details": {"errors": exc.errors()},
-                }
+        content={
+            "error": {
+                "code": "validation_error",
+                "message": "Validation failed",
+                "details": {"errors": safe_errors},
             }
-        ),
+        },
     )
 
 
@@ -1025,6 +1075,10 @@ def use_inmemory_stores():
     app.state.ad_account_discovery_service = discovery_service
     app.state.ad_stats_store = s
     app.state.budget_store = b
+    app.state.provider_budget_command_store = InMemoryBudgetCommandStore()
+    app.state.provider_budget_target_locks = {}
+    app.state.provider_budget_target_locks_guard = threading.RLock()
+    app.state.meta_budget_adapter_factory = None
     app.state.auth_store = auth
     app.state.platform_admin_store = platform_admin
     app.state.assignment_conflict_service = AssignmentConflictService(
@@ -1074,6 +1128,10 @@ def _ad_account_discovery_service() -> AdAccountDiscoveryService:
 
 def _budget_store() -> BudgetStore:
     return app.state.budget_store
+
+
+def _provider_budget_command_store():
+    return app.state.provider_budget_command_store
 
 
 def _auth_store() -> AuthStore:
@@ -2919,6 +2977,776 @@ def _client_or_404(client_id: UUID) -> ClientOut:
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     return client
+
+
+def _budget_env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _meta_budget_feature_enabled() -> bool:
+    return _budget_env_enabled("META_BUDGET_COMMANDS_ENABLED", False)
+
+
+def _meta_budget_rollout_configuration() -> tuple[bool, set[UUID], Optional[tuple[str, str]]]:
+    allow_all_raw = os.getenv("META_BUDGET_ALLOW_ALL_CLIENTS", "false").strip().lower()
+    if allow_all_raw not in {"1", "true", "yes", "on", "0", "false", "no", "off", ""}:
+        return False, set(), (
+            "meta_budget_rollout_configuration_invalid",
+            "META_BUDGET_ALLOW_ALL_CLIENTS must be an explicit boolean.",
+        )
+    allow_all = allow_all_raw in {"1", "true", "yes", "on"}
+    allowed: set[UUID] = set()
+    for item in os.getenv("META_BUDGET_ALLOWED_CLIENT_IDS", "").split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            allowed.add(UUID(candidate))
+        except (TypeError, ValueError):
+            return False, set(), (
+                "meta_budget_rollout_configuration_invalid",
+                "META_BUDGET_ALLOWED_CLIENT_IDS must contain only comma-separated UUIDs.",
+            )
+    return allow_all, allowed, None
+
+
+def _meta_budget_client_allowed(client_id: UUID) -> tuple[bool, Optional[tuple[str, str]]]:
+    allow_all, allowed, problem = _meta_budget_rollout_configuration()
+    if problem:
+        return False, problem
+    if allow_all or client_id in allowed:
+        return True, None
+    return False, (
+        "meta_budget_client_not_allowed",
+        "Meta budget controls are not enabled for this pilot client.",
+    )
+
+
+def _require_meta_budget_client_allowed(client_id: UUID) -> None:
+    allowed, problem = _meta_budget_client_allowed(client_id)
+    if not allowed:
+        code, message = problem or (
+            "meta_budget_client_not_allowed",
+            "Meta budget controls are not enabled for this pilot client.",
+        )
+        raise HTTPException(status_code=403, detail={"code": code, "message": message})
+
+
+def _meta_spend_cap_enabled() -> bool:
+    # Account-level spend caps have a materially larger blast radius.  The
+    # generic feature flag can never activate them.
+    return _budget_env_enabled("META_BUDGET_SPEND_CAP_ENABLED", False)
+
+
+def _meta_budget_configuration_error() -> Optional[tuple[str, str]]:
+    if not _meta_budget_feature_enabled():
+        return "meta_budget_controls_disabled", "Meta budget controls are not enabled."
+    preview_secret = os.getenv("META_BUDGET_PREVIEW_SECRET", "")
+    if len(preview_secret.encode("utf-8")) < 32:
+        return (
+            "meta_budget_preview_secret_missing",
+            "Meta budget controls require a dedicated preview signing secret.",
+        )
+    try:
+        preview_ttl = int(os.getenv("META_BUDGET_PREVIEW_TTL_SECONDS", "300"))
+    except (TypeError, ValueError):
+        preview_ttl = 0
+    if not 30 <= preview_ttl <= 900:
+        return (
+            "meta_budget_preview_ttl_invalid",
+            "Meta budget preview TTL must be an integer between 30 and 900 seconds.",
+        )
+    _allow_all, _allowed, rollout_problem = _meta_budget_rollout_configuration()
+    if rollout_problem:
+        return rollout_problem
+    required = {
+        "FACEBOOK_CLIENT_ID": os.getenv("FACEBOOK_CLIENT_ID", "").strip(),
+        "FACEBOOK_CLIENT_SECRET": os.getenv("FACEBOOK_CLIENT_SECRET", "").strip(),
+        "FACEBOOK_LOGIN_CONFIG_ID": os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip(),
+    }
+    if any(not value for value in required.values()):
+        return (
+            "meta_budget_provider_configuration_missing",
+            "Meta Ads application configuration is incomplete.",
+        )
+    return None
+
+
+def _require_meta_budget_feature() -> None:
+    problem = _meta_budget_configuration_error()
+    if problem:
+        code, message = problem
+        raise HTTPException(status_code=503, detail={"code": code, "message": message})
+
+
+def _meta_budget_preview_signer() -> PreviewSigner:
+    _require_meta_budget_feature()
+    ttl = int(os.getenv("META_BUDGET_PREVIEW_TTL_SECONDS", "300"))
+    return PreviewSigner(os.environ["META_BUDGET_PREVIEW_SECRET"], ttl_seconds=ttl)
+
+
+def _meta_budget_unknown_settlement_seconds() -> int:
+    try:
+        value = int(os.getenv("META_BUDGET_UNKNOWN_SETTLEMENT_SECONDS", "600"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_unknown_settlement_invalid",
+                "message": "Unknown-command settlement window must be an integer from 60 to 86400 seconds.",
+            },
+        ) from exc
+    if not 60 <= value <= 86400:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_unknown_settlement_invalid",
+                "message": "Unknown-command settlement window must be an integer from 60 to 86400 seconds.",
+            },
+        )
+    return value
+
+
+def _meta_budget_adapter(credentials: dict[str, Any]) -> MetaBudgetAdapter:
+    access_token = str(credentials.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_credential_incomplete",
+                "message": "The bound Meta credential has no usable access token. Reconnect Meta Ads.",
+            },
+        )
+    factory = getattr(app.state, "meta_budget_adapter_factory", None)
+    if callable(factory):
+        return factory(credentials)
+    return MetaBudgetAdapter(
+        access_token=access_token,
+        app_secret=os.getenv("FACEBOOK_CLIENT_SECRET", "").strip(),
+    )
+
+
+def _meta_budget_live_request_context(
+    ctx: RequestContext,
+    http_request: Request,
+) -> RequestContext:
+    """Rebuild mutable actor role/status/tenant grants at the money-write boundary."""
+
+    token = _get_session_token(
+        http_request.headers.get("Authorization"),
+        http_request.headers.get("X-Session-Token"),
+        http_request.cookies.get(settings.auth_cookie_name),
+        required=True,
+    )
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
+    user = _auth_store().get_user(ctx.user_id)
+    if user is None or user.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_actor_revoked",
+                "message": "The budget command actor is no longer active.",
+            },
+        )
+    if not session.valid or session.user_id != ctx.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_session_revoked",
+                "message": "The budget command session is no longer valid for the original actor.",
+            },
+        )
+    if user.role != ctx.role or session.role != ctx.role:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_actor_revoked",
+                "message": "The budget command actor is no longer active in the original role.",
+            },
+        )
+    try:
+        accessible_client_ids = {
+            row.client_id for row in _auth_store().list_client_access(user_id=ctx.user_id)
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_actor_scope_check_failed",
+                "message": "Current tenant access could not be verified.",
+            },
+        ) from exc
+    return RequestContext(
+        user_id=user.id,
+        role=user.role,
+        global_access=user.role == "admin",
+        accessible_client_ids=accessible_client_ids,
+    )
+
+
+def _meta_budget_actor_context(
+    ctx: RequestContext,
+    *,
+    client_id: UUID,
+    requested_agency_id: Optional[UUID],
+    for_write: bool,
+) -> BudgetActorContext:
+    ensure_client_access(ctx, client_id)
+    if ctx.role == "agency":
+        selected_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            requested_agency_id,
+            require_manage=for_write,
+        )
+        agency = _platform_admin_store().get_agency(selected_agency_id)
+        member = next(
+            (
+                row
+                for row in _platform_admin_store().list_members(selected_agency_id)
+                if row.user_id == ctx.user_id and row.status == "active"
+            ),
+            None,
+        )
+        bound_clients = frozenset(
+            row.client_id for row in _platform_admin_store().list_clients(selected_agency_id)
+        )
+        member_role = (
+            AgencyMemberRole(member.role)
+            if member is not None and member.role in {"owner", "manager", "member"}
+            else None
+        )
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.AGENCY,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            selected_agency_id=selected_agency_id,
+            agency_active=bool(agency and agency.status == "active"),
+            agency_member_role=member_role,
+            agency_bound_client_ids=bound_clients,
+            can_manage_spend_cap=(
+                _meta_spend_cap_enabled()
+                and member_role == AgencyMemberRole.OWNER
+            ),
+        )
+    if requested_agency_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "agency_context_not_applicable",
+                "message": "agency_id is valid only for an agency session.",
+            },
+        )
+    if ctx.role == "solo_client":
+        owned_client_id = _solo_owner_client_id_for_context(ctx)
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.SOLO_CLIENT,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            solo_owner_client_id=owned_client_id,
+            can_manage_spend_cap=False,
+        )
+    if ctx.role == "client":
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.CLIENT,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+        )
+    if ctx.role == "admin":
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.ADMIN,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            can_admin_provider_write=_budget_env_enabled("META_BUDGET_ADMIN_WRITES_ENABLED", False),
+            can_manage_spend_cap=(
+                _budget_env_enabled("META_BUDGET_ADMIN_WRITES_ENABLED", False)
+                and _meta_spend_cap_enabled()
+            ),
+        )
+    raise HTTPException(
+        status_code=403,
+        detail={"code": "meta_budget_role_forbidden", "message": "This role cannot use Meta budget controls."},
+    )
+
+
+def _meta_budget_bound_context(
+    ctx: RequestContext,
+    *,
+    account: AdAccountOut,
+    requested_agency_id: Optional[UUID],
+    for_write: bool,
+):
+    client = _client_or_404(account.client_id)
+    ensure_account_access(ctx, account.client_id, account_id=account.id)
+    if client.status != "active" or account.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_scope_inactive",
+                "message": "The client and Meta advertising account must both be active.",
+            },
+        )
+    if normalize_account_platform(account.platform) != "meta":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "meta_budget_provider_mismatch", "message": "The selected account is not a Meta account."},
+        )
+    provider_account_id = canonical_external_account_id(account.platform, account.external_account_id)
+    if not provider_account_id.isdigit():
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "meta_budget_account_invalid", "message": "The Meta account identity is invalid."},
+        )
+    if account.id in active_assignment_conflict_ids(_ad_account_store()):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_assignment_conflict",
+                "message": "This Meta account has multiple active client assignments. Resolve ownership first.",
+            },
+        )
+
+    bound = _integration_credential_store().resolve_bound_credential(
+        ad_account_id=account.id,
+        provider="meta",
+        external_account_id=provider_account_id,
+    )
+    if bound is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_rediscovery_required",
+                "message": "Rediscover this Meta account to create a verified credential binding.",
+            },
+        )
+    if not bound.security.write_eligible:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_credential_storage_not_ready",
+                "message": "Rotate this Meta credential into encrypted storage before enabling budget controls.",
+                "details": {"reason": bound.security.reason},
+            },
+        )
+    credential = bound.credential
+    values = dict(credential.credentials or {})
+    try:
+        require_usable_validated_meta_credentials(
+            values,
+            expected_app_id=os.getenv("FACEBOOK_CLIENT_ID", "").strip(),
+            expected_config_id=os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip(),
+            required_permissions=("ads_management",),
+            allow_unverified_legacy=False,
+        )
+    except MetaCredentialReconnectRequiredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": str(getattr(exc, "code", "meta_budget_credential_not_ready")),
+                "message": str(exc),
+            },
+        ) from exc
+    if "ads_management" not in {
+        str(value or "").strip().lower()
+        for value in values.get("meta_granted_permissions", [])
+        if str(value or "").strip()
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_ads_management_missing",
+                "message": "Reconnect Meta and grant ads_management before changing budgets.",
+            },
+        )
+
+    try:
+        meta_validated_at = datetime.fromisoformat(
+            str(values.get("meta_validated_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_validation_timestamp_invalid",
+                "message": "Reconnect Meta so the validated authorization timestamp can be verified.",
+            },
+        ) from exc
+    if meta_validated_at.tzinfo is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_validation_timestamp_invalid",
+                "message": "Reconnect Meta so the validated authorization timestamp can be verified.",
+            },
+        )
+
+    actor = _meta_budget_actor_context(
+        ctx,
+        client_id=account.client_id,
+        requested_agency_id=requested_agency_id,
+        for_write=for_write,
+    )
+    tenant = BudgetTenantContext(
+        client_id=account.client_id,
+        ad_account_id=account.id,
+        account_client_id=account.client_id,
+        client_active=client.status == "active",
+        account_active=account.status == "active",
+        account_platform="meta",
+    )
+    credential_ctx = BudgetCredentialContext(
+        id=credential.id,
+        provider=credential.provider,
+        status=credential.status,
+        scope_type=CredentialScope(credential.scope_type),
+        scope_id=credential.scope_id,
+        created_by=credential.created_by,
+        has_ads_management=True,
+        revision=bound.security.semantic_revision,
+        meta_app_id=str(values.get("meta_app_id") or "").strip(),
+        meta_business_config_id=str(values.get("meta_business_config_id") or "").strip(),
+        meta_user_id=str(values.get("meta_user_id") or "").strip(),
+        granted_permissions=tuple(values.get("meta_granted_permissions") or ()),
+        validation_version=int(values.get("meta_validation_version") or 0),
+        validated_at=meta_validated_at,
+        expired=False,
+    )
+    return actor, tenant, credential_ctx, values, provider_account_id
+
+
+def _meta_budget_final_execution_authorization(
+    ctx: RequestContext,
+    http_request: Request,
+    command: ProviderBudgetCommand,
+) -> BudgetExecutionAuthorization:
+    """Perform the last live authorization read immediately before Meta POST."""
+
+    try:
+        _require_meta_budget_feature()
+        _require_meta_budget_client_allowed(command.request.client_id)
+        live_ctx = _meta_budget_live_request_context(ctx, http_request)
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, _values, provider_account_id = _meta_budget_bound_context(
+            live_ctx,
+            account=account,
+            requested_agency_id=command.request.agency_id,
+            for_write=True,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        candidate_code = str(detail.get("code") or "provider_budget_reauthorization_failed")
+        safe_code = (
+            candidate_code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", candidate_code)
+            else "provider_budget_reauthorization_failed"
+        )
+        message = str(
+            detail.get("message")
+            or detail.get("detail")
+            or "Live provider budget authorization failed."
+        )
+        raise BudgetPolicyError(safe_code, message) from exc
+    # Read the independent high-blast-radius kill switch after every mutable
+    # store lookup. The actor capability is derived from this exact last read,
+    # so an agency owner cannot bypass a switch-off via an older context.
+    spend_cap_enabled = _meta_spend_cap_enabled()
+    actor = replace(
+        actor,
+        can_manage_spend_cap=(
+            spend_cap_enabled
+            and (
+                (
+                    actor.role == ActorRole.AGENCY
+                    and actor.agency_member_role == AgencyMemberRole.OWNER
+                )
+                or (
+                    actor.role == ActorRole.ADMIN
+                    and actor.can_admin_provider_write
+                )
+            )
+        ),
+    )
+    return BudgetExecutionAuthorization(
+        actor=actor,
+        tenant=tenant,
+        credential=credential,
+        provider_account_id=provider_account_id,
+        feature_enabled=True,
+        client_rollout_allowed=True,
+        binding_verified=True,
+        spend_cap_enabled=spend_cap_enabled,
+    )
+
+
+def _meta_budget_change_request(
+    payload: MetaBudgetChangeInput,
+    *,
+    account: AdAccountOut,
+    credential_id: UUID,
+    provider_account_id: str,
+) -> BudgetChangeRequest:
+    if payload.client_id != account.client_id or payload.ad_account_id != account.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_account_scope_mismatch",
+                "message": "The selected advertising account does not belong to the requested client.",
+            },
+        )
+    if payload.currency != account.currency.strip().upper():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_currency_mismatch",
+                "message": "The requested currency does not match the Meta account currency.",
+            },
+        )
+    if payload.target_type == "account" or payload.field == "spend_cap":
+        if not _meta_spend_cap_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "meta_spend_cap_disabled",
+                    "message": "Account spend-cap changes require a separate operator feature flag.",
+                },
+            )
+    return BudgetChangeRequest(
+        client_id=account.client_id,
+        agency_id=payload.agency_id,
+        ad_account_id=account.id,
+        provider_account_id=provider_account_id,
+        credential_id=credential_id,
+        target_type=payload.target_type,
+        provider_target_id=payload.provider_target_id,
+        field=payload.field,
+        amount_minor=payload.amount_minor,
+        expected_current_minor=payload.expected_current_minor,
+        currency=payload.currency,
+        reason=payload.reason,
+        source_action_id=None,
+    )
+
+
+def _assert_meta_budget_target_allowlisted(
+    adapter: MetaBudgetAdapter,
+    request: BudgetChangeRequest,
+) -> None:
+    """Bounded proof of exact provider type and effective budget owner."""
+    adapter.verify_budget_target(request)
+
+
+def _assert_meta_budget_target_not_quarantined(request: BudgetChangeRequest) -> None:
+    lookup = getattr(_provider_budget_command_store(), "target_quarantine_command_id", None)
+    quarantined_by = lookup(request) if callable(lookup) else None
+    if quarantined_by is not None:
+        raise BudgetConflictError(
+            "meta_budget_target_quarantined",
+            "An earlier budget write has an unresolved outcome; reconcile it before another change",
+        )
+
+
+def _meta_budget_public_request(request: BudgetChangeRequest) -> dict[str, Any]:
+    return {
+        "client_id": request.client_id,
+        "ad_account_id": request.ad_account_id,
+        "agency_id": request.agency_id,
+        "target_type": request.target_type.value,
+        "provider_target_id": request.provider_target_id,
+        "field": request.field.value,
+        "amount_minor": request.amount_minor,
+        "expected_current_minor": request.expected_current_minor,
+        "currency": request.currency,
+        "reason": request.reason,
+    }
+
+
+def _meta_budget_command_out(command: ProviderBudgetCommand) -> MetaBudgetCommandOut:
+    def _error(error):
+        if error is None:
+            return None
+        return {
+            "code": error.code,
+            "message": error.message,
+            "subcode": error.subcode,
+            "trace_id": error.trace_id,
+            "retryable": error.retryable,
+        }
+
+    return MetaBudgetCommandOut(
+        id=command.id,
+        status=command.status.value,
+        request=_meta_budget_public_request(command.request),
+        observed_before_minor=command.observed_before_minor,
+        confirmed_after_minor=command.confirmed_after_minor,
+        provider_trace_id=command.provider_trace_id,
+        error=_error(command.error),
+        attempt_count=command.attempt_count,
+        attempts=[
+            {
+                "attempt_no": attempt.attempt_no,
+                "started_at": attempt.started_at,
+                "finished_at": attempt.finished_at,
+                "outcome": attempt.outcome.value,
+                "observed_before_minor": attempt.observed_before_minor,
+                "confirmed_after_minor": attempt.confirmed_after_minor,
+                "provider_trace_id": attempt.provider_trace_id,
+                "error": _error(attempt.error),
+                "reconciliation": attempt.reconciliation,
+            }
+            for attempt in command.attempts
+        ],
+        created_at=command.created_at,
+        updated_at=command.updated_at,
+        completed_at=command.completed_at,
+    )
+
+
+def _raise_meta_budget_domain_error(exc: ProviderBudgetCommandError) -> None:
+    if isinstance(exc, IdempotencyConflictError):
+        status = 409
+    elif isinstance(exc, (BudgetConflictError, PreviewExpiredError, CommandNotExecutableError)):
+        status = 409
+    elif isinstance(exc, BudgetPolicyError):
+        status = 403
+    elif isinstance(exc, (BudgetValidationError, PreviewTokenError)):
+        status = 400
+    elif isinstance(exc, ProviderBudgetError):
+        status = 502
+    else:
+        status = 400
+    if isinstance(exc, CommandNotExecutableError) and exc.code == "command_not_found":
+        status = 404
+    raise HTTPException(status_code=status, detail={"code": exc.code, "message": exc.message}) from exc
+
+
+def _list_meta_budget_commands(
+    *,
+    client_id: UUID,
+    ad_account_id: Optional[UUID],
+    agency_id: Optional[UUID],
+    agency_id_is_null: bool,
+    limit: int,
+) -> list[ProviderBudgetCommand]:
+    store = _provider_budget_command_store()
+    list_method = getattr(store, "list", None)
+    if callable(list_method):
+        return list_method(
+            client_id=client_id,
+            ad_account_id=ad_account_id,
+            agency_id=agency_id,
+            agency_id_is_null=agency_id_is_null,
+            limit=limit,
+        )
+    # Isolated test-only in-memory store; production always uses the durable
+    # SQLite adapter above.
+    rows = list(getattr(store, "_items", {}).values())
+    rows = [row for row in rows if row.request.client_id == client_id]
+    if ad_account_id is not None:
+        rows = [row for row in rows if row.request.ad_account_id == ad_account_id]
+    if agency_id is not None:
+        rows = [row for row in rows if row.request.agency_id == agency_id]
+    elif agency_id_is_null:
+        rows = [row for row in rows if row.request.agency_id is None]
+    rows.sort(key=lambda row: row.created_at, reverse=True)
+    return rows[:limit]
+
+
+def _acquire_meta_budget_target_lock(
+    command: ProviderBudgetCommand,
+    *,
+    for_reconciliation: bool = False,
+) -> Optional[str]:
+    store = _provider_budget_command_store()
+    if not for_reconciliation:
+        lookup = getattr(store, "target_quarantine_command_id", None)
+        if callable(lookup) and lookup(command.request) is not None:
+            return None
+    acquire = getattr(store, "acquire_target_lock", None)
+    if callable(acquire):
+        return acquire(
+            command,
+            allow_quarantined_command=for_reconciliation,
+        )
+    key = (
+        "meta",
+        command.request.target_type.value,
+        command.request.provider_target_id,
+        command.request.field.value,
+    )
+    token = secrets.token_urlsafe(24)
+    with app.state.provider_budget_target_locks_guard:
+        if key in app.state.provider_budget_target_locks:
+            return None
+        app.state.provider_budget_target_locks[key] = (command.id, token)
+    return token
+
+
+def _release_meta_budget_target_lock(command: ProviderBudgetCommand, lease_token: str) -> None:
+    store = _provider_budget_command_store()
+    release = getattr(store, "release_target_lock", None)
+    if callable(release):
+        release(command, lease_token)
+        return
+    key = (
+        "meta",
+        command.request.target_type.value,
+        command.request.provider_target_id,
+        command.request.field.value,
+    )
+    with app.state.provider_budget_target_locks_guard:
+        if app.state.provider_budget_target_locks.get(key) == (command.id, lease_token):
+            app.state.provider_budget_target_locks.pop(key, None)
+
+
+def _renew_meta_budget_target_lock(command: ProviderBudgetCommand, lease_token: str) -> None:
+    store = _provider_budget_command_store()
+    renew = getattr(store, "renew_target_lock", None)
+    if callable(renew):
+        valid = renew(command, lease_token)
+    else:
+        key = (
+            "meta",
+            command.request.target_type.value,
+            command.request.provider_target_id,
+            command.request.field.value,
+        )
+        with app.state.provider_budget_target_locks_guard:
+            valid = app.state.provider_budget_target_locks.get(key) == (command.id, lease_token)
+    if not valid:
+        raise BudgetConflictError(
+            "meta_budget_target_lock_lost",
+            "The budget target execution lease was lost; no provider write was attempted",
+        )
+
+
+def _bind_hardened_meta_discovery_accounts(evidence: Iterable[object], *, actor_user_id: UUID) -> int:
+    """Create explicit write bindings only from this successful live discovery.
+
+    Historical metadata is never scanned or backfilled.  A validated discovery
+    service emits server-only evidence while the exact current provider
+    candidate is still in scope. Stored account metadata is never consulted.
+    """
+    bound_count = 0
+    for row in evidence:
+        try:
+            _integration_credential_store().bind_provider_account(
+                ad_account_id=row.ad_account_id,
+                provider=row.provider,
+                external_account_id=row.external_account_id,
+                credential_id=row.credential_id,
+                bound_by=actor_user_id,
+            )
+            bound_count += 1
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            logger.warning(
+                "Meta discovery binding failed account_id=%s code=%s",
+                row.ad_account_id,
+                detail.get("code", "credential_binding_failed"),
+            )
+    return bound_count
 
 
 def _ensure_client_currency(client_id: UUID, currency: str, *, resource: str) -> ClientOut:
@@ -5012,6 +5840,9 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
         upsert_existing=payload.upsert_existing,
         expected_currency=target_client.default_currency,
     )
+    budget_bindings_created = (
+        _bind_hardened_meta_discovery_accounts(result.credential_bindings, actor_user_id=ctx.user_id)
+    )
     _process_discovery_alerts(
         target_client_id=target_client_id,
         providers_attempted=result.providers_attempted,
@@ -5029,6 +5860,7 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             "created": result.created,
             "updated": result.updated,
             "skipped": result.skipped,
+            "provider_budget_bindings_created": budget_bindings_created,
             "providers_failed": result.providers_failed,
         },
     )
@@ -5529,6 +6361,626 @@ def list_ad_stats(
         allowed = {a.id for a in _ad_account_store().list(status="all") if a.client_id in ctx.accessible_client_ids}
         items = [x for x in items if x.ad_account_id in allowed]
     return {"items": [x.model_dump(mode="json") for x in items], "count": len(items)}
+
+
+@app.get(
+    "/provider-controls/meta/readiness",
+    response_model=MetaBudgetReadinessResponse,
+    summary="Check Meta budget-control readiness",
+)
+def meta_budget_readiness(
+    client_id: UUID,
+    ad_account_id: Optional[UUID] = None,
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    client = _client_or_404(client_id)
+    ensure_client_access(ctx, client_id)
+    feature_enabled = _meta_budget_feature_enabled()
+    allowed_targets: list[str] = ["campaign", "ad_set"]
+    fields_by_target: dict[str, list[str]] = {
+        "campaign": ["daily_budget", "lifetime_budget"],
+        "ad_set": ["daily_budget", "lifetime_budget"],
+    }
+    if _meta_spend_cap_enabled():
+        allowed_targets.append("account")
+        fields_by_target["account"] = ["spend_cap"]
+    base = {
+        "provider": "meta",
+        "feature_enabled": feature_enabled,
+        "visible": True,
+        "can_read_history": True,
+        "can_preview": False,
+        "can_confirm": False,
+        "can_reconcile": False,
+        "credential_ready": False,
+        "binding_ready": False,
+        "role": ctx.role,
+        "account": None,
+        "allowed": {
+            "target_types": allowed_targets,
+            "fields_by_target": fields_by_target,
+        },
+    }
+    if client.status != "active":
+        return {**base, "reason_code": "client_not_active", "message": "The selected client is not active."}
+    if ad_account_id is None:
+        return {
+            **base,
+            "reason_code": "meta_account_required",
+            "message": "Select a Meta advertising account to check readiness.",
+        }
+    account = _account_or_404(ad_account_id)
+    ensure_account_access(ctx, account.client_id, account_id=account.id)
+    if account.client_id != client_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "account_scope_mismatch", "message": "Advertising account does not belong to client."},
+        )
+    base["account"] = {
+        "id": account.id,
+        "name": account.name,
+        "provider_account_id": canonical_external_account_id(account.platform, account.external_account_id),
+        "currency": account.currency,
+    }
+    try:
+        actor, _tenant, credential, _values, _provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=agency_id,
+            for_write=False,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            **base,
+            "reason_code": str(detail.get("code") or "meta_budget_not_ready"),
+            "message": str(detail.get("message") or "Meta budget controls are not ready."),
+            "binding_ready": str(detail.get("code") or "") not in {
+                "meta_budget_rediscovery_required",
+                "meta_budget_assignment_conflict",
+            },
+        }
+
+    base["binding_ready"] = True
+    base["credential_ready"] = True
+    if actor.role == ActorRole.AGENCY:
+        base["can_reconcile"] = bool(
+            actor.agency_active
+            and actor.agency_member_role in {AgencyMemberRole.OWNER, AgencyMemberRole.MANAGER}
+            and client_id in actor.agency_bound_client_ids
+            and credential.scope_type == CredentialScope.AGENCY
+            and credential.scope_id == actor.selected_agency_id
+        )
+    elif actor.role == ActorRole.SOLO_CLIENT:
+        base["can_reconcile"] = bool(
+            actor.solo_owner_client_id == client_id
+            and credential.scope_type == CredentialScope.CLIENT
+            and credential.scope_id == client_id
+            and credential.created_by == actor.user_id
+        )
+    elif actor.role == ActorRole.ADMIN:
+        # Recovery is provider-read-only, but remains an explicitly delegated
+        # operator capability. Exact command/account/credential scope is
+        # rechecked again by the reconcile endpoint.
+        base["can_reconcile"] = bool(actor.can_admin_provider_write)
+
+    # Mutation rollout/config gates do not hide read-only incident recovery.
+    # This lets the UI reconcile UNKNOWN commands after writes are disabled,
+    # without weakening the live binding, credential or role checks above.
+    config_problem = _meta_budget_configuration_error()
+    if config_problem:
+        return {**base, "reason_code": config_problem[0], "message": config_problem[1]}
+    client_allowed, rollout_problem = _meta_budget_client_allowed(client_id)
+    if not client_allowed:
+        code, message = rollout_problem or (
+            "meta_budget_client_not_allowed",
+            "Meta budget controls are not enabled for this pilot client.",
+        )
+        return {**base, "reason_code": code, "message": message}
+    can_write = False
+    if actor.role == ActorRole.AGENCY:
+        can_write = bool(
+            actor.agency_active
+            and actor.agency_member_role in {AgencyMemberRole.OWNER, AgencyMemberRole.MANAGER}
+            and client_id in actor.agency_bound_client_ids
+            and credential.scope_type == CredentialScope.AGENCY
+            and credential.scope_id == actor.selected_agency_id
+        )
+    elif actor.role == ActorRole.SOLO_CLIENT:
+        can_write = bool(
+            actor.solo_owner_client_id == client_id
+            and credential.scope_type == CredentialScope.CLIENT
+            and credential.scope_id == client_id
+            and credential.created_by == actor.user_id
+        )
+    elif actor.role == ActorRole.ADMIN:
+        can_write = bool(
+            actor.can_admin_provider_write
+            and credential.scope_type == CredentialScope.GLOBAL
+            and credential.scope_id is None
+        )
+    base["can_preview"] = can_write
+    base["can_confirm"] = can_write
+    if not can_write:
+        reason_code = "client_read_only" if actor.role == ActorRole.CLIENT else "meta_budget_write_scope_not_ready"
+        message = (
+            "Client access is read-only."
+            if actor.role == ActorRole.CLIENT
+            else "The current role or credential scope is not authorized for Meta budget writes."
+        )
+        return {**base, "reason_code": reason_code, "message": message}
+    return {**base, "reason_code": None, "message": "Meta budget controls are ready."}
+
+
+@app.get(
+    "/provider-controls/meta/accounts/{ad_account_id}/budget-targets",
+    response_model=MetaBudgetTargetsResponse,
+    summary="List effective Meta campaign and ad-set budget owners",
+)
+def list_meta_budget_targets(
+    ad_account_id: UUID,
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    account = _account_or_404(ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    _actor, _tenant, _credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=agency_id,
+        for_write=False,
+    )
+    try:
+        targets = _meta_budget_adapter(values).list_budget_targets(provider_account_id)
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+    items = [
+        {
+            "target_type": target.target_type.value,
+            "provider_target_id": target.provider_target_id,
+            "name": target.name,
+            "status": target.status,
+            "budget_fields": [
+                {
+                    "field": field.field.value,
+                    "current_minor": field.current_minor,
+                    "currency": field.currency,
+                    "observed_at": field.observed_at,
+                    "editable": field.editable,
+                    "reason_code": field.reason_code,
+                    "message": field.message,
+                }
+                for field in target.budget_fields
+                if field.field in {BudgetField.DAILY_BUDGET, BudgetField.LIFETIME_BUDGET}
+            ],
+        }
+        for target in targets
+        if target.target_type in {BudgetTargetType.CAMPAIGN, BudgetTargetType.AD_SET}
+    ]
+    return {"provider": "meta", "account_id": account.id, "items": items, "count": len(items)}
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/preview",
+    response_model=MetaBudgetPreviewResponse,
+    summary="Preview a Meta budget change without mutating Meta",
+)
+def preview_meta_budget_change(
+    payload: MetaBudgetChangeInput,
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    account = _account_or_404(payload.ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    actor, tenant, credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=payload.agency_id,
+        for_write=True,
+    )
+    effective_payload = payload.model_copy(update={"agency_id": actor.selected_agency_id})
+    request = _meta_budget_change_request(
+        effective_payload,
+        account=account,
+        credential_id=credential.id,
+        provider_account_id=provider_account_id,
+    )
+    adapter = _meta_budget_adapter(values)
+    service = ProviderBudgetCommandService(
+        adapter=adapter,
+        store=_provider_budget_command_store(),
+        preview_signer=_meta_budget_preview_signer(),
+    )
+    try:
+        _assert_meta_budget_target_not_quarantined(request)
+        _assert_meta_budget_target_allowlisted(adapter, request)
+        preview = service.preview(request, actor=actor, tenant=tenant, credential=credential)
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+    warnings = []
+    if preview.observed_before_minor > 0:
+        change_ratio = abs(request.amount_minor - preview.observed_before_minor) / preview.observed_before_minor
+        if change_ratio >= 0.5:
+            warnings.append(
+                {
+                    "code": "large_budget_change",
+                    "message": "The requested budget differs from the current value by at least 50%.",
+                    "severity": "warning",
+                }
+            )
+    return {
+        "preview_token": preview.token,
+        "issued_at": preview.issued_at,
+        "expires_at": preview.expires_at,
+        "current_minor": preview.observed_before_minor,
+        "requested_minor": request.amount_minor,
+        "delta_minor": request.amount_minor - preview.observed_before_minor,
+        "currency": request.currency,
+        "request": _meta_budget_public_request(request),
+        "warnings": warnings,
+    }
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes",
+    response_model=MetaBudgetCommandResponse,
+    summary="Explicitly confirm and execute a Meta budget change",
+)
+def confirm_meta_budget_change(
+    payload: MetaBudgetConfirmRequest,
+    http_request: Request,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    account = _account_or_404(payload.ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    actor, tenant, credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=payload.agency_id,
+        for_write=True,
+    )
+    change_payload = MetaBudgetChangeInput(**payload.model_dump(exclude={"preview_token", "confirm"}))
+    change_payload = change_payload.model_copy(update={"agency_id": actor.selected_agency_id})
+    request = _meta_budget_change_request(
+        change_payload,
+        account=account,
+        credential_id=credential.id,
+        provider_account_id=provider_account_id,
+    )
+    service = ProviderBudgetCommandService(
+        adapter=_meta_budget_adapter(values),
+        store=_provider_budget_command_store(),
+        preview_signer=_meta_budget_preview_signer(),
+    )
+    try:
+        submission = service.submit(
+            request,
+            preview_token=payload.preview_token,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            tenant=tenant,
+            credential=credential,
+        )
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+
+    command = submission.command
+    if command.status != BudgetCommandStatus.QUEUED:
+        return {"command": _meta_budget_command_out(command), "replayed": True}
+    lease_token = _acquire_meta_budget_target_lock(command)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        # Re-read every mutable tenant, binding, credential and permission fact
+        # after queueing and immediately before the provider write.
+        current_account = _account_or_404(command.request.ad_account_id)
+        current_actor, current_tenant, current_credential, current_values, _ = _meta_budget_bound_context(
+            ctx,
+            account=current_account,
+            requested_agency_id=command.request.agency_id,
+            for_write=True,
+        )
+        execution_adapter = _meta_budget_adapter(current_values)
+        execution_service = ProviderBudgetCommandService(
+            adapter=execution_adapter,
+            store=_provider_budget_command_store(),
+            preview_signer=_meta_budget_preview_signer(),
+            before_provider_write=lambda claimed: _renew_meta_budget_target_lock(claimed, lease_token),
+            reauthorize_before_write=lambda claimed: _meta_budget_final_execution_authorization(
+                ctx,
+                http_request,
+                claimed,
+            ),
+        )
+        try:
+            _assert_meta_budget_target_allowlisted(execution_adapter, command.request)
+            command = execution_service.execute(
+                command.id,
+                actor=current_actor,
+                tenant=current_tenant,
+                credential=current_credential,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(submission.command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_completed",
+        resource_type="provider_budget_command",
+        resource_id=str(command.id),
+        ctx=ctx,
+        tenant_client_id=command.request.client_id,
+        payload={
+            "provider": "meta",
+            "ad_account_id": str(command.request.ad_account_id),
+            "target_type": command.request.target_type.value,
+            "field": command.request.field.value,
+            "status": command.status.value,
+            "amount_minor": command.request.amount_minor,
+            "currency": command.request.currency,
+        },
+    )
+    return {"command": _meta_budget_command_out(command), "replayed": submission.replayed}
+
+
+@app.get(
+    "/provider-controls/meta/budget-changes",
+    response_model=MetaBudgetCommandListResponse,
+    summary="Read tenant-scoped Meta budget command history",
+)
+def list_meta_budget_change_history(
+    client_id: UUID,
+    ad_account_id: Optional[UUID] = None,
+    agency_id: Optional[UUID] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    ctx: RequestContext = Depends(auth_context),
+):
+    _client_or_404(client_id)
+    ensure_client_access(ctx, client_id)
+    effective_agency_id = agency_id
+    if ctx.role == "agency":
+        effective_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            agency_id,
+            require_manage=False,
+        )
+        _ensure_client_bound_to_agency(effective_agency_id, client_id)
+    elif agency_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "agency_context_not_applicable", "message": "agency_id is valid only for agency users."},
+        )
+    if ctx.role == "solo_client":
+        if _solo_owner_client_id_for_context(ctx) != client_id:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Tenant access denied."})
+    if ad_account_id is not None:
+        account = _account_or_404(ad_account_id)
+        ensure_account_access(ctx, account.client_id, account_id=account.id)
+        if account.client_id != client_id:
+            raise HTTPException(status_code=409, detail={"code": "account_scope_mismatch", "message": "Account mismatch."})
+    rows = _list_meta_budget_commands(
+        client_id=client_id,
+        ad_account_id=ad_account_id,
+        agency_id=effective_agency_id,
+        agency_id_is_null=ctx.role == "solo_client",
+        limit=limit,
+    )
+    return {"items": [_meta_budget_command_out(row) for row in rows], "count": len(rows)}
+
+
+@app.get(
+    "/provider-controls/meta/budget-changes/{command_id}",
+    response_model=MetaBudgetCommandOut,
+    summary="Read one tenant-scoped Meta budget command",
+)
+def get_meta_budget_change(command_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    ensure_client_access(ctx, command.request.client_id)
+    if ctx.role == "agency":
+        if command.request.agency_id is None:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Command access denied."})
+        selected = _resolve_agency_context_for_user(
+            ctx.user_id,
+            command.request.agency_id,
+            require_manage=False,
+        )
+        _ensure_client_bound_to_agency(selected, command.request.client_id)
+    elif ctx.role == "solo_client":
+        if command.request.agency_id is not None or _solo_owner_client_id_for_context(ctx) != command.request.client_id:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Command access denied."})
+    return _meta_budget_command_out(command)
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/{command_id}/reconcile",
+    response_model=MetaBudgetCommandOut,
+    summary="Read Meta to reconcile an unknown budget command",
+)
+def reconcile_meta_budget_change(command_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    if command.status != BudgetCommandStatus.UNKNOWN:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "command_not_reconcilable",
+                "message": "Only an unknown budget command can be reconciled.",
+            },
+        )
+    lease_token = _acquire_meta_budget_target_lock(command, for_reconciliation=True)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, values, current_provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=(None if ctx.role == "admin" else command.request.agency_id),
+            for_write=True,
+        )
+        if current_provider_account_id != command.request.provider_account_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "meta_budget_recovery_account_binding_mismatch",
+                    "message": "The Meta account identity changed after this command; recovery was not attempted.",
+                },
+            )
+        service = ProviderBudgetCommandService(
+            adapter=_meta_budget_adapter(values),
+            store=_provider_budget_command_store(),
+            preview_signer=None,
+        )
+        try:
+            reconciled = service.reconcile(
+                command.id,
+                actor=actor,
+                tenant=tenant,
+                credential=credential,
+                finalize_mismatch=False,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_reconciled",
+        resource_type="provider_budget_command",
+        resource_id=str(reconciled.id),
+        ctx=ctx,
+        tenant_client_id=reconciled.request.client_id,
+        payload={"provider": "meta", "status": reconciled.status.value, "write_attempted": False},
+    )
+    return _meta_budget_command_out(reconciled)
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/{command_id}/resolve-unknown",
+    response_model=MetaBudgetCommandOut,
+    summary="Conclude an aged unknown Meta budget command from current provider state",
+)
+def resolve_unknown_meta_budget_change(
+    command_id: UUID,
+    payload: MetaBudgetResolveUnknownRequest,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    if command.status != BudgetCommandStatus.UNKNOWN:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "command_not_reconcilable", "message": "Only an unknown command can be resolved."},
+        )
+    settlement_seconds = _meta_budget_unknown_settlement_seconds()
+    unknown_since = command.updated_at
+    if unknown_since.tzinfo is None:
+        unknown_since = unknown_since.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - unknown_since.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < settlement_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_unknown_settlement_pending",
+                "message": "Wait for the settlement window before accepting the current Meta state.",
+                "details": {"retry_after_seconds": max(1, int(settlement_seconds - age_seconds))},
+            },
+        )
+    lease_token = _acquire_meta_budget_target_lock(command, for_reconciliation=True)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, values, current_provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=(None if ctx.role == "admin" else command.request.agency_id),
+            for_write=True,
+        )
+        if current_provider_account_id != command.request.provider_account_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "meta_budget_recovery_account_binding_mismatch",
+                    "message": "The Meta account identity changed after this command; recovery was not attempted.",
+                },
+            )
+        service = ProviderBudgetCommandService(
+            adapter=_meta_budget_adapter(values),
+            store=_provider_budget_command_store(),
+            preview_signer=None,
+        )
+        try:
+            resolved = service.reconcile(
+                command.id,
+                actor=actor,
+                tenant=tenant,
+                credential=credential,
+                finalize_mismatch=True,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_unknown_resolved",
+        resource_type="provider_budget_command",
+        resource_id=str(resolved.id),
+        ctx=ctx,
+        tenant_client_id=resolved.request.client_id,
+        payload={
+            "provider": "meta",
+            "status": resolved.status.value,
+            "resolution": payload.resolution,
+            "write_attempted": False,
+        },
+    )
+    return _meta_budget_command_out(resolved)
 
 
 @app.post(
