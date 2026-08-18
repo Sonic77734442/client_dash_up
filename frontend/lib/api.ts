@@ -23,6 +23,29 @@ export class ApiRequestError extends Error {
   }
 }
 
+const API_ERROR_MESSAGES_RU: Record<string, string> = {
+  agency_access_denied: "У вас нет активного доступа к выбранному агентству.",
+  agency_manage_forbidden:
+    "Подключать источники и импортировать рекламные аккаунты может только владелец или менеджер агентства.",
+  agency_membership_check_failed:
+    "Не удалось безопасно проверить доступ к агентству. Обновите страницу и попробуйте снова.",
+  agency_unbound:
+    "Пользователь ещё не добавлен ни в одно активное агентство. Администратор должен назначить его участником.",
+  agency_client_access_denied:
+    "Этот клиент ещё не привязан к выбранному агентству.",
+  client_invites_disabled:
+    "Администратор платформы отключил приглашения клиентов для этого агентства.",
+  last_active_agency_owner:
+    "Сначала назначьте другого активного владельца агентства, затем измените роль или удалите текущего.",
+  provider_connect_forbidden:
+    "Ваша роль не позволяет подключать рекламные платформы.",
+  session_required: "Сначала войдите в платформу, затем повторите подключение.",
+};
+
+function localizedApiErrorMessage(code: string, fallback: string): string {
+  return API_ERROR_MESSAGES_RU[code] || fallback;
+}
+
 function normalizeQueryPath(path: string): string {
   const qIndex = path.indexOf("?");
   if (qIndex < 0) return path;
@@ -175,9 +198,10 @@ export async function fetchJson<T>(
   if (!res.ok) {
     const envelope = body as ApiErrorEnvelope;
     const code = String(envelope?.error?.code || "").trim();
+    const fallbackMessage = envelope?.error?.message || `Запрос завершился ошибкой (${res.status})`;
     const msg = code === "selection_required"
       ? agencySelectionRequiredMessage()
-      : envelope?.error?.message || `Request failed (${res.status})`;
+      : localizedApiErrorMessage(code, fallbackMessage);
     throw new ApiRequestError(msg, res.status, code, envelope?.error?.details);
   }
 

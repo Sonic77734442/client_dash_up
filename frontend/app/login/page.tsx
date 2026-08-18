@@ -1,9 +1,10 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
+import { type Locale } from "../../lib/i18n";
 import { DEFAULT_API_BASE, normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
 import {
   type AppRole,
@@ -11,34 +12,65 @@ import {
   safeRelativePath,
 } from "../../lib/authRedirect";
 import { oauthErrorMessage } from "../../lib/oauthError";
+import { oauthRelayLaunchPath } from "../../lib/oauthLaunchRelay";
 import { clearSessionToken, setSessionToken } from "../../lib/sessionToken";
-import styles from "../register/register.module.css";
+import styles from "./login.module.css";
 
 const LS_API_BASE = "ops_api_base";
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
-function FeatureIcon({ name }: { name: "speed" | "shield" | "architecture" }) {
-  if (name === "shield") {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5.5 5.7v5.1c0 4.4 2.6 7.8 6.5 9.7 3.9-1.9 6.5-5.3 6.5-9.7V5.7L12 3Z" /><path d="m9.2 11.8 1.8 1.8 3.8-4" /></svg>;
+function FeatureIcon({ name }: { name: "overview" | "signal" | "action" }) {
+  if (name === "signal") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4.5 15a7.5 7.5 0 1 1 15 0" />
+        <path d="m12 15 4-5M8 18h8" />
+      </svg>
+    );
   }
-  if (name === "architecture") {
-    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18h14M7 15V9M12 15V5M17 15v-3" /><path d="m5 8 5-3 4 2 5-3" /></svg>;
+  if (name === "action") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 18h14M7 15V9M12 15V5M17 15v-3" />
+        <path d="m5 8 5-3 4 2 5-3" />
+      </svg>
+    );
   }
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 15a7.5 7.5 0 1 1 15 0" /><path d="m12 15 4-5M8 18h8" /></svg>;
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="4" y="5" width="16" height="14" rx="3" />
+      <path d="M8 14v2M12 10v6M16 12v4" />
+    </svg>
+  );
 }
 
 function ArrowIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M14 7l5 5-5 5" /></svg>;
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 12h14M14 7l5 5-5 5" />
+    </svg>
+  );
 }
 
 function ChevronIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>;
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  );
 }
 
 function EyeIcon({ hidden }: { hidden: boolean }) {
-  return hidden
-    ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 10.6A2 2 0 0 0 13.4 13.4M9.9 4.3A10.8 10.8 0 0 1 21 12a12.5 12.5 0 0 1-2.3 3.5M6.2 6.2A12.4 12.4 0 0 0 3 12c2.1 4 5.1 6 9 6 1.2 0 2.3-.2 3.3-.6" /></svg>
-    : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12c2.1-4 5.1-6 9-6s6.9 2 9 6c-2.1 4-5.1 6-9 6s-6.9-2-9-6Z" /><circle cx="12" cy="12" r="2.5" /></svg>;
+  return hidden ? (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 3l18 18M10.6 10.6A2 2 0 0 0 13.4 13.4M9.9 4.3A10.8 10.8 0 0 1 21 12a12.5 12.5 0 0 1-2.3 3.5M6.2 6.2A12.4 12.4 0 0 0 3 12c2.1 4 5.1 6 9 6 1.2 0 2.3-.2 3.3-.6" />
+    </svg>
+  ) : (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 12c2.1-4 5.1-6 9-6s6.9 2 9 6c-2.1 4-5.1 6-9 6s-6.9-2-9-6Z" />
+      <circle cx="12" cy="12" r="2.5" />
+    </svg>
+  );
 }
 
 function readRole(payload: unknown): AppRole | null {
@@ -64,11 +96,12 @@ function LoginPageContent() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const { locale } = useLocale();
+  const { locale, setLocale } = useLocale();
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
   const requestedNext = useMemo(() => safeRelativePath(search.get("next"), "/"), [search]);
   const oauthError = useMemo(() => oauthErrorMessage(search.get("oauth_error")), [search]);
+  const tr = (en: string, ru: string) => locale === "en" ? en : ru;
 
   function redirectAfterLogin(payload: unknown) {
     const role = readRole(payload);
@@ -183,41 +216,54 @@ function LoginPageContent() {
     clearSessionToken();
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
     const params = new URLSearchParams({ next: requestedNext, intent: "login" });
-    window.location.href = `${base}/auth/${provider}/start?${params.toString()}`;
+    window.location.href = base.startsWith("/")
+      ? oauthRelayLaunchPath(provider, params)
+      : `${base}/auth/${provider}/start?${params.toString()}`;
   }
 
-  const tr = (en: string, ru: string) => locale === "en" ? en : ru;
   const features = [
     {
-      icon: "speed" as const,
-      title: tr("Financial speed in real time", "Финансовая скорость в реальном времени"),
-      text: tr("Instant spend reconciliation for large advertising budgets.", "Мгновенная сверка расходов для больших рекламных бюджетов."),
+      icon: "overview" as const,
+      title: tr("Every client and channel in one view", "Все клиенты и площадки в одном окне"),
+      text: tr(
+        "Google Ads, Meta and campaign performance without switching between cabinets.",
+        "Google Ads, Meta и показатели кампаний — без переключения между кабинетами.",
+      ),
     },
     {
-      icon: "shield" as const,
-      title: tr("Corporate control", "Корпоративный контроль"),
-      text: tr("Deep compliance monitoring and immutable audit logs.", "Глубокий комплаенс-мониторинг и неизменяемые журналы аудита."),
+      icon: "signal" as const,
+      title: tr("Deviations are visible immediately", "Отклонения видны сразу"),
+      text: tr(
+        "Plan, actuals and anomalies are collected into a single operational picture.",
+        "План, факт и аномалии собраны в единую операционную картину.",
+      ),
     },
     {
-      icon: "architecture" as const,
-      title: tr("Architectural Ledger", "Архитектурный Ledger"),
-      text: tr("Structured financial operations built to scale.", "Структурированные финансовые операции для масштабирования."),
+      icon: "action" as const,
+      title: tr("From data to the next action", "От данных — к следующему действию"),
+      text: tr(
+        "Clear reasons, priorities and reports for agency and client teams.",
+        "Понятные причины, приоритеты и отчёты для агентства и клиента.",
+      ),
     },
   ];
 
+  const statusMessage = error || oauthError;
+
   return (
     <div className={styles.page} data-i18n-skip>
-      <aside className={styles.hero}>
+      <aside className={styles.hero} aria-label={tr("About Dash Envidicy", "О Dash Envidicy")}>
         <div className={styles.pattern} />
         <div className={styles.heroInner}>
-          <Link className={styles.brand} href="/login">Envidicy</Link>
+          <Link className={styles.brand} href="/login" aria-label="Envidicy">Envidicy</Link>
+          <span className={styles.productLabel}>Dash</span>
           <h1 className={styles.heroTitle}>
-            {tr("Manage advertising operations", "Управляйте рекламными операциями")}
+            {tr("Run advertising operations with clarity", "Управляйте рекламными операциями")}
           </h1>
           <p className={styles.heroSubtitle}>
             {tr(
-              "Accounts, top-ups, planning and reporting in one place",
-              "Аккаунты, пополнения, планирование и отчетность в одном месте",
+              "Clients, advertising accounts, campaigns, deviations and reports in one place.",
+              "Клиенты, рекламные аккаунты, кампании, отклонения и отчёты — в одном месте.",
             )}
           </p>
           <div className={styles.featureList}>
@@ -233,40 +279,82 @@ function LoginPageContent() {
           </div>
         </div>
         <div className={styles.heroFooter}>
-          <span>{tr("Trusted by leading platforms", "Нам доверяют ведущие платформы")}</span>
+          <span>{tr("One Envidicy ecosystem", "Единая экосистема Envidicy")}</span>
           <div className={styles.heroLine} />
         </div>
       </aside>
 
       <main className={styles.side}>
         <div className={styles.panel}>
-          <nav className={styles.products} aria-label="Envidicy products">
+          <nav className={styles.products} aria-label={tr("Envidicy products", "Продукты Envidicy")}>
             <a href="https://app.envidicy.kz">App Envidicy</a>
-            <a className={styles.productActive} href="https://dash.envidicy.kz">Dash Envidicy</a>
+            <span className={styles.productActive} aria-current="page">Dash Envidicy</span>
             <a href="https://crm.envidicy.kz">CRM Envidicy</a>
           </nav>
-          <span className={styles.mobileBrand}>Envidicy</span>
-          <div className={styles.panelHead}>
-            <h2 className={styles.panelTitle}>
-              {inviteToken ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
-            </h2>
-            <p className={styles.panelText}>
-              {inviteToken
-                ? tr("Create a password to join the workspace.", "Создайте пароль, чтобы войти в рабочее пространство.")
-                : tr("Enter your details to access your dashboard.", "Введите данные для входа в кабинет.")}
-            </p>
+
+          <div className={styles.mobileTopline}>
+            <span className={styles.mobileBrand}>Envidicy</span>
+            <label className={styles.localeControl}>
+              <span className={styles.srOnly}>{tr("Language", "Язык")}</span>
+              <select
+                value={locale}
+                onChange={(event) => setLocale(event.target.value as Locale)}
+                aria-label={tr("Language", "Язык")}
+              >
+                <option value="ru">RU</option>
+                <option value="en">EN</option>
+              </select>
+            </label>
           </div>
 
-          <div className={styles.card}>
+          <div className={styles.panelHead}>
+            <div>
+              <p className={styles.eyebrow}>Dash Envidicy</p>
+              <h2 className={styles.panelTitle}>
+                {inviteToken ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
+              </h2>
+              <p className={styles.panelText}>
+                {inviteToken
+                  ? tr("Create a password to join the workspace.", "Создайте пароль, чтобы войти в рабочее пространство.")
+                  : tr("Enter your details to access the advertising operations center.", "Войдите в операционный центр управления рекламой.")}
+              </p>
+            </div>
+            <label className={`${styles.localeControl} ${styles.desktopLocale}`}>
+              <span className={styles.srOnly}>{tr("Language", "Язык")}</span>
+              <select
+                value={locale}
+                onChange={(event) => setLocale(event.target.value as Locale)}
+                aria-label={tr("Language", "Язык")}
+              >
+                <option value="ru">RU</option>
+                <option value="en">EN</option>
+              </select>
+            </label>
+          </div>
+
+          <section className={styles.card} aria-label={inviteToken ? tr("Invitation", "Приглашение") : tr("Sign in form", "Форма входа")}>
             {inviteToken ? (
               <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void acceptInvite(); }}>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("Name", "Имя")}</span>
-                  <input className={styles.fieldInput} value={inviteName} onChange={(event) => setInviteName(event.target.value)} placeholder={tr("Ivan Ivanov", "Иван Иванов")} />
+                  <input
+                    className={styles.fieldInput}
+                    value={inviteName}
+                    onChange={(event) => setInviteName(event.target.value)}
+                    placeholder={tr("Ivan Ivanov", "Иван Иванов")}
+                    autoComplete="name"
+                  />
                 </label>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("Create password", "Придумайте пароль")}</span>
-                  <input className={styles.fieldInput} type="password" value={invitePassword} onChange={(event) => setInvitePassword(event.target.value)} placeholder="********" />
+                  <input
+                    className={styles.fieldInput}
+                    type="password"
+                    value={invitePassword}
+                    onChange={(event) => setInvitePassword(event.target.value)}
+                    placeholder={tr("At least 8 characters", "Минимум 8 символов")}
+                    autoComplete="new-password"
+                  />
                 </label>
                 <button className={styles.submit} type="submit" disabled={loading}>
                   <span>{loading ? tr("Accepting...", "Принимаем…") : tr("Accept invitation", "Принять приглашение")}</span>
@@ -277,26 +365,74 @@ function LoginPageContent() {
               <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void signInWithPassword(); }}>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>Email</span>
-                  <input className={styles.fieldInput} type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" autoComplete="email" />
+                  <input
+                    className={styles.fieldInput}
+                    type="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="name@company.com"
+                    autoComplete="email"
+                  />
                 </label>
-                <label className={styles.field}>
-                  <span className={styles.fieldLabel}>{tr("Password", "Пароль")}</span>
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel} htmlFor="login-password">
+                    {tr("Password", "Пароль")}
+                  </label>
                   <span className={styles.fieldInputWrap}>
-                    <input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="********" autoComplete="current-password" />
-                    <button className={styles.visibilityButton} type="button" onClick={() => setShowPassword((value) => !value)} aria-label={showPassword ? tr("Hide password", "Скрыть пароль") : tr("Show password", "Показать пароль")}>
+                    <input
+                      id="login-password"
+                      type={showPassword ? "text" : "password"}
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      placeholder={tr("At least 8 characters", "Минимум 8 символов")}
+                      autoComplete="current-password"
+                    />
+                    <button
+                      className={styles.visibilityButton}
+                      type="button"
+                      onClick={() => setShowPassword((value) => !value)}
+                      aria-label={showPassword ? tr("Hide password", "Скрыть пароль") : tr("Show password", "Показать пароль")}
+                    >
                       <EyeIcon hidden={showPassword} />
                     </button>
                   </span>
-                </label>
+                </div>
                 <button className={styles.submit} type="submit" disabled={loading}>
                   <span>{loading ? tr("Signing in...", "Входим…") : tr("Sign in", "Войти")}</span>
                   <ArrowIcon />
                 </button>
-                <div className={styles.divider}><span>OR</span></div>
-                <button className={styles.metaButton} type="button" onClick={() => startOAuthLogin("facebook")} disabled={loading}>
-                  <span className={styles.metaMark}>f</span>
-                  <span>Continue with Meta</span>
-                </button>
+
+                <div className={styles.divider}><span>{tr("or", "или")}</span></div>
+
+                <p className={styles.oauthHint}>
+                  {tr(
+                    "Your first Facebook sign-in creates a client workspace immediately, without approval. Facebook and Google are used only to sign in; advertising accounts are connected later in Advertising sources.",
+                    "Первый вход через Facebook сразу создаст ваш клиентский кабинет — без ожидания подтверждения. Facebook и Google здесь используются только для входа; рекламные кабинеты подключаются позже в разделе «Источники рекламы».",
+                  )}
+                </p>
+
+                <div className={styles.providerGrid}>
+                  <button
+                    className={styles.providerButton}
+                    type="button"
+                    onClick={() => startOAuthLogin("facebook")}
+                    disabled={loading}
+                    aria-label={tr("Sign in with Facebook", "Войти через Facebook")}
+                  >
+                    <span className={styles.metaMark}>f</span>
+                    <span>{tr("Continue with Meta", "Продолжить с Meta")}</span>
+                  </button>
+                  <button
+                    className={styles.providerButton}
+                    type="button"
+                    onClick={() => startOAuthLogin("google")}
+                    disabled={loading}
+                    aria-label={tr("Sign in with Google", "Войти через Google")}
+                  >
+                    <span className={styles.googleMark}>G</span>
+                    <span>{tr("Continue with Google", "Продолжить с Google")}</span>
+                  </button>
+                </div>
               </form>
             )}
 
@@ -305,31 +441,50 @@ function LoginPageContent() {
                 <div className={styles.divider}><span>{tr("internal access", "внутренний доступ")}</span></div>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("API address", "Адрес API")}</span>
-                  <input className={styles.fieldInput} value={apiBase} onChange={(event) => setApiBase(event.target.value)} placeholder="http://127.0.0.1:8000" />
+                  <input
+                    className={styles.fieldInput}
+                    value={apiBase}
+                    onChange={(event) => setApiBase(event.target.value)}
+                    placeholder="http://127.0.0.1:8000"
+                  />
                 </label>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("Session token", "Токен сессии")}</span>
-                  <input className={styles.fieldInput} type="password" value={token} onChange={(event) => setToken(event.target.value)} />
+                  <input
+                    className={styles.fieldInput}
+                    type="password"
+                    value={token}
+                    onChange={(event) => setToken(event.target.value)}
+                  />
                 </label>
                 <button className={styles.codeButton} type="button" onClick={() => void signInWithToken()} disabled={loading}>
                   {tr("Sign in with token", "Войти по токену")}
                 </button>
               </div>
             ) : null}
-          </div>
+          </section>
 
           <div className={styles.bottomLinks}>
-            <button type="button" onClick={() => setError(tr("Open the password setup link from your invitation.", "Откройте ссылку установки пароля из приглашения."))}>
+            <button
+              type="button"
+              onClick={() => setError(tr("Open the password setup link from your invitation.", "Откройте ссылку установки пароля из приглашения."))}
+            >
               <span>{tr("Set password", "Установить пароль")}</span>
               <ChevronIcon />
             </button>
             <span className={styles.dot} />
-            <Link href="/register">
+            <button
+              type="button"
+              onClick={() => setError(tr("Use Meta or Google for instant access, or ask your administrator for an invitation.", "Войдите через Meta или Google без ожидания либо запросите приглашение у администратора."))}
+            >
               <span>{tr("Need access?", "Нужен доступ?")}</span>
               <ChevronIcon />
-            </Link>
+            </button>
           </div>
-          <p className={styles.status}>{error || oauthError || ""}</p>
+
+          <p className={`${styles.status} ${statusMessage ? styles.statusVisible : ""}`} role={statusMessage ? "alert" : undefined}>
+            {statusMessage || ""}
+          </p>
         </div>
       </main>
     </div>
@@ -338,7 +493,7 @@ function LoginPageContent() {
 
 export default function LoginPage() {
   return (
-    <Suspense fallback={<main className="login-shell" />}>
+    <Suspense fallback={<main className={styles.loadingShell} aria-label="Loading" />}>
       <LoginPageContent />
     </Suspense>
   );

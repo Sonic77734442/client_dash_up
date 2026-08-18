@@ -14,11 +14,13 @@ import {
   setSessionToken,
 } from "../../../lib/sessionToken";
 import {
+  AgencyClientAccessOut,
   AgencyInviteIssueResponse,
   AgencyInviteOut,
   AgencyMemberOut,
   AgencyOut,
   AuthMeResponse,
+  ClientOut,
   SessionContext,
 } from "../../../lib/types";
 
@@ -51,6 +53,12 @@ function agencyRoleLabel(v: "owner" | "manager" | "member") {
   if (v === "owner") return "Владелец";
   if (v === "manager") return "Менеджер";
   return "Участник";
+}
+
+function agencyRoleCapabilities(v: "owner" | "manager" | "member") {
+  if (v === "owner") return "управляет командой, клиентами и подключениями";
+  if (v === "manager") return "управляет клиентами и подключениями";
+  return "видит отчёты и обновляет уже добавленные аккаунты";
 }
 
 function agencyStatusLabel(v: string) {
@@ -90,6 +98,11 @@ export default function PlatformAgenciesPage() {
 
   const [members, setMembers] = useState<AgencyMemberOut[]>([]);
   const [invites, setInvites] = useState<AgencyInviteOut[]>([]);
+  const [clientBindings, setClientBindings] = useState<AgencyClientAccessOut[]>([]);
+  const [clients, setClients] = useState<ClientOut[]>([]);
+  const [bindClientId, setBindClientId] = useState("");
+  const [bindingLoading, setBindingLoading] = useState(false);
+  const [detailsLoading, setDetailsLoading] = useState(false);
 
   const [users, setUsers] = useState<UserItem[]>([]);
 
@@ -105,6 +118,7 @@ export default function PlatformAgenciesPage() {
   const [memberStatus, setMemberStatus] = useState<"active" | "inactive">("active");
 
   const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"owner" | "manager" | "member">("member");
   const [lastInviteUrl, setLastInviteUrl] = useState("");
 
   const selectedAgency = useMemo(
@@ -118,12 +132,20 @@ export default function PlatformAgenciesPage() {
   );
 
   const loadRefData = useCallback(async () => {
-    try {
-      const usersRes = await req<{ items: UserItem[] }>("/auth/internal/users");
-      setUsers((usersRes.items || []).filter((u) => u.role === "agency" || u.role === "admin"));
-    } catch {
-      setUsers([]);
-    }
+    const [usersResult, clientsResult] = await Promise.allSettled([
+      req<{ items: UserItem[] }>("/auth/internal/users"),
+      req<{ items: ClientOut[] }>("/clients?status=all"),
+    ]);
+    setUsers(
+      usersResult.status === "fulfilled"
+        ? (usersResult.value.items || []).filter((u) => u.role === "agency" || u.role === "admin")
+        : [],
+    );
+    setClients(
+      clientsResult.status === "fulfilled"
+        ? (clientsResult.value.items || []).filter((client) => client.status !== "archived")
+        : [],
+    );
   }, [req]);
 
   const loadAgencies = useCallback(async () => {
@@ -139,15 +161,19 @@ export default function PlatformAgenciesPage() {
 
   const loadAgencyDetails = useCallback(
     async (agencyId: string) => {
-      const m = await req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`);
-      let i: AgencyInviteOut[] = [];
       try {
-        i = await req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`);
-      } catch {
-        i = [];
+        setDetailsLoading(true);
+        const [m, b, inviteResult] = await Promise.all([
+          req<AgencyMemberOut[]>(`/platform/agencies/${agencyId}/members`),
+          req<AgencyClientAccessOut[]>(`/platform/agencies/${agencyId}/clients`),
+          req<AgencyInviteOut[]>(`/platform/agencies/${agencyId}/invites?status=all`).catch(() => []),
+        ]);
+        setMembers(m || []);
+        setClientBindings(b || []);
+        setInvites(inviteResult || []);
+      } finally {
+        setDetailsLoading(false);
       }
-      setMembers(m || []);
-      setInvites(i || []);
     },
     [req]
   );
@@ -170,6 +196,8 @@ export default function PlatformAgenciesPage() {
     if (!selectedAgencyId) {
       setMembers([]);
       setInvites([]);
+      setClientBindings([]);
+      setBindClientId("");
       return;
     }
     void loadAgencyDetails(selectedAgencyId).catch((err) => {
@@ -192,11 +220,37 @@ export default function PlatformAgenciesPage() {
 
   const selectedStats = useMemo(() => {
     const activeMembers = members.filter((m) => m.status === "active").length;
+    const activeConnectionManagers = members.filter(
+      (m) => m.status === "active" && (m.role === "owner" || m.role === "manager"),
+    ).length;
+    const activeOwners = members.filter((m) => m.status === "active" && m.role === "owner").length;
     return {
       totalMembers: members.length,
       activeMembers,
+      activeConnectionManagers,
+      activeOwners,
     };
   }, [members]);
+
+  const boundClientIds = useMemo(
+    () => new Set(clientBindings.map((binding) => binding.client_id)),
+    [clientBindings],
+  );
+  const availableClients = useMemo(
+    () => clients.filter((client) => client.status === "active" && !boundClientIds.has(client.id)),
+    [boundClientIds, clients],
+  );
+  const clientsById = useMemo(
+    () => new Map(clients.map((client) => [client.id, client])),
+    [clients],
+  );
+
+  useEffect(() => {
+    if (!selectedAgencyId || detailsLoading) return;
+    const nextDefaultRole = selectedStats.activeOwners === 0 ? "owner" : "member";
+    setMemberRole(nextDefaultRole);
+    setInviteRole(nextDefaultRole);
+  }, [detailsLoading, selectedAgencyId, selectedStats.activeOwners]);
 
   async function createAgency() {
     if (!createName.trim()) {
@@ -268,6 +322,7 @@ export default function PlatformAgenciesPage() {
       await loadAgencies();
       setMembers([]);
       setInvites([]);
+      setClientBindings([]);
       push("Агентство удалено", "success");
     } catch (err) {
       push(err instanceof Error ? err.message : "Не удалось удалить агентство", "error");
@@ -298,7 +353,7 @@ export default function PlatformAgenciesPage() {
         method: "POST",
         body: JSON.stringify({
           email: inviteEmail.trim().toLowerCase(),
-          member_role: "member",
+          member_role: inviteRole,
           expires_in_days: 7,
         }),
       });
@@ -308,6 +363,46 @@ export default function PlatformAgenciesPage() {
       push("Приглашение создано", "success");
     } catch (err) {
       push(err instanceof Error ? err.message : "Не удалось создать приглашение", "error");
+    }
+  }
+
+  async function bindClient() {
+    if (!selectedAgency || !bindClientId || boundClientIds.has(bindClientId)) return;
+    const client = clientsById.get(bindClientId);
+    if (!client) return;
+    try {
+      setBindingLoading(true);
+      await req<AgencyClientAccessOut>(`/platform/agencies/${selectedAgency.id}/clients`, {
+        method: "POST",
+        body: JSON.stringify({ client_id: bindClientId }),
+      });
+      await loadAgencyDetails(selectedAgency.id);
+      setBindClientId("");
+      push(`Клиент «${client.name}» добавлен в портфель агентства`, "success");
+    } catch (err) {
+      push(err instanceof Error ? err.message : "Не удалось добавить клиента в агентство", "error");
+    } finally {
+      setBindingLoading(false);
+    }
+  }
+
+  async function revokeClientBinding(binding: AgencyClientAccessOut) {
+    if (!selectedAgency) return;
+    const clientName = clientsById.get(binding.client_id)?.name || binding.client_id.slice(0, 8);
+    if (!window.confirm(
+      `Убрать клиента «${clientName}» из агентства ${selectedAgency.name}? Участники потеряют доступ к его данным, но сам клиент и рекламные аккаунты не удалятся.`,
+    )) return;
+    try {
+      setBindingLoading(true);
+      await req<{ status: string }>(`/platform/agencies/${selectedAgency.id}/clients/${binding.id}`, {
+        method: "DELETE",
+      });
+      await loadAgencyDetails(selectedAgency.id);
+      push(`Клиент «${clientName}» исключён из портфеля агентства`, "success");
+    } catch (err) {
+      push(err instanceof Error ? err.message : "Не удалось убрать клиента из агентства", "error");
+    } finally {
+      setBindingLoading(false);
     }
   }
 
@@ -468,8 +563,9 @@ export default function PlatformAgenciesPage() {
 
           <section className="agency-flow" style={{ marginTop: 12 }}>
             <div className="agency-flow-step">1. Выберите агентство</div>
-            <div className="agency-flow-step">2. Добавьте участника и роль</div>
-            <div className="agency-flow-step">3. Пригласите пользователя агентства</div>
+            <div className="agency-flow-step">2. Назначьте владельца</div>
+            <div className="agency-flow-step">3. Добавьте клиентов</div>
+            <div className="agency-flow-step">4. Пригласите команду</div>
           </section>
 
           <section className="agency-stats" style={{ marginTop: 12 }}>
@@ -555,22 +651,39 @@ export default function PlatformAgenciesPage() {
                 </article>
               </section>
 
+              {selectedAgency && !detailsLoading && selectedStats.activeConnectionManagers === 0 ? (
+                <div className="alert-card high" style={{ marginTop: 10 }}>
+                  <div className="alert-priority high">НАСТРОЙКА НЕ ЗАВЕРШЕНА</div>
+                  <div className="insight-text" style={{ marginTop: 8 }}>
+                    У агентства нет активного владельца или менеджера. Никто не сможет подключить Google Ads или Meta Ads и найти новые рекламные аккаунты. Назначьте первого участника владельцем.
+                  </div>
+                </div>
+              ) : null}
+
+              {selectedAgency && !detailsLoading && selectedStats.activeConnectionManagers > 0 && selectedStats.activeOwners === 0 ? (
+                <div className="muted-note" style={{ marginTop: 10 }}>
+                  Подключениями уже может управлять менеджер, но у агентства нет активного владельца. Следующий участник и приглашение по умолчанию получат роль владельца.
+                </div>
+              ) : null}
+
               <div className="panel drawer-section">
                 <h3>Шаг 2. Добавьте участника</h3>
-                <div className="panel-subtitle">Выберите пользователя платформы и назначьте его роль внутри агентства.</div>
+                <div className="panel-subtitle">
+                  Выберите пользователя платформы и назначьте роль. Первому участнику автоматически предлагается роль владельца.
+                </div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
-                  <select value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)}>
+                  <select aria-label="Пользователь агентства" value={memberUserId} onChange={(e) => setMemberUserId(e.target.value)}>
                     <option value="">Выберите пользователя</option>
                     {users.map((u) => (
                       <option key={u.id} value={u.id}>{u.name} ({userRoleLabel(u.role)})</option>
                     ))}
                   </select>
-                  <select value={memberRole} onChange={(e) => setMemberRole(e.target.value as "owner" | "manager" | "member")}>
-                    <option value="owner">Владелец</option>
-                    <option value="manager">Менеджер</option>
-                    <option value="member">Участник</option>
+                  <select aria-label="Роль участника" value={memberRole} onChange={(e) => setMemberRole(e.target.value as "owner" | "manager" | "member")}>
+                    <option value="owner">Владелец — команда, клиенты и подключения</option>
+                    <option value="manager">Менеджер — клиенты и подключения</option>
+                    <option value="member">Участник — отчёты и готовые аккаунты</option>
                   </select>
-                  <select value={memberStatus} onChange={(e) => setMemberStatus(e.target.value as "active" | "inactive")}>
+                  <select aria-label="Статус участника" value={memberStatus} onChange={(e) => setMemberStatus(e.target.value as "active" | "inactive")}>
                     <option value="active">Активен</option>
                     <option value="inactive">Неактивен</option>
                   </select>
@@ -586,7 +699,9 @@ export default function PlatformAgenciesPage() {
                     return (
                       <div key={m.id} className="activity-item">
                         <div><strong>{user?.name || m.user_id.slice(0, 8)}</strong></div>
-                        <div className="muted">{agencyRoleLabel(m.role)} | {memberStatusLabel(m.status)} | {fmtDate(m.updated_at)}</div>
+                        <div className="muted">
+                          {agencyRoleLabel(m.role)} · {agencyRoleCapabilities(m.role)} · {memberStatusLabel(m.status)} · {fmtDate(m.updated_at)}
+                        </div>
                         <div className="alert-actions" style={{ marginTop: 6 }}>
                           <button
                             className="mini-btn"
@@ -614,8 +729,64 @@ export default function PlatformAgenciesPage() {
               </div>
 
               <div className="panel drawer-section">
-                <h3>Шаг 3. Пригласите пользователя агентства</h3>
-                <div className="panel-subtitle">Создайте одноразовую ссылку: пользователь примет приглашение на странице входа.</div>
+                <h3>Шаг 3. Добавьте клиентов агентства</h3>
+                <div className="panel-subtitle">
+                  Участники увидят данные только добавленных сюда клиентов. Уже добавленные клиенты повторно не предлагаются.
+                </div>
+                <div className="session-controls" style={{ marginTop: 8 }}>
+                  <label>
+                    <span>Клиент</span>
+                    <select
+                      aria-label="Клиент агентства"
+                      value={bindClientId}
+                      onChange={(e) => setBindClientId(e.target.value)}
+                    >
+                      <option value="">Выберите клиента</option>
+                      {availableClients.map((client) => (
+                        <option key={client.id} value={client.id}>{client.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className="primary-btn"
+                    disabled={!selectedAgency || !bindClientId || bindingLoading || adminOnly === true}
+                    onClick={() => void bindClient()}
+                    title={!bindClientId ? "Сначала выберите клиента" : undefined}
+                  >
+                    {bindingLoading ? "Сохраняем…" : "Добавить клиента"}
+                  </button>
+                </div>
+                {!availableClients.length && clients.length > 0 ? (
+                  <div className="muted-note" style={{ marginTop: 8 }}>Все активные клиенты уже добавлены в это агентство.</div>
+                ) : null}
+                <div className="drawer-list">
+                  {clientBindings.map((binding) => {
+                    const client = clientsById.get(binding.client_id);
+                    return (
+                      <div key={binding.id} className="activity-item">
+                        <div><strong>{client?.name || binding.client_id.slice(0, 8)}</strong></div>
+                        <div className="muted">Доступ выдан · {fmtDate(binding.updated_at)}</div>
+                        <div className="alert-actions" style={{ marginTop: 6 }}>
+                          <button
+                            className="mini-btn"
+                            disabled={bindingLoading || adminOnly === true}
+                            onClick={() => void revokeClientBinding(binding)}
+                          >
+                            Убрать из агентства
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {!clientBindings.length && !detailsLoading ? (
+                    <div className="muted">Клиенты ещё не добавлены. Без клиента агентство не увидит рекламные аккаунты и не сможет запустить синхронизацию.</div>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="panel drawer-section">
+                <h3>Шаг 4. Пригласите пользователя агентства</h3>
+                <div className="panel-subtitle">Создайте одноразовую ссылку и сразу укажите возможности нового участника.</div>
                 <div className="session-controls" style={{ marginTop: 8 }}>
                   <input
                     type="email"
@@ -623,6 +794,11 @@ export default function PlatformAgenciesPage() {
                     onChange={(e) => setInviteEmail(e.target.value)}
                     placeholder="member@agency.com"
                   />
+                  <select aria-label="Роль приглашения" value={inviteRole} onChange={(e) => setInviteRole(e.target.value as "owner" | "manager" | "member")}>
+                    <option value="owner">Владелец — команда, клиенты и подключения</option>
+                    <option value="manager">Менеджер — клиенты и подключения</option>
+                    <option value="member">Участник — отчёты и готовые аккаунты</option>
+                  </select>
                 </div>
                 <div className="alert-actions" style={{ marginTop: 8 }}>
                   <button className="primary-btn" disabled={!selectedAgency || !inviteEmail || !canManageMembers} onClick={() => void issueInvite()}>

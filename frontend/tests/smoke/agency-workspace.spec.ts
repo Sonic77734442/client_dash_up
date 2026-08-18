@@ -85,17 +85,18 @@ test("agency workspace routes are stable and role-scoped", async ({ page, contex
   await metaConnect.click();
   await expect(page.getByRole("heading", { name: "Подключить Meta Ads" })).toBeVisible();
 
-  await page.route("**/auth/facebook/start?**", async (route) => {
+  await page.route("**/api/connect/start?**", async (route) => {
     await route.fulfill({ status: 200, contentType: "text/html", body: "ok" });
   });
   const requestPromise = page.waitForRequest((oauthRequest) =>
-    oauthRequest.url().includes("/auth/facebook/start?"),
+    oauthRequest.url().includes("/api/connect/start?"),
   );
   await page.getByRole("button", { name: "Перейти к авторизации" }).click();
   const oauthRequest = await requestPromise;
   const oauthUrl = new URL(oauthRequest.url());
 
-  expect(oauthUrl.pathname).toMatch(/\/auth\/facebook\/start$/);
+  expect(oauthUrl.pathname).toBe("/api/connect/start");
+  expect(oauthUrl.searchParams.get("source")).toBe("m");
   expect(oauthUrl.searchParams.get("intent")).toBe("connect");
   expect(oauthUrl.searchParams.get("connect_mode")).toBe("add");
   expect(oauthUrl.searchParams.get("agency_id")).toBe(agency.id);
@@ -131,6 +132,41 @@ test("archived clients are not offered as discovery targets", async ({ page, con
   await expect(discoveryTarget.locator("option", { hasText: archivedName })).toHaveCount(0);
 });
 
+test("client registry stays fail-closed when agency scope cannot be loaded", async ({ page, context, request }) => {
+  const token = await createAgencySessionWithAccess(request);
+  await attachSession(page, context, token);
+  let clientListRequests = 0;
+
+  await page.route("**/platform/agencies?status=active", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "agency_scope_unavailable", message: "Не удалось загрузить агентства для проверки доступа." },
+      }),
+    });
+  });
+  await page.route("**/clients?status=all", async (route) => {
+    clientListRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [{ id: "foreign-client", name: "Чужой клиент", status: "active" }] }),
+    });
+  });
+
+  await page.goto("/clients");
+  const agencySelect = page.getByLabel("Текущее агентство");
+  await expect(agencySelect).toBeVisible({ timeout: 30_000 });
+  await expect(agencySelect).toBeDisabled();
+  await expect(
+    page.locator("main .warning").filter({ hasText: "Не удалось загрузить агентства для проверки доступа." }),
+  ).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(clientListRequests).toBe(0);
+  await expect(page.getByText("Чужой клиент", { exact: true })).toHaveCount(0);
+});
+
 test("switching agency drops delayed old scope and constrains bulk sync", async ({ page, context, request }) => {
   test.setTimeout(120_000);
   const fixture = await createMultiAgencySessionWithAccess(request);
@@ -158,8 +194,14 @@ test("switching agency drops delayed old scope and constrains bulk sync", async 
   await new Promise((resolve) => setTimeout(resolve, 1_200));
   await expect(page.getByText(north.clientId.slice(0, 8), { exact: false })).toHaveCount(0);
 
+  let reloadAuthRequests = 0;
+  page.on("request", (networkRequest) => {
+    if (new URL(networkRequest.url()).pathname.endsWith("/auth/me")) reloadAuthRequests += 1;
+  });
   await page.reload();
   await expect(page.getByLabel("Текущее агентство")).toHaveValue(south.agencyId, { timeout: 30_000 });
+  await page.waitForTimeout(300);
+  expect(reloadAuthRequests).toBe(1);
 
   await page.goto("/accounts");
   const accountsAgencySelect = page.getByLabel("Текущее агентство");

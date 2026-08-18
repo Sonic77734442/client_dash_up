@@ -110,6 +110,13 @@ export default function ClientsPage() {
 
   const loadClients = useCallback(async () => {
     const isCurrentRequest = beginScopedRequest();
+    if (!agencyContext.role) {
+      setItems([]);
+      setClientInvitesAllowed(false);
+      throw new Error(
+        agencyContext.error || "Не удалось безопасно проверить роль и доступ к клиентам. Обновите страницу.",
+      );
+    }
     if (
       agencyContext.role === "agency"
       && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
@@ -151,8 +158,14 @@ export default function ClientsPage() {
   useEffect(() => {
     setItems([]);
     setClientInvitesAllowed(false);
-    setWarning(agencyContext.selectionRequired ? agencySelectionRequiredMessage() : "");
-  }, [agencyContext.selectedAgencyId, agencyContext.selectionRequired]);
+    setWarning(
+      agencyContext.selectionRequired
+        ? agencySelectionRequiredMessage()
+        : !agencyContext.loading && !agencyContext.role
+          ? agencyContext.error || "Не удалось безопасно проверить роль и доступ к клиентам."
+          : "",
+    );
+  }, [agencyContext.error, agencyContext.loading, agencyContext.role, agencyContext.selectedAgencyId, agencyContext.selectionRequired]);
 
   useEffect(() => {
     if (!ready || agencyContext.loading) return;

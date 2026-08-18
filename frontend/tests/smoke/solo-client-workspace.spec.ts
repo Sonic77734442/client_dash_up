@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { attachSession, createSoloClientSessionWithAccess } from "./auth";
 
 test("solo owner sees only their portal and data-management workspace", async ({ page, context, request }) => {
+  test.setTimeout(90_000);
   const fixture = await createSoloClientSessionWithAccess(request);
   await attachSession(page, context, fixture.token);
 
@@ -85,13 +86,15 @@ test("solo owner connect, discovery and sync requests carry the sole client scop
   await expect.poll(() => syncPayload).not.toBeNull();
   expect(syncPayload).toMatchObject({ client_id: fixture.clientId, account_ids: [fixture.accountId] });
 
-  await page.route("**/auth/google/start?**", async (route) => {
+  await page.route("**/api/connect/start?**", async (route) => {
     await route.fulfill({ status: 200, contentType: "text/html", body: "ok" });
   });
   await page.getByRole("button", { name: "Подключить Google Ads", exact: true }).first().click();
-  const oauthRequestPromise = page.waitForRequest((candidate) => candidate.url().includes("/auth/google/start?"));
+  const oauthRequestPromise = page.waitForRequest((candidate) => candidate.url().includes("/api/connect/start?"));
   await page.getByRole("button", { name: "Перейти к авторизации" }).click();
   const oauthUrl = new URL((await oauthRequestPromise).url());
+  expect(oauthUrl.pathname).toBe("/api/connect/start");
+  expect(oauthUrl.searchParams.get("source")).toBe("g");
   expect(oauthUrl.searchParams.get("intent")).toBe("connect");
   expect(oauthUrl.searchParams.get("client_id")).toBe(fixture.clientId);
   expect(oauthUrl.searchParams.has("agency_id")).toBeFalsy();

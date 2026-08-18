@@ -288,10 +288,18 @@ export function AppSidebar({
       <div className="brand" data-i18n-skip>Envidicy</div>
       <div className="panel-subtitle">{roleSubtitle}</div>
 
-      {role === "agency" && agencyContext.agencies.length ? (
+      {role === "agency" ? (
         <div className="agency-context-switcher">
           <label htmlFor="agency-context-select">Текущее агентство</label>
-          {agencyContext.agencies.length === 1 ? (
+          {agencyContext.agencies.length === 0 ? (
+            <select id="agency-context-select" aria-label="Текущее агентство" value="" disabled>
+              <option value="">
+                {agencyContext.loading
+                  ? "Загружаем агентства…"
+                  : agencyContext.error || "Нет доступных агентств"}
+              </option>
+            </select>
+          ) : agencyContext.agencies.length === 1 ? (
             <div className="agency-context-current" title={agencyContext.agencies[0].name}>
               {agencyContext.agencies[0].name}
             </div>
@@ -310,6 +318,11 @@ export function AppSidebar({
           )}
           {agencyContext.selectionRequired ? (
             <div className="agency-context-hint">Выберите агентство для работы с его клиентами и подключениями.</div>
+          ) : null}
+          {!agencyContext.loading && agencyContext.error ? (
+            <button className="mini-btn" type="button" onClick={() => void agencyContext.refresh()}>
+              Повторить загрузку
+            </button>
           ) : null}
         </div>
       ) : null}

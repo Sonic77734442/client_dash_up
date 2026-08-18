@@ -109,6 +109,42 @@ export default function IntegrationsPage() {
   const [selectedProvider, setSelectedProvider] = useState("");
   const [syncLoading, setSyncLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  const currentRole = agencyContext.role || "unknown";
+  const canManageAgencyConnections = useMemo(() => {
+    if (currentRole === "admin" || soloClient) return true;
+    if (currentRole !== "agency") return false;
+    const member = agencyContext.currentMember;
+    return !!member
+      && member.status === "active"
+      && (member.role === "owner" || member.role === "manager");
+  }, [agencyContext.currentMember, currentRole, soloClient]);
+  const connectionManagementReason = useMemo(() => {
+    if (currentRole === "client") return "Клиент видит данные, но не управляет подключениями.";
+    if (currentRole === "agency" && !agencyContext.selectedAgencyId) return agencySelectionRequiredMessage();
+    if (currentRole === "agency" && !agencyContext.portfolioReady) {
+      return agencyContext.portfolioError || "Портфель агентства ещё загружается.";
+    }
+    if (currentRole === "agency" && !canManageAgencyConnections) {
+      return "Подключать платформы и искать новые аккаунты может только владелец или менеджер агентства. Участник может обновлять уже добавленные аккаунты.";
+    }
+    if (currentRole === "agency" && agencyContext.clientIds.length === 0) {
+      return "Сначала администратор должен добавить агентству хотя бы одного активного клиента.";
+    }
+    if (soloClient && !agencyContext.soloClientReady) {
+      return "Для подключения должен быть назначен ровно один активный клиент.";
+    }
+    return "";
+  }, [
+    agencyContext.clientIds.length,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.selectedAgencyId,
+    agencyContext.soloClientReady,
+    canManageAgencyConnections,
+    currentRole,
+    soloClient,
+  ]);
+  const connectionControlsEnabled = canManageAgencyConnections && !connectionManagementReason;
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -402,6 +438,7 @@ export default function IntegrationsPage() {
       (total, item) => total + (item.assignment_conflict_accounts_count || 0),
       0,
     );
+  const setupActionNeedsConnectionManagement = setup.href.includes("#provider-connections");
 
   return (
     <>
@@ -458,6 +495,22 @@ export default function IntegrationsPage() {
 
           <DataSourcesNav active="overview" />
 
+          {currentRole === "agency" && agencyContext.portfolioReady && !agencyContext.loading && !canManageAgencyConnections ? (
+            <section className="data-next-step" style={{ marginTop: 12 }}>
+              <strong>Режим участника</strong>
+              <span>
+                Вы можете смотреть состояние источников и запускать синхронизацию уже добавленных аккаунтов. Новые подключения, поиск аккаунтов, переподключение и отключение доступны владельцу или менеджеру агентства.
+              </span>
+            </section>
+          ) : null}
+
+          {currentRole === "agency" && canManageAgencyConnections && agencyContext.portfolioReady && agencyContext.clientIds.length === 0 ? (
+            <section className="data-next-step" style={{ marginTop: 12 }}>
+              <strong>Сначала добавьте клиента</strong>
+              <span>Попросите администратора привязать к агентству хотя бы одного активного клиента. После этого можно подключить платформу и найти рекламные аккаунты.</span>
+            </section>
+          ) : null}
+
           {!soloClient && assignmentConflictCount > 0 ? (
             <section className="alert-card high" style={{ marginTop: 12 }}>
               <div className="alert-priority high">ТРЕБУЕТСЯ РЕШЕНИЕ</div>
@@ -488,9 +541,15 @@ export default function IntegrationsPage() {
               </div>
             </div>
             <div className="data-setup-action">
-              <Link className="primary-btn" href={setup.href} aria-disabled={loading}>
-                {loading ? "Загрузка…" : setup.action}
-              </Link>
+              {setupActionNeedsConnectionManagement && !connectionControlsEnabled ? (
+                <button className="primary-btn" disabled title={connectionManagementReason || undefined}>
+                  {loading ? "Загрузка…" : setup.action}
+                </button>
+              ) : (
+                <Link className="primary-btn" href={setup.href} aria-disabled={loading}>
+                  {loading ? "Загрузка…" : setup.action}
+                </Link>
+              )}
               <small>Система подсказывает только следующий необходимый шаг</small>
             </div>
           </section>
@@ -531,7 +590,11 @@ export default function IntegrationsPage() {
                   <h3 style={{ margin: 0 }}>Рекламные платформы</h3>
                   <div className="panel-subtitle">Выберите платформу, чтобы увидеть состояние и доступные действия</div>
                 </div>
-                <Link className="ghost-btn" href="/sync-monitor#provider-connections">+ Подключить</Link>
+                {connectionControlsEnabled ? (
+                  <Link className="ghost-btn" href="/sync-monitor#provider-connections">+ Подключить</Link>
+                ) : (
+                  <button className="ghost-btn" disabled title={connectionManagementReason || undefined}>+ Подключить</button>
+                )}
               </div>
               <label className="data-provider-search">
                 <span className="sr-only">Найти платформу</span>
@@ -574,7 +637,11 @@ export default function IntegrationsPage() {
                   <div className="data-empty-state">
                     <strong>Платформы ещё не подключены</strong>
                     <span>Подключите Meta или Google Ads — мы автоматически найдём рекламные аккаунты.</span>
-                    <Link className="primary-btn" href="/sync-monitor#provider-connections">Подключить платформу</Link>
+                    {connectionControlsEnabled ? (
+                      <Link className="primary-btn" href="/sync-monitor#provider-connections">Подключить платформу</Link>
+                    ) : (
+                      <button className="primary-btn" disabled title={connectionManagementReason || undefined}>Подключить платформу</button>
+                    )}
                   </div>
                 ) : null}
               </div>
@@ -657,9 +724,15 @@ export default function IntegrationsPage() {
                   </details>
 
                   <div className="data-provider-actions">
-                    <Link className="primary-btn" href="/sync-monitor#provider-connections">
-                      Управлять подключением
-                    </Link>
+                    {connectionControlsEnabled ? (
+                      <Link className="primary-btn" href="/sync-monitor#provider-connections">
+                        Управлять подключением
+                      </Link>
+                    ) : (
+                      <button className="primary-btn" disabled title={connectionManagementReason || undefined}>
+                        Управлять подключением
+                      </button>
+                    )}
                     <button
                       className="ghost-btn"
                       onClick={() => void runProviderSync()}
