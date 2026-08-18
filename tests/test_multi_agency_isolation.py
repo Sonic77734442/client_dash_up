@@ -221,6 +221,18 @@ def test_multi_agency_discovery_uses_credentials_only_from_selected_agency():
             headers=_auth(admin_token),
         )
         assert credential.status_code == 200
+    direct_client_credential = client.post(
+        "/platform/integration-credentials",
+        json={
+            "provider": "meta",
+            "scope_type": "client",
+            "scope_id": tenant.json()["id"],
+            "connection_key": "meta:direct-client-owner",
+            "credentials": {"access_token": "direct-client-token"},
+        },
+        headers=_auth(admin_token),
+    )
+    assert direct_client_credential.status_code == 200
 
     observed_tokens: list[str] = []
 

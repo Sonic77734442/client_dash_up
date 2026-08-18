@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
@@ -8,6 +9,9 @@ from fastapi import HTTPException
 from app.services.meta_version import meta_graph_api_version
 
 META_INSIGHTS_MAX_PAGES = 100
+META_AUTH_ERROR_CODES = {102, 190}
+META_PERMISSION_ERROR_CODES = {10, 200}
+META_RATE_LIMIT_ERROR_CODES = {4, 17, 32, 613}
 DEFAULT_CONVERSION_ACTION_TYPES = {
     "purchase",
     "lead",
@@ -61,6 +65,135 @@ def _conversion_action_types() -> set[str]:
     return parsed or set(DEFAULT_CONVERSION_ACTION_TYPES)
 
 
+def _meta_error_code(response: object) -> Optional[int]:
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    try:
+        return int(error.get("code"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _raise_meta_api_error(response: object) -> None:
+    """Map an untrusted Meta error to a stable, non-sensitive API error."""
+    try:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        status_code = 0
+    meta_code = _meta_error_code(response)
+    if status_code in {401, 403} or meta_code in META_AUTH_ERROR_CODES.union(META_PERMISSION_ERROR_CODES):
+        raise HTTPException(
+            status_code=401 if meta_code in META_AUTH_ERROR_CODES or status_code == 401 else 403,
+            detail={
+                "code": "meta_auth_failed",
+                "message": "Meta authorization or permissions are invalid. Reconnect Meta Ads.",
+            },
+        )
+    if status_code == 429 or meta_code in META_RATE_LIMIT_ERROR_CODES:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "meta_rate_limited",
+                "message": "Meta is temporarily rate-limiting requests. Retry later.",
+            },
+        )
+    if status_code >= 500 or status_code <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "meta_provider_unavailable",
+                "message": "Meta API is temporarily unavailable. Retry later.",
+            },
+        )
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "meta_request_invalid",
+            "message": "Meta rejected the request. Check the ad account and connection settings.",
+        },
+    )
+
+
+def _raise_meta_response_invalid() -> None:
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "code": "meta_response_invalid",
+            "message": "Meta returned an invalid response. Retry later or reconnect Meta Ads.",
+        },
+    )
+
+
+def _raise_meta_pagination_invalid() -> None:
+    raise HTTPException(
+        status_code=502,
+        detail={"code": "meta_pagination_invalid", "message": "Meta returned an invalid pagination link."},
+    )
+
+
+def _validated_paging_url(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _raise_meta_pagination_invalid()
+    raw = value.strip()
+    if not raw:
+        return None
+    if len(raw) > 8192:
+        _raise_meta_pagination_invalid()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        parsed = None
+        port = None
+    if (
+        parsed is None
+        or parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "graph.facebook.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        _raise_meta_pagination_invalid()
+    return raw
+
+
+def _validated_meta_page(response: object) -> tuple[List[Dict[str, object]], Optional[str]]:
+    """Validate a successful Graph response before consuming any rows."""
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:
+        _raise_meta_response_invalid()
+
+    if not isinstance(payload, dict):
+        _raise_meta_response_invalid()
+    if "error" in payload:
+        # Meta can return a Graph error in a HTTP 200 response. Treat it exactly
+        # like a non-2xx provider error and never consume sibling data.
+        _raise_meta_api_error(response)
+
+    if "data" not in payload or not isinstance(payload["data"], list):
+        _raise_meta_response_invalid()
+    page_rows = payload["data"]
+    if any(not isinstance(row, dict) for row in page_rows):
+        _raise_meta_response_invalid()
+
+    if "paging" not in payload:
+        return page_rows, None
+    paging = payload["paging"]
+    if not isinstance(paging, dict):
+        _raise_meta_pagination_invalid()
+    return page_rows, _validated_paging_url(paging.get("next"))
+
+
 def _sum_actions_conversions(actions: object) -> Optional[float]:
     if not isinstance(actions, list):
         return None
@@ -101,15 +234,10 @@ def _fetch_paginated_insights(url: str, params: Dict[str, object]) -> List[Dict[
             return rows
         resp = httpx.get(next_url, params=next_params, timeout=20)
         if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
+            _raise_meta_api_error(resp)
 
-        payload = resp.json()
-        page_rows = payload.get("data", [])
-        if isinstance(page_rows, list):
-            rows.extend(row for row in page_rows if isinstance(row, dict))
-
-        paging = payload.get("paging") or {}
-        next_url = paging.get("next") if isinstance(paging, dict) else None
+        page_rows, next_url = _validated_meta_page(resp)
+        rows.extend(page_rows)
         # Meta's paging.next is already a complete URL (including its cursor and
         # access token). Reapplying the original query parameters can reset the
         # cursor and repeatedly fetch page one.
@@ -140,17 +268,15 @@ def list_accounts(config_override: Optional[Dict[str, Any]] = None) -> List[Dict
         while next_url:
             resp = httpx.get(next_url, params=next_params, timeout=20)
             if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Meta API error: {resp.text}")
-            payload = resp.json()
-            for row in payload.get("data", []):
+                _raise_meta_api_error(resp)
+            page_rows, next_url = _validated_meta_page(resp)
+            for row in page_rows:
                 parsed = _extract_account_row(row, source)
                 account_id = str(parsed["external_account_id"]).strip()
                 if not account_id or account_id in seen:
                     continue
                 seen.add(account_id)
                 out.append(parsed)
-            paging = payload.get("paging") or {}
-            next_url = paging.get("next")
             next_params = None
 
     try:

@@ -100,7 +100,12 @@ function LoginPageContent() {
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
   const requestedNext = useMemo(() => safeRelativePath(search.get("next"), "/"), [search]);
-  const oauthError = useMemo(() => oauthErrorMessage(search.get("oauth_error")), [search]);
+  const oauthErrorCode = useMemo(
+    () => String(search.get("oauth_error") || "").trim().toLowerCase(),
+    [search],
+  );
+  const oauthError = useMemo(() => oauthErrorMessage(oauthErrorCode), [oauthErrorCode]);
+  const needsFacebookMigration = oauthErrorCode === "facebook_migration_required";
   const tr = (en: string, ru: string) => locale === "en" ? en : ru;
 
   function redirectAfterLogin(payload: unknown) {
@@ -210,12 +215,15 @@ function LoginPageContent() {
     }
   }
 
-  function startOAuthLogin(provider: "facebook" | "google") {
+  function startOAuthLogin(
+    provider: "facebook" | "google",
+    intent: "login" | "migrate" = "login",
+  ) {
     const base = normalizeApiBase(apiBase, defaultApiBase);
     localStorage.setItem(LS_API_BASE, base);
     clearSessionToken();
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
-    const params = new URLSearchParams({ next: requestedNext, intent: "login" });
+    const params = new URLSearchParams({ next: requestedNext, intent });
     window.location.href = base.startsWith("/")
       ? oauthRelayLaunchPath(provider, params)
       : `${base}/auth/${provider}/start?${params.toString()}`;
@@ -433,6 +441,25 @@ function LoginPageContent() {
                     <span>{tr("Continue with Google", "Продолжить с Google")}</span>
                   </button>
                 </div>
+
+                {needsFacebookMigration ? (
+                  <div className={styles.migrationNotice} role="status">
+                    <p>
+                      {tr(
+                        "Confirm the old and new Facebook sign-ins once. We will keep your current role, clients and history.",
+                        "Один раз подтвердите старый и новый вход Facebook. Текущая роль, клиенты и история сохранятся.",
+                      )}
+                    </p>
+                    <button
+                      className={styles.migrationButton}
+                      type="button"
+                      onClick={() => startOAuthLogin("facebook", "migrate")}
+                      disabled={loading}
+                    >
+                      {tr("Transfer Facebook sign-in", "Перенести Facebook-вход")}
+                    </button>
+                  </div>
+                ) : null}
               </form>
             )}
 

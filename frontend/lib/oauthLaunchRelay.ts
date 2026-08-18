@@ -113,7 +113,13 @@ export function resolveOAuthRelayTarget(requestUrl: URL, rawUpstreamBase?: strin
   }
 
   const intent = target.searchParams.get("intent");
-  if (intent !== null && intent !== "login" && intent !== "connect") {
+  if (
+    intent !== null
+    && intent !== "login"
+    && intent !== "connect"
+    && intent !== "migrate"
+    && intent !== "link"
+  ) {
     throw new OAuthRelayRequestError("invalid_oauth_launch", "OAuth launch parameters are invalid");
   }
 

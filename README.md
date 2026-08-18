@@ -130,8 +130,11 @@ Backend for digital analytics with normalized spend, manual budgets, and unified
   - `GET /auth/facebook/start` -> `GET /auth/facebook/callback`
   - `GET /auth/google/start` -> `GET /auth/google/callback`
   - `intent=login` resolves an internal user via `auth_identities`; `intent=connect` requires an existing admin/agency session and stores integration credentials without creating an auth identity
-  - Facebook platform login uses the separate `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`, and `FACEBOOK_AUTH_REDIRECT_URI` app credentials
-  - Meta Ads connection uses `FACEBOOK_CLIENT_ID`, `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and `FACEBOOK_LOGIN_CONFIG_ID`
+  - Facebook platform login uses `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`, and `FACEBOOK_AUTH_REDIRECT_URI`; these values may point to the same Meta App as the advertising connection, while the OAuth purposes and scopes remain separate
+  - Meta Ads connection uses `FACEBOOK_CLIENT_ID`, `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and `FACEBOOK_LOGIN_CONFIG_ID`; the callback verifies the returned token's app, user, granted permissions, and absolute expiry before persisting it
+  - `META_REQUIRED_PERMISSIONS` controls the comma-separated Business Login permission check and defaults to `ads_read`; `ads_management` also satisfies the read requirement and must be enforced separately before provider budget writes, while `business_management` is needed only for configured Business Portfolio enumeration
+  - an App ID migration can be enabled explicitly with `FACEBOOK_AUTH_LEGACY_CLIENT_ID`, `FACEBOOK_AUTH_LEGACY_CLIENT_SECRET`, and `FACEBOOK_AUTH_LEGACY_REDIRECT_URI`; it is disabled only when all three values are empty, while partial configuration fails closed; while enabled, an unknown primary Facebook subject cannot auto-provision a workspace
+  - `intent=migrate` proves the already-linked legacy Facebook subject and then the primary subject in two single-use OAuth steps; both app-qualified and historical raw legacy subjects are accepted only when every matching record belongs to the same active user, otherwise migration fails closed; `intent=link` requires the same active backend session at start and callback; neither flow merges users by email or creates a workspace
   - callback sets `ops_session` httpOnly cookie and redirects to frontend login-success route
   - start/callback flow uses state + nonce cookie validation (double-submit) to harden CSRF protection
   - external auth does not grant authorization; tenant access still comes from role + `user_client_access`

@@ -240,6 +240,35 @@ class SqliteAuthStore:
         if blocking:
             _raise_last_active_agency_owner(str(blocking["agency_id"]))
 
+    @staticmethod
+    def _rebuild_active_agency_access(conn, user_id: UUID, now: str) -> None:
+        """Replace a user's scope with the canonical active agency union."""
+        conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
+        rows = conn.execute(
+            """
+            SELECT DISTINCT aca.client_id
+            FROM agency_members am
+            JOIN agencies a ON a.id=am.agency_id
+            JOIN users u ON u.id=am.user_id
+            JOIN agency_client_access aca ON aca.agency_id=am.agency_id
+            WHERE am.user_id=?
+              AND am.status='active'
+              AND a.status='active'
+              AND u.status='active'
+              AND u.role='agency'
+            """,
+            (str(user_id),),
+        ).fetchall()
+        for access in rows:
+            conn.execute(
+                """
+                INSERT INTO user_client_access
+                  (id, user_id, client_id, role, created_at, updated_at)
+                VALUES (?, ?, ?, 'agency', ?, ?)
+                """,
+                (str(uuid4()), str(user_id), access["client_id"], now, now),
+            )
+
     def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
         patch = payload.model_dump(exclude_unset=True)
         with sqlite_conn(self.db_path) as conn:
@@ -257,6 +286,8 @@ class SqliteAuthStore:
             name = patch.get("name", row["name"])
             role = patch.get("role", row["role"])
             status = patch.get("status", row["status"])
+            role_changed = role != row["role"]
+            status_changed = status != row["status"]
             if role == "solo_client" and status == "active":
                 agency_membership = conn.execute(
                     """
@@ -268,21 +299,20 @@ class SqliteAuthStore:
                     """,
                     (str(user_id),),
                 ).fetchone()
-                active_access = conn.execute(
+                access_rows = conn.execute(
                     """
                     SELECT uca.client_id, uca.role
                     FROM user_client_access uca
-                    JOIN clients c ON c.id=uca.client_id
-                    WHERE uca.user_id=? AND c.status='active'
+                    WHERE uca.user_id=?
                     """,
                     (str(user_id),),
                 ).fetchall()
-                if agency_membership or len(active_access) > 1 or any(x["role"] != "client" for x in active_access):
+                if agency_membership or len(access_rows) > 1 or any(x["role"] != "client" for x in access_rows):
                     raise HTTPException(
                         status_code=409,
                         detail={
                             "code": "solo_owner_provisioning_conflict",
-                            "message": "Solo client must have no agency membership and at most one active client grant",
+                            "message": "Solo client must have no agency membership and at most one client grant",
                         },
                     )
             removes_active_admin = (
@@ -309,15 +339,16 @@ class SqliteAuthStore:
                     "UPDATE users SET email=?, name=?, role=?, status=?, updated_at=? WHERE id=?",
                     (email, name, role, status, now, str(user_id)),
                 )
-                # Agency access is materialized. A role demotion/promotion or
-                # deactivation must not leave tenant grants from the old role.
-                # Do not synthesize grants on activation here: provisioning via
-                # agency membership remains the sole source of agency scope.
-                if role != "agency" or status != "active":
-                    conn.execute(
-                        "DELETE FROM user_client_access WHERE user_id=? AND role='agency'",
-                        (str(user_id),),
-                    )
+                # A global-role transition must never reinterpret old tenant
+                # rows as stronger permissions. Agency scope is rebuilt only
+                # from active memberships and bindings; admin scope needs no
+                # rows; direct client/solo rows survive ordinary status flips.
+                if role == "agency" and (role_changed or status_changed):
+                    self._rebuild_active_agency_access(conn, user_id, now)
+                elif role == "admin" and (role_changed or status_changed):
+                    conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
+                elif role_changed and row["role"] in {"agency", "admin"}:
+                    conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
                 if status != "active":
                     conn.execute(
                         "UPDATE sessions SET revoked_at=?, updated_at=? WHERE user_id=? AND revoked_at IS NULL",
@@ -471,6 +502,25 @@ class SqliteAuthStore:
             user = conn.execute("SELECT role, status FROM users WHERE id=?", (str(payload.user_id),)).fetchone()
             if not user:
                 raise HTTPException(status_code=400, detail="user_id does not exist")
+            if user["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "access_user_inactive", "message": "Access can be assigned only to an active user"},
+                )
+            if user["role"] == "admin":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "admin_access_not_required", "message": "Administrators already have global client access"},
+                )
+            expected_role = "agency" if user["role"] == "agency" else "client"
+            if payload.role != expected_role:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "access_role_mismatch",
+                        "message": "Client assignment type must match the user's platform role",
+                    },
+                )
             client_exists = conn.execute("SELECT id, status FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
             if not client_exists:
                 raise HTTPException(status_code=400, detail="client_id does not exist")
@@ -485,12 +535,11 @@ class SqliteAuthStore:
                         status_code=409,
                         detail={"code": "solo_owner_client_inactive", "message": "Solo client grant requires an active client"},
                     )
-                active_other = conn.execute(
+                other_access = conn.execute(
                     """
                     SELECT 1
                     FROM user_client_access uca
-                    JOIN clients c ON c.id=uca.client_id
-                    WHERE uca.user_id=? AND uca.client_id<>? AND c.status='active'
+                    WHERE uca.user_id=? AND uca.client_id<>?
                     LIMIT 1
                     """,
                     (str(payload.user_id), str(payload.client_id)),
@@ -504,7 +553,7 @@ class SqliteAuthStore:
                     """,
                     (str(payload.user_id),),
                 ).fetchone()
-                if active_other or agency_membership:
+                if other_access or agency_membership:
                     raise HTTPException(
                         status_code=409,
                         detail={
@@ -703,6 +752,7 @@ class InMemoryAuthStore:
     def __init__(self):
         self._user_lock = RLock()
         self._agency_owner_exit_guard: Optional[Callable[[UUID], None]] = None
+        self._agency_access_rebuilder: Optional[Callable[[UUID], None]] = None
         self.users: Dict[UUID, UserOut] = {}
         self.password_hashes: Dict[UUID, str] = {}
         self.identities: Dict[str, AuthIdentityOut] = {}
@@ -712,6 +762,9 @@ class InMemoryAuthStore:
 
     def register_agency_owner_exit_guard(self, guard: Callable[[UUID], None]) -> None:
         self._agency_owner_exit_guard = guard
+
+    def register_agency_access_rebuilder(self, rebuilder: Callable[[UUID], None]) -> None:
+        self._agency_access_rebuilder = rebuilder
 
     def create_user(self, payload: UserCreate) -> UserOut:
         now = _utcnow()
@@ -749,6 +802,8 @@ class InMemoryAuthStore:
                     raise HTTPException(status_code=409, detail="User conflict: duplicate email")
             patch["email"] = new_email
         updated = existing.model_copy(update={**patch, "updated_at": _utcnow()})
+        role_changed = updated.role != existing.role
+        status_changed = updated.status != existing.status
         if updated.role == "solo_client" and updated.status == "active":
             access_rows = [x for x in self.access.values() if x.user_id == user_id]
             if len(access_rows) > 1 or any(x.role != "client" for x in access_rows):
@@ -780,9 +835,20 @@ class InMemoryAuthStore:
             self._agency_owner_exit_guard(user_id)
 
         self.users[user_id] = updated
-        if updated.role != "agency" or updated.status != "active":
+        if updated.role == "agency" and (role_changed or status_changed):
+            if self._agency_access_rebuilder:
+                self._agency_access_rebuilder(user_id)
+            else:
+                for key, value in list(self.access.items()):
+                    if value.user_id == user_id:
+                        self.access.pop(key, None)
+        elif updated.role == "admin" and (role_changed or status_changed):
             for key, value in list(self.access.items()):
-                if value.user_id == user_id and value.role == "agency":
+                if value.user_id == user_id:
+                    self.access.pop(key, None)
+        elif role_changed and existing.role in {"agency", "admin"}:
+            for key, value in list(self.access.items()):
+                if value.user_id == user_id:
                     self.access.pop(key, None)
         if updated.status != "active":
             for session in self.sessions.values():
@@ -883,6 +949,25 @@ class InMemoryAuthStore:
             user = self.users.get(payload.user_id)
             if not user:
                 raise HTTPException(status_code=400, detail="user_id does not exist")
+            if user.status != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "access_user_inactive", "message": "Access can be assigned only to an active user"},
+                )
+            if user.role == "admin":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "admin_access_not_required", "message": "Administrators already have global client access"},
+                )
+            expected_role = "agency" if user.role == "agency" else "client"
+            if payload.role != expected_role:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "access_role_mismatch",
+                        "message": "Client assignment type must match the user's platform role",
+                    },
+                )
             if user.role == "solo_client":
                 if payload.role != "client":
                     raise HTTPException(

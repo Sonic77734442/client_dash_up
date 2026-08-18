@@ -647,6 +647,51 @@ def init_sqlite(db_path: str) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(DDL)
         _migrate_sqlite(conn)
+        # The assignment marker is not an ACL level. Reconcile legacy agency
+        # rows against the active membership/binding graph instead of merely
+        # relabelling an orphan grant and leaving full write scope in place.
+        conn.execute(
+            """
+            DELETE FROM user_client_access
+            WHERE EXISTS (
+              SELECT 1
+              FROM users u
+              WHERE u.id=user_client_access.user_id
+                AND (
+                  u.role='admin'
+                  OR (
+                    u.role='agency'
+                    AND (
+                      u.status<>'active'
+                      OR NOT EXISTS (
+                        SELECT 1
+                        FROM agency_members am
+                        JOIN agencies a ON a.id=am.agency_id
+                        JOIN agency_client_access aca ON aca.agency_id=am.agency_id
+                        WHERE am.user_id=user_client_access.user_id
+                          AND aca.client_id=user_client_access.client_id
+                          AND am.status='active'
+                          AND a.status='active'
+                      )
+                    )
+                  )
+                )
+            )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE user_client_access
+            SET role = CASE
+              WHEN user_id IN (SELECT id FROM users WHERE role='agency') THEN 'agency'
+              ELSE 'client'
+            END
+            WHERE role <> CASE
+              WHEN user_id IN (SELECT id FROM users WHERE role='agency') THEN 'agency'
+              ELSE 'client'
+            END
+            """
+        )
         conn.commit()
 
 

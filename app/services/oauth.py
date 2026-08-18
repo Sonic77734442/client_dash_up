@@ -203,7 +203,12 @@ class FacebookOAuthAdapter:
     provider = "facebook"
 
     def build_authorize_url(self, cfg: OAuthProviderConfig, state: str) -> str:
-        if cfg.intent == "login":
+        # Identity login/link/migration are ordinary Facebook Login flows.
+        # Advertising-account authorization is the only flow that uses a
+        # Facebook Login for Business configuration. Keeping these purposes
+        # separate prevents identity scopes (notably ``email``) from leaking
+        # into the Business Login request.
+        if cfg.intent in {"login", "link", "migrate_legacy", "migrate_primary"}:
             params = {
                 "client_id": cfg.client_id,
                 "redirect_uri": cfg.redirect_uri,
@@ -251,7 +256,13 @@ class FacebookOAuthAdapter:
 
             profile_resp = client.get(
                 f"https://graph.facebook.com/{meta_graph_api_version()}/me",
-                params={"fields": "id,name,email" if cfg.intent == "login" else "id,name"},
+                params={
+                    "fields": (
+                        "id,name,email"
+                        if cfg.intent in {"login", "link", "migrate_legacy", "migrate_primary"}
+                        else "id,name"
+                    )
+                },
                 headers={"Authorization": f"Bearer {token}"},
             )
             if profile_resp.status_code >= 400:

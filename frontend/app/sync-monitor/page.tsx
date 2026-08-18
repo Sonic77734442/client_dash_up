@@ -110,6 +110,9 @@ function jobStatusLabel(status: string) {
 function actionHintLabel(raw?: string | null) {
   const value = String(raw || "").toLowerCase();
   if (!value) return "Откройте подключение и повторите обновление.";
+  if (value.includes("date range") || value.includes("account activity") || value.includes("no metric")) {
+    return "Проверьте выбранный период и наличие рекламной активности. Если данные ожидались — запустите обновление ещё раз.";
+  }
   if (value.includes("reconnect") || value.includes("auth")) return "Переподключите рекламную платформу.";
   if (value.includes("permission") || value.includes("access")) return "Проверьте доступ пользователя к рекламному аккаунту.";
   if (value.includes("retry")) return "Повторите обновление данных.";
@@ -338,6 +341,7 @@ export default function SyncMonitorPage() {
           summary: {
             total_accounts: visibleDiagnosticItems.length,
             healthy: visibleDiagnosticItems.filter((item) => item.sync_state === "healthy").length,
+            no_data: visibleDiagnosticItems.filter((item) => item.sync_state === "no_data").length,
             error: visibleDiagnosticItems.filter((item) => item.sync_state === "error").length,
             retry_scheduled: visibleDiagnosticItems.filter((item) => item.sync_state === "retry_scheduled").length,
             never_synced: visibleDiagnosticItems.filter((item) => item.sync_state === "never_synced").length,
@@ -460,6 +464,7 @@ export default function SyncMonitorPage() {
       current: 0,
       stale: 0,
       never_synced: 0,
+      no_data: 0,
       insufficient_data: 0,
       retry_scheduled: 0,
       error: 0,
@@ -1088,8 +1093,8 @@ export default function SyncMonitorPage() {
                 <div className="kpi-value">{diagnosticStateCounts.never_synced}</div>
               </article>
               <article className="kpi-card warn">
-                <div className="kpi-title">Недостаточно данных</div>
-                <div className="kpi-value">{diagnosticStateCounts.insufficient_data + diagnosticStateCounts.retry_scheduled}</div>
+                <div className="kpi-title">Без активности / нужна проверка</div>
+                <div className="kpi-value">{diagnosticStateCounts.no_data + diagnosticStateCounts.insufficient_data + diagnosticStateCounts.retry_scheduled}</div>
               </article>
             </div>
             {lastRun ? (
@@ -1321,9 +1326,17 @@ export default function SyncMonitorPage() {
                       </div>
                     ) : null}
                     {selectedDiagnostic && selectedDiagnosticState && selectedDiagnosticState !== "current" ? (
-                      <div className="alert-card high" style={{ marginTop: 10 }}>
-                        <div className="alert-priority high">{syncStateLabel(selectedDiagnosticState).toUpperCase()}</div>
-                        <div className="insight-text" style={{ color: "#9e2b2b", marginTop: 8 }}>
+                      <div
+                        className={`alert-card ${selectedDiagnosticState === "error" ? "high" : ""}`}
+                        style={{ marginTop: 10 }}
+                      >
+                        <div className={`alert-priority ${selectedDiagnosticState === "error" ? "high" : ""}`}>
+                          {syncStateLabel(selectedDiagnosticState).toUpperCase()}
+                        </div>
+                        <div
+                          className="insight-text"
+                          style={{ color: selectedDiagnosticState === "error" ? "#9e2b2b" : "#7a4a13", marginTop: 8 }}
+                        >
                           {selectedDiagnosticState === "error" || selectedDiagnosticState === "retry_scheduled"
                             ? safeErrorMessage(selectedDiagnostic.diagnostic_message) || dataFreshnessMeta(selectedDiagnosticState).description
                             : dataFreshnessMeta(selectedDiagnosticState).description}

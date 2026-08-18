@@ -404,7 +404,7 @@ class AdAccountSyncDiagnosticOut(BaseModel):
     platform: str
     account_name: str
     account_status: Literal["active", "inactive", "archived"]
-    sync_state: Literal["healthy", "error", "retry_scheduled", "never_synced"]
+    sync_state: Literal["healthy", "no_data", "error", "retry_scheduled", "never_synced"]
     diagnostic_message: str
     action_hint: str
     last_sync_at: Optional[datetime] = None

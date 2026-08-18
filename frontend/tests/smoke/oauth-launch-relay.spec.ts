@@ -24,6 +24,13 @@ test("neutral OAuth launch maps only allowlisted sources and query fields", () =
   expect(target.searchParams.has("unknown")).toBeFalsy();
   expect(oauthRelayLaunchPath("facebook", { next: "/integrations", intent: "connect" }))
     .toBe("/api/connect/start?next=%2Fintegrations&intent=connect&source=m");
+
+  const migration = resolveOAuthRelayTarget(
+    new URL("https://frontend.test/api/connect/start?source=m&next=%2F&intent=migrate"),
+    "https://backend.test/root",
+  );
+  expect(migration.pathname).toBe("/root/auth/facebook/start");
+  expect(migration.searchParams.get("intent")).toBe("migrate");
 });
 
 test("neutral OAuth launch rejects unsupported sources and external return paths", () => {

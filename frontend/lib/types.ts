@@ -218,7 +218,7 @@ export type AdAccountSyncDiagnostic = {
   platform: string;
   account_name: string;
   account_status: "active" | "inactive" | "archived";
-  sync_state: "healthy" | "error" | "retry_scheduled" | "never_synced";
+  sync_state: "healthy" | "no_data" | "error" | "retry_scheduled" | "never_synced";
   diagnostic_message: string;
   action_hint: string;
   last_sync_at?: string | null;
@@ -236,6 +236,7 @@ export type AdAccountSyncDiagnosticsResponse = {
   summary: {
     total_accounts: number;
     healthy: number;
+    no_data: number;
     error: number;
     retry_scheduled: number;
     never_synced: number;

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.main import app
+from app.schemas import AdAccountPatch
 from app.services.ad_account_sync import AdAccountSyncService
 
 
@@ -44,6 +45,14 @@ def mk_account(client_id: str, platform: str, external: str):
     )
     assert res.status_code == 200
     return res.json()
+
+
+def seed_account_metadata(account_id: str, metadata: dict):
+    """Seed server-owned sync state without going through the public API."""
+    return app.state.ad_account_store.patch(
+        UUID(account_id),
+        AdAccountPatch(metadata=metadata),
+    )
 
 
 def test_sync_run_updates_account_sync_fields_and_job_log():
@@ -258,11 +267,7 @@ def test_sync_auto_date_range_uses_one_time_backfill_before_incremental_mode():
     c = mk_client("Auto Range")
     fresh = mk_account(c["id"], "meta", "meta-fresh")
     existing = mk_account(c["id"], "meta", "meta-existing")
-    patched = client.patch(
-        f"/ad-accounts/{existing['id']}",
-        json={"metadata": {"last_sync_at": "2026-04-10T12:00:00"}},
-    )
-    assert patched.status_code == 200
+    seed_account_metadata(existing["id"], {"last_sync_at": "2026-04-10T12:00:00"})
 
     seen = []
 
@@ -378,11 +383,7 @@ def test_invalid_provider_row_dates_fail_closed_without_metrics_or_freshness(inv
         "last_data_at": "2026-03-30",
         "latest_data_date": "2026-03-30",
     }
-    seeded = client.patch(
-        f"/ad-accounts/{account['id']}",
-        json={"metadata": prior_freshness},
-    )
-    assert seeded.status_code == 200
+    seed_account_metadata(account["id"], prior_freshness)
     app.state.ad_account_sync_service.provider_fetchers = {
         "meta": lambda *_args, **_kwargs: invalid_rows,
     }
@@ -451,10 +452,15 @@ def test_empty_provider_response_records_attempt_but_does_not_mark_data_fresh():
 
     diagnostics = client.get(f"/ad-accounts/sync/diagnostics?client_id={c['id']}")
     assert diagnostics.status_code == 200
-    item = diagnostics.json()["items"][0]
-    assert item["sync_state"] == "error"
-    assert "freshness is not confirmed" in item["diagnostic_message"]
+    diagnostic_body = diagnostics.json()
+    item = diagnostic_body["items"][0]
+    assert item["sync_state"] == "no_data"
+    assert "no metric rows" in item["diagnostic_message"]
+    assert "date range" in item["action_hint"]
     assert item["last_sync_at"] is None
+    assert diagnostic_body["summary"]["no_data"] == 1
+    assert diagnostic_body["summary"]["error"] == 0
+    assert diagnostic_body["summary"]["healthy"] == 0
 
 
 def test_empty_initial_response_keeps_historical_backfill_window_for_next_attempt():
@@ -520,19 +526,16 @@ def test_incremental_sync_uses_latest_metric_date_with_overlap_not_request_heart
     reset_state()
     c = mk_client("Delayed Provider Data")
     acc = mk_account(c["id"], "meta", "meta-delayed-data")
-    seeded = client.patch(
-        f"/ad-accounts/{acc['id']}",
-        json={
-            "metadata": {
-                "history_backfill_completed_at": "2026-08-01T00:00:00",
-                "latest_data_date": "2026-08-04",
-                "last_data_at": "2026-08-04",
-                "last_sync_at": "2026-08-06T12:00:00",
-                "sync_status": "success",
-            }
+    seed_account_metadata(
+        acc["id"],
+        {
+            "history_backfill_completed_at": "2026-08-01T00:00:00",
+            "latest_data_date": "2026-08-04",
+            "last_data_at": "2026-08-04",
+            "last_sync_at": "2026-08-06T12:00:00",
+            "sync_status": "success",
         },
     )
-    assert seeded.status_code == 200
     seen = []
 
     def fetcher(external, date_from, date_to, creds=None):

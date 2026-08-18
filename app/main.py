@@ -138,6 +138,7 @@ from app.services.integration_credentials import (
     IntegrationCredentialStore,
     SqliteIntegrationCredentialStore,
 )
+from app.services.meta_connection import MetaConnectionValidationError, validate_meta_business_connection
 from app.services.overview import OverviewService
 from app.services.operational_insights import OperationalInsightsService
 from app.services.operational_actions import (
@@ -294,11 +295,13 @@ def _resolve_provider_credentials(
                 and row.scope_id == owned_client_id
                 and row.created_by == user_id
             ]
+        elif requesting_user and requesting_user.role == "agency":
+            rows = [row for row in rows if row.scope_type == "agency"]
     if agency_id is not None:
         rows = [
             row
             for row in rows
-            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            if row.scope_type == "agency" and row.scope_id == agency_id
         ]
     if not rows:
         return None
@@ -325,17 +328,22 @@ def _resolve_provider_credentials_candidates(
                 and row.scope_id == owned_client_id
                 and row.created_by == user_id
             ]
+        elif requesting_user and requesting_user.role == "agency":
+            rows = [row for row in rows if row.scope_type == "agency"]
     if agency_id is not None:
         rows = [
             row
             for row in rows
-            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            if row.scope_type == "agency" and row.scope_id == agency_id
         ]
     out: List[dict] = []
     for row in rows:
         cred = dict(row.credentials)
         cred["__credential_id"] = str(row.id)
         cred["__connection_key"] = row.connection_key
+        cred["__scope_type"] = row.scope_type
+        cred["__scope_id"] = str(row.scope_id) if row.scope_id else None
+        cred["__created_by"] = str(row.created_by) if row.created_by else None
         out.append(cred)
     return out
 
@@ -646,6 +654,8 @@ def _safe_sync_error_message(raw: Optional[str]) -> str:
     msg = str(raw or "").strip().lower()
     if not msg:
         return "No provider error details available."
+    if "reconnect" in msg or "rediscover" in msg:
+        return "This account's provider connection must be reconnected before sync can continue."
     if "expired" in msg or "unauthorized" in msg or "invalid token" in msg:
         return "Authentication expired or invalid. Reconnect provider."
     if "scope" in msg or "permission" in msg or "forbidden" in msg or "access" in msg:
@@ -664,19 +674,71 @@ def _safe_sync_error_message(raw: Optional[str]) -> str:
 def _sync_action_hint(*, state: str, error_code: Optional[str], retryable: bool) -> str:
     if state == "healthy":
         return "No action needed."
+    if state == "no_data":
+        return "Check the selected date range and account activity, then run sync again if data is expected."
     if state == "never_synced":
         return "Run initial sync for this account."
     if state == "retry_scheduled":
         if _sync_automation_enabled():
             return "The retry is eligible for the configured sync scheduler. You can force sync if needed."
         return "The retry is eligible at the shown time. Run it manually or enable the sync scheduler."
-    if error_code == "auth_failed":
+    if error_code in {"auth_failed", "provider_reconnect_required"}:
         return "Reconnect provider credentials or fix account permissions."
     if error_code == "invalid_request":
         return "Check account mapping and provider account configuration."
     if retryable:
         return "Retry later or run force sync after provider recovers."
     return "Inspect account/provider diagnostics and retry sync."
+
+
+_SERVER_MANAGED_AD_ACCOUNT_METADATA_KEYS = frozenset(
+    {
+        "integration_credential_id",
+        "last_data_at",
+        "latest_data_date",
+        "meta_rediscovery_required",
+    }
+)
+_SERVER_MANAGED_AD_ACCOUNT_METADATA_PREFIXES = (
+    "__",
+    "discovery_",
+    "history_backfill_",
+    "last_sync_",
+    "meta_connection_",
+    "sync_",
+)
+
+
+def _is_server_managed_ad_account_metadata_key(key: object) -> bool:
+    normalized = str(key).strip().lower()
+    return normalized in _SERVER_MANAGED_AD_ACCOUNT_METADATA_KEYS or normalized.startswith(
+        _SERVER_MANAGED_AD_ACCOUNT_METADATA_PREFIXES
+    )
+
+
+def _reject_server_managed_ad_account_metadata(metadata: Optional[dict]) -> None:
+    if not metadata:
+        return
+    reserved = sorted(
+        str(key) for key in metadata if _is_server_managed_ad_account_metadata_key(key)
+    )
+    if reserved:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ad_account_metadata_reserved",
+                "message": "Sync and provider connection metadata is managed by the server.",
+                "details": {"keys": reserved},
+            },
+        )
+
+
+def _server_managed_ad_account_metadata(metadata: Optional[dict]) -> dict:
+    return {
+        key: value
+        for key, value in (metadata or {}).items()
+        if _is_server_managed_ad_account_metadata_key(key)
+    }
 
 
 def _error_envelope(status_code: int, detail) -> dict:
@@ -858,11 +920,13 @@ def use_inmemory_stores():
                     and row.scope_id == owned_client_id
                     and row.created_by == user_id
                 ]
+            elif requesting_user and requesting_user.role == "agency":
+                rows = [row for row in rows if row.scope_type == "agency"]
         if agency_id is not None:
             rows = [
                 row
                 for row in rows
-                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+                if row.scope_type == "agency" and row.scope_id == agency_id
             ]
         if not rows:
             return None
@@ -887,17 +951,22 @@ def use_inmemory_stores():
                     and row.scope_id == owned_client_id
                     and row.created_by == user_id
                 ]
+            elif requesting_user and requesting_user.role == "agency":
+                rows = [row for row in rows if row.scope_type == "agency"]
         if agency_id is not None:
             rows = [
                 row
                 for row in rows
-                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+                if row.scope_type == "agency" and row.scope_id == agency_id
             ]
         out: List[dict] = []
         for row in rows:
             cred = dict(row.credentials)
             cred["__credential_id"] = str(row.id)
             cred["__connection_key"] = row.connection_key
+            cred["__scope_type"] = row.scope_type
+            cred["__scope_id"] = str(row.scope_id) if row.scope_id else None
+            cred["__created_by"] = str(row.created_by) if row.created_by else None
             out.append(cred)
         return out
     sync_jobs = InMemoryAdAccountSyncJobStore()
@@ -1209,7 +1278,7 @@ def _build_sync_alert_signal(job: AdAccountSyncJobOut, *, client_id: UUID) -> Op
             context={"error_code": job.error_code, "raw_error": message},
         )
 
-    if error_code == "auth_failed":
+    if error_code in {"auth_failed", "provider_reconnect_required"}:
         return AlertSignal(
             code="provider.auth_failed",
             severity="high",
@@ -1295,10 +1364,36 @@ def _process_discovery_alerts(
             _alert_store().resolve_by_fingerprint(f"discovery-failed:{provider}:{target_client_id}")
 
 
+_FACEBOOK_PRIMARY_IDENTITY_INTENTS = {"login", "link", "migrate_primary"}
+
+
+def _facebook_legacy_migration_enabled() -> bool:
+    """Return whether the operator deliberately enabled legacy-app migration.
+
+    A completely empty legacy configuration is disabled. Any partial legacy
+    configuration activates the fail-closed login guard; the migration
+    entrypoint then reports a safe configuration error instead of silently
+    creating users.
+    """
+
+    return any(
+        os.getenv(name, "").strip()
+        for name in (
+            "FACEBOOK_AUTH_LEGACY_CLIENT_ID",
+            "FACEBOOK_AUTH_LEGACY_CLIENT_SECRET",
+            "FACEBOOK_AUTH_LEGACY_REDIRECT_URI",
+        )
+    )
+
+
 def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OAuthProviderConfig:
     cfg = next((x for x in _auth_store().list_provider_configs() if x.provider == provider), None)
     normalized_intent = (intent or "login").strip().lower()
-    if cfg and not cfg.enabled and not (provider == "facebook" and normalized_intent == "login"):
+    facebook_identity_intent = provider == "facebook" and (
+        normalized_intent in _FACEBOOK_PRIMARY_IDENTITY_INTENTS
+        or normalized_intent == "migrate_legacy"
+    )
+    if cfg and not cfg.enabled and not facebook_identity_intent:
         raise HTTPException(
             status_code=400,
             detail={
@@ -1307,7 +1402,7 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
             },
         )
 
-    if provider == "facebook" and normalized_intent == "login":
+    if provider == "facebook" and normalized_intent in _FACEBOOK_PRIMARY_IDENTITY_INTENTS:
         auth_env = {
             "client_id": os.getenv("FACEBOOK_AUTH_CLIENT_ID", "").strip(),
             "client_secret": os.getenv("FACEBOOK_AUTH_CLIENT_SECRET", "").strip(),
@@ -1328,6 +1423,42 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
         client_id = auth_env["client_id"]
         client_secret = auth_env["client_secret"]
         redirect_uri = auth_env["redirect_uri"]
+        config_id = None
+    elif provider == "facebook" and normalized_intent == "migrate_legacy":
+        legacy_env = {
+            "client_id": os.getenv("FACEBOOK_AUTH_LEGACY_CLIENT_ID", "").strip(),
+            "client_secret": os.getenv("FACEBOOK_AUTH_LEGACY_CLIENT_SECRET", "").strip(),
+            "redirect_uri": os.getenv("FACEBOOK_AUTH_LEGACY_REDIRECT_URI", "").strip(),
+        }
+        missing = [key for key, value in legacy_env.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_legacy_auth_not_configured",
+                    "message": "Legacy Facebook identity migration is not fully configured",
+                },
+            )
+        primary_client_id = os.getenv("FACEBOOK_AUTH_CLIENT_ID", "").strip()
+        if not primary_client_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_auth_not_configured",
+                    "message": "Primary Facebook platform login is not configured",
+                },
+            )
+        if legacy_env["client_id"] == primary_client_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_legacy_auth_invalid",
+                    "message": "Legacy and primary Facebook applications must be different",
+                },
+            )
+        client_id = legacy_env["client_id"]
+        client_secret = legacy_env["client_secret"]
+        redirect_uri = legacy_env["redirect_uri"]
         config_id = None
     else:
         if not cfg and provider not in {"facebook", "google"}:
@@ -1580,6 +1711,30 @@ def _ensure_client_bound_to_agency(agency_id: UUID, client_id: UUID) -> None:
     )
 
 
+def _active_agency_backing_for_client(user_id: UUID, client_id: UUID) -> Optional[UUID]:
+    """Return the active agency that currently materializes this tenant grant.
+
+    Direct access cleanup must fail closed if the agency graph cannot be read:
+    otherwise a transient membership-store failure could delete a grant that
+    is still managed by an active agency binding.
+    """
+    memberships = _active_agency_memberships_for_user(user_id, fail_closed=True)
+    for agency_id, _member in memberships:
+        try:
+            bindings = _platform_admin_store().list_clients(agency_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "agency_membership_check_failed",
+                    "message": "Cannot verify agency client access",
+                },
+            ) from exc
+        if any(binding.client_id == client_id for binding in bindings):
+            return agency_id
+    return None
+
+
 def _ensure_client_invites_allowed_for_agency(ctx: RequestContext, client_id: UUID) -> None:
     if ctx.role != "agency" or not ctx.user_id:
         return
@@ -1615,7 +1770,23 @@ def _integration_credentials_from_oauth(
         if not access_token:
             return None
         business_ids = [x.strip() for x in str(os.getenv("META_BUSINESS_IDS", "")).split(",") if x.strip()]
-        return {"access_token": access_token, "business_ids": business_ids}
+        payload = {"access_token": access_token, "business_ids": business_ids}
+        safe_validation_fields = {
+            "meta_validation_version",
+            "meta_validated_at",
+            "meta_app_id",
+            "meta_business_config_id",
+            "meta_business_config_source",
+            "meta_user_id",
+            "meta_scopes",
+            "meta_granted_permissions",
+            "meta_granular_scopes",
+            "meta_expires_at",
+            "meta_data_access_expires_at",
+            "meta_absolute_expires_at",
+        }
+        payload.update({key: tokens[key] for key in safe_validation_fields if key in tokens})
+        return payload
 
     if p == "google":
         refresh_token = str(tokens.get("refresh_token") or "").strip()
@@ -2086,6 +2257,9 @@ def _normalize_next_path(next_path: Optional[str]) -> str:
     return value
 
 
+_OAUTH_INTERNAL_INTENTS = {"login", "connect", "link", "migrate_legacy", "migrate_primary"}
+
+
 def _with_oauth_connect_options(
     next_path: str,
     *,
@@ -2094,6 +2268,7 @@ def _with_oauth_connect_options(
     connection_key: Optional[str],
     agency_id: Optional[UUID],
     client_id: Optional[UUID],
+    meta_config_id: Optional[str],
 ) -> str:
     parsed = urlsplit(_normalize_next_path(next_path))
     query_items = [
@@ -2106,10 +2281,11 @@ def _with_oauth_connect_options(
             "ops_connection_key",
             "ops_agency_id",
             "ops_client_id",
+            "ops_meta_config_id",
         }
     ]
     normalized_intent = (intent or "login").strip().lower()
-    if normalized_intent not in {"login", "connect"}:
+    if normalized_intent not in _OAUTH_INTERNAL_INTENTS:
         normalized_intent = "login"
     query_items.append(("ops_oauth_intent", normalized_intent))
     mode = (connect_mode or "add").strip().lower()
@@ -2123,23 +2299,27 @@ def _with_oauth_connect_options(
         query_items.append(("ops_agency_id", str(agency_id)))
     if normalized_intent == "connect" and client_id is not None:
         query_items.append(("ops_client_id", str(client_id)))
+    bound_meta_config_id = str(meta_config_id or "").strip()
+    if normalized_intent == "connect" and bound_meta_config_id:
+        query_items.append(("ops_meta_config_id", bound_meta_config_id))
     return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
 
 
 def _extract_oauth_connect_options(
     next_path: str,
-) -> tuple[str, str, str, Optional[str], Optional[UUID], Optional[UUID]]:
+) -> tuple[str, str, str, Optional[str], Optional[UUID], Optional[UUID], Optional[str]]:
     parsed = urlsplit(_normalize_next_path(next_path))
     intent = "login"
     mode = "add"
     key: Optional[str] = None
     agency_id: Optional[UUID] = None
     client_id: Optional[UUID] = None
+    meta_config_id: Optional[str] = None
     clean_items: List[tuple[str, str]] = []
     for k, v in parse_qsl(parsed.query, keep_blank_values=True):
         if k == "ops_oauth_intent":
             candidate = str(v or "").strip().lower()
-            if candidate in {"login", "connect"}:
+            if candidate in _OAUTH_INTERNAL_INTENTS:
                 intent = candidate
             continue
         if k == "ops_connect_mode":
@@ -2168,11 +2348,16 @@ def _extract_oauth_connect_options(
                 except ValueError:
                     client_id = None
             continue
+        if k == "ops_meta_config_id":
+            candidate = str(v or "").strip()
+            if candidate:
+                meta_config_id = candidate
+            continue
         clean_items.append((k, v))
     if mode == "overwrite" and not key:
         mode = "add"
     clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
-    return clean_next, intent, mode, key, agency_id, client_id
+    return clean_next, intent, mode, key, agency_id, client_id, meta_config_id
 
 
 def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
@@ -2189,6 +2374,9 @@ def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
             "access_pending",
             "account_link_required",
             "facebook_auth_not_configured",
+            "facebook_migration_required",
+            "facebook_migration_identity_not_found",
+            "facebook_identity_conflict",
         }
         else "provider_error"
     )
@@ -2222,6 +2410,127 @@ def _find_user_by_normalized_email(value: Optional[str]) -> Optional[UserOut]:
 
 def _facebook_login_subject(cfg: OAuthProviderConfig, identity: ExternalIdentityPayload) -> str:
     return f"{cfg.client_id}:{identity.provider_user_id}"
+
+
+def _resolve_facebook_legacy_migration_user(
+    *,
+    cfg: OAuthProviderConfig,
+    identity: ExternalIdentityPayload,
+) -> Optional[UserOut]:
+    """Resolve a legacy Facebook subject without guessing or merging.
+
+    Older records may contain either the app-qualified subject introduced by
+    the current OAuth implementation or the raw provider subject written by a
+    previous implementation. A fresh OAuth response from the configured
+    legacy app proves both candidate forms. If those records point at different
+    internal users, migration must stop instead of choosing either account.
+    """
+
+    subjects = tuple(
+        dict.fromkeys(
+            (
+                _facebook_login_subject(cfg, identity),
+                identity.provider_user_id,
+            )
+        )
+    )
+    linked_identities = [
+        linked
+        for subject in subjects
+        if (linked := _auth_store().find_identity("facebook", subject)) is not None
+    ]
+    owner_ids = {linked.user_id for linked in linked_identities}
+    if len(owner_ids) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "facebook_identity_conflict",
+                "message": "Legacy Facebook identity is linked to multiple accounts",
+            },
+        )
+    if not owner_ids:
+        return None
+    owner = _auth_store().get_user(next(iter(owner_ids)))
+    return owner if owner and owner.status == "active" else None
+
+
+def _link_facebook_identity_to_proven_user(
+    *,
+    cfg: OAuthProviderConfig,
+    identity: ExternalIdentityPayload,
+    user_id: UUID,
+) -> UserOut:
+    """Link one primary-app Facebook subject after independent user proof.
+
+    The proof is supplied by either the current backend session (``link``)
+    or a freshly completed legacy-app OAuth step (``migrate_primary``).
+    This helper never resolves by email and never reassigns an identity.
+    """
+
+    user = _auth_store().get_user(user_id)
+    if not user or user.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity cannot be linked"},
+        )
+
+    subject = _facebook_login_subject(cfg, identity)
+    linked = _auth_store().find_identity("facebook", subject)
+    if linked and linked.user_id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity is already linked"},
+        )
+
+    # One canonical Facebook subject per primary application and internal
+    # user. Legacy subjects use another app-id prefix and remain as immutable
+    # evidence/fallback during the migration window.
+    primary_prefix = f"{cfg.client_id}:"
+    conflicting_primary = next(
+        (
+            row
+            for row in _auth_store().list_identities(user_id=user.id)
+            if row.provider == "facebook"
+            and row.provider_user_id.startswith(primary_prefix)
+            and row.provider_user_id != subject
+        ),
+        None,
+    )
+    if conflicting_primary:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Another Facebook identity is already linked"},
+        )
+
+    # Email is contact metadata only. It may detect a conflict, but it must
+    # never select or merge users across Facebook applications.
+    contact_email = _normalized_oauth_email(identity.email)
+    email_owner = _find_user_by_normalized_email(contact_email)
+    if email_owner and email_owner.id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity conflicts with another account"},
+        )
+
+    try:
+        _auth_store().link_identity(
+            AuthIdentityLink(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id=subject,
+                email=contact_email,
+                email_verified=identity.email_verified,
+                raw_profile=identity.raw_profile,
+            )
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "facebook_identity_conflict", "message": "Facebook identity is already linked"},
+            ) from exc
+        raise
+    return user
 
 
 def _auto_provision_facebook_client(
@@ -2975,17 +3284,13 @@ def auth_patch_user(
                     "message": "Remove active agency memberships before assigning solo client role",
                 },
             )
-        active_access = [
-            row
-            for row in _auth_store().list_client_access(user_id=user_id)
-            if (client := _client_store().get(row.client_id)) is not None and client.status == "active"
-        ]
-        if len(active_access) > 1 or any(row.role != "client" for row in active_access):
+        access_rows = _auth_store().list_client_access(user_id=user_id)
+        if len(access_rows) > 1 or any(row.role != "client" for row in access_rows):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "solo_owner_provisioning_conflict",
-                    "message": "Solo client may have at most one active client grant with client access role",
+                    "message": "Solo client may have at most one client grant with client access role",
                 },
             )
     return _auth_store().patch_user(user_id, payload)
@@ -3042,15 +3347,42 @@ def auth_assign_access(
     _enforce_internal_admin(ctx)
     target_user = _auth_store().get_user(payload.user_id)
     target_client = _client_store().get(payload.client_id)
-    if target_user and target_user.role == "solo_client":
-        if payload.role != "client" or not target_client or target_client.status != "active":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "solo_owner_provisioning_conflict",
-                    "message": "Solo client access requires an active client and client access role",
-                },
-            )
+    if not target_user:
+        raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "User not found"})
+    if target_user.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "access_user_inactive", "message": "Access can be assigned only to an active user"},
+        )
+    if target_user.role == "admin":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "admin_access_not_required", "message": "Administrators already have global client access"},
+        )
+    if target_user.role == "agency":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agency_access_managed_by_membership",
+                "message": "Agency client access must be managed through agency members and client bindings",
+            },
+        )
+    if not target_client:
+        raise HTTPException(status_code=404, detail={"code": "client_not_found", "message": "Client not found"})
+    if target_client.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "access_client_inactive", "message": "Access can be assigned only to an active client"},
+        )
+    expected_role = "client"
+    if payload.role != expected_role:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "access_role_mismatch",
+                "message": "Client assignment type must match the user's platform role",
+            },
+        )
     row = _auth_store().assign_client_access(payload)
     _audit_event(
         event_type="access.assigned",
@@ -3071,6 +3403,58 @@ def auth_list_access(
     _enforce_internal_admin(ctx)
     rows = _auth_store().list_client_access(user_id=user_id)
     return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+
+
+@app.delete(
+    "/auth/internal/access/{user_id}/{client_id}",
+    summary="Revoke a direct client access assignment",
+)
+def auth_revoke_access(
+    user_id: UUID,
+    client_id: UUID,
+    ctx: Optional[RequestContext] = Depends(optional_auth_context),
+):
+    _enforce_internal_admin(ctx)
+    target_user = _auth_store().get_user(user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "User not found"})
+    existing = next(
+        (row for row in _auth_store().list_client_access(user_id=user_id) if row.client_id == client_id),
+        None,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "access_not_found", "message": "Client access assignment not found"},
+        )
+    backing_agency_id = (
+        _active_agency_backing_for_client(user_id, client_id)
+        if target_user.role == "agency" and target_user.status == "active"
+        else None
+    )
+    if backing_agency_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agency_access_managed_by_membership",
+                "message": "Agency client access must be managed through agency members and client bindings",
+                "details": {"agency_id": str(backing_agency_id)},
+            },
+        )
+    _auth_store().remove_client_access(user_id, client_id)
+    _audit_event(
+        event_type="access.revoked",
+        resource_type="user_client_access",
+        resource_id=str(existing.id),
+        ctx=ctx,
+        tenant_client_id=client_id,
+        payload={
+            "target_user_id": str(user_id),
+            "role": existing.role,
+            "orphan_agency_cleanup": target_user.role == "agency",
+        },
+    )
+    return {"status": "revoked"}
 
 
 @app.post(
@@ -3292,7 +3676,7 @@ def auth_oauth_start(
     request: Request,
     provider: str,
     next_path: Optional[str] = Query(default="/", alias="next"),
-    intent: str = Query(default="login", pattern="^(login|connect)$"),
+    intent: str = Query(default="login", pattern="^(login|connect|link|migrate)$"),
     connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
     connection_key: Optional[str] = Query(default=None),
     agency_id: Optional[UUID] = Query(default=None),
@@ -3302,10 +3686,17 @@ def auth_oauth_start(
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
+    if intent in {"link", "migrate"} and provider != "facebook":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_oauth_intent", "message": "Identity migration is supported only for Facebook"},
+        )
     selected_agency_id: Optional[UUID] = None
     selected_client_id: Optional[UUID] = None
     initiator_user_id: Optional[UUID] = None
-    if intent == "connect":
+    internal_intent = "migrate_legacy" if intent == "migrate" else intent
+    current_ctx = None
+    if intent in {"connect", "link"}:
         current_token = _get_session_token(
             request.headers.get("Authorization"),
             request.headers.get("X-Session-Token"),
@@ -3316,8 +3707,24 @@ def auth_oauth_start(
         if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
             raise HTTPException(
                 status_code=401,
-                detail={"code": "session_required", "message": "Sign in before connecting an advertising account"},
+                detail={
+                    "code": "session_required",
+                    "message": (
+                        "Sign in before linking a Facebook identity"
+                        if intent == "link"
+                        else "Sign in before connecting an advertising account"
+                    ),
+                },
             )
+        initiator_user_id = current_ctx.user_id
+    if intent == "link":
+        if agency_id is not None or client_id is not None or connection_key is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "identity_link_scope_invalid", "message": "Identity linking does not accept tenant scope"},
+            )
+    elif intent == "connect":
+        assert current_ctx is not None
         if current_ctx.role not in {"admin", "agency", "solo_client"}:
             raise HTTPException(
                 status_code=403,
@@ -3367,15 +3774,20 @@ def auth_oauth_start(
                     "message": "Admin OAuth connections use global scope and do not accept agency_id or client_id",
                 },
             )
-        initiator_user_id = current_ctx.user_id
-    cfg = _oauth_provider_config_or_400(provider, intent=intent)
+    elif intent == "migrate" and (agency_id is not None or client_id is not None or connection_key is not None):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "identity_migration_scope_invalid", "message": "Identity migration does not accept tenant scope"},
+        )
+    cfg = _oauth_provider_config_or_400(provider, intent=internal_intent)
     normalized_next = _with_oauth_connect_options(
         _normalize_next_path(next_path),
-        intent=intent,
+        intent=internal_intent,
         connect_mode=connect_mode,
         connection_key=connection_key,
         agency_id=selected_agency_id,
         client_id=selected_client_id,
+        meta_config_id=cfg.config_id if provider == "facebook" and internal_intent == "connect" else None,
     )
     nonce = secrets.token_urlsafe(24)
     state = _oauth_state_store().create_state(
@@ -3436,9 +3848,10 @@ def auth_oauth_callback(
         requested_connection_key,
         requested_agency_id,
         requested_client_id,
+        requested_meta_config_id,
     ) = _extract_oauth_connect_options(consumed.next_path or "/")
     current_ctx = None
-    if oauth_intent == "connect":
+    if oauth_intent in {"connect", "link"}:
         current_token = _get_session_token(
             request.headers.get("Authorization"),
             request.headers.get("X-Session-Token"),
@@ -3454,7 +3867,7 @@ def auth_oauth_callback(
             or current_ctx.user_id != consumed.initiator_user_id
         ):
             return _oauth_error_redirect("session_mismatch")
-        if current_ctx.role == "solo_client":
+        if oauth_intent == "connect" and current_ctx.role == "solo_client":
             try:
                 current_client_id = _solo_owner_client_id_for_user(
                     current_ctx.user_id,
@@ -3466,18 +3879,44 @@ def auth_oauth_callback(
                 return _oauth_error_redirect("access_denied")
             if requested_agency_id is not None:
                 return _oauth_error_redirect("access_denied")
-        elif requested_client_id is not None:
+        elif oauth_intent == "connect" and requested_client_id is not None:
             return _oauth_error_redirect("access_denied")
     if error:
         return _oauth_error_redirect(error)
     if not code:
         return _oauth_error_redirect("provider_error")
-    cfg = _oauth_provider_config_or_400(provider, intent=oauth_intent)
+    try:
+        cfg = _oauth_provider_config_or_400(provider, intent=oauth_intent)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return _oauth_error_redirect(str(detail.get("code") or "provider_error"))
+    if provider == "facebook" and oauth_intent == "connect":
+        current_meta_config_id = str(cfg.config_id or "").strip()
+        if not requested_meta_config_id or requested_meta_config_id != current_meta_config_id:
+            logger.warning("Meta Business OAuth state configuration mismatch")
+            return _oauth_error_redirect("provider_error")
     try:
         identity = adapter.fetch_identity(cfg, code)
     except Exception:
         logger.warning("OAuth identity exchange failed for provider=%s intent=%s", provider, oauth_intent)
         return _oauth_error_redirect("provider_error")
+
+    if provider == "facebook" and oauth_intent == "connect":
+        token_payload = dict(identity.oauth_tokens or {})
+        try:
+            validation = validate_meta_business_connection(
+                access_token=token_payload.get("access_token"),
+                app_id=cfg.client_id,
+                app_secret=cfg.client_secret,
+                config_id=requested_meta_config_id,
+                expected_user_id=identity.provider_user_id,
+                token_payload=token_payload,
+            )
+        except MetaConnectionValidationError as exc:
+            logger.warning("Meta Business OAuth validation failed code=%s", exc.code)
+            safe_code = "access_not_granted" if exc.code == "meta_permissions_missing" else "provider_error"
+            return _oauth_error_redirect(safe_code)
+        identity.oauth_tokens = {**token_payload, **validation}
 
     if oauth_intent == "connect":
         if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
@@ -3506,12 +3945,85 @@ def auth_oauth_callback(
         response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
         return response
 
-    if provider == "facebook":
+    if oauth_intent == "migrate_legacy":
+        if provider != "facebook":
+            return _oauth_error_redirect("provider_error")
+        try:
+            legacy_user = _resolve_facebook_legacy_migration_user(cfg=cfg, identity=identity)
+        except HTTPException:
+            return _oauth_error_redirect("facebook_identity_conflict")
+        if not legacy_user:
+            return _oauth_error_redirect("facebook_migration_identity_not_found")
+        try:
+            primary_cfg = _oauth_provider_config_or_400("facebook", intent="migrate_primary")
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return _oauth_error_redirect(str(detail.get("code") or "facebook_auth_not_configured"))
+        primary_nonce = secrets.token_urlsafe(24)
+        primary_next = _with_oauth_connect_options(
+            redirect_next,
+            intent="migrate_primary",
+            connect_mode="add",
+            connection_key=None,
+            agency_id=None,
+            client_id=None,
+            meta_config_id=None,
+        )
+        primary_state = _oauth_state_store().create_state(
+            provider="facebook",
+            next_path=primary_next,
+            nonce=primary_nonce,
+            ttl_minutes=settings.oauth_state_ttl_minutes,
+            initiator_user_id=legacy_user.id,
+        )
+        primary_url = adapter.build_authorize_url(primary_cfg, primary_state.state)
+        response = RedirectResponse(url=primary_url, status_code=302)
+        response.set_cookie(
+            key=settings.oauth_nonce_cookie_name,
+            value=primary_nonce,
+            httponly=True,
+            samesite=_cookie_samesite_value(),
+            secure=settings.auth_cookie_secure,
+            max_age=max(60, settings.oauth_state_ttl_minutes * 60),
+            path="/",
+        )
+        return response
+
+    if oauth_intent in {"link", "migrate_primary"}:
+        proven_user_id = (
+            current_ctx.user_id
+            if oauth_intent == "link" and current_ctx and current_ctx.valid and current_ctx.user_id
+            else consumed.initiator_user_id
+        )
+        if proven_user_id is None:
+            return _oauth_error_redirect("session_mismatch")
+        try:
+            oauth_user = _link_facebook_identity_to_proven_user(
+                cfg=cfg,
+                identity=identity,
+                user_id=proven_user_id,
+            )
+        except HTTPException:
+            return _oauth_error_redirect("facebook_identity_conflict")
+
+        if oauth_intent == "link":
+            base = settings.frontend_base_url.rstrip("/")
+            redirect_url = f"{base}/login/success?{urlencode({'next': redirect_next or '/'})}"
+            response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
+            response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
+            return response
+        oauth_session = _auth_facade().issue_session(
+            oauth_user.id,
+            ttl_minutes=settings.oauth_session_ttl_minutes,
+        )
+    elif provider == "facebook":
         login_subject = _facebook_login_subject(cfg, identity)
         contact_email = _normalized_oauth_email(identity.email)
         linked_identity = _auth_store().find_identity(provider, login_subject)
         login_user = _auth_store().get_user(linked_identity.user_id) if linked_identity else None
         if not linked_identity:
+            if _facebook_legacy_migration_enabled():
+                return _oauth_error_redirect("facebook_migration_required")
             if _find_user_by_normalized_email(contact_email):
                 return _oauth_error_redirect("account_link_required")
             try:
@@ -3956,12 +4468,24 @@ def platform_deactivate_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
-    return _platform_admin_store().deactivate_member(
+    row = _platform_admin_store().deactivate_member(
         agency_id,
         member_id,
         actor_user_id=ctx.user_id,
         actor_is_platform_admin=ctx.role == "admin",
     )
+    _audit_event(
+        event_type="agency.member.deactivated",
+        resource_type="agency_member",
+        resource_id=str(row.id),
+        ctx=ctx,
+        payload={
+            "agency_id": str(agency_id),
+            "target_user_id": str(row.user_id),
+            "member_role": row.role,
+        },
+    )
+    return row
 
 
 @app.delete(
@@ -3974,12 +4498,28 @@ def platform_remove_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
+    target = next(
+        (row for row in _platform_admin_store().list_members(agency_id) if row.id == member_id),
+        None,
+    )
     _platform_admin_store().remove_member(
         agency_id,
         member_id,
         actor_user_id=ctx.user_id,
         actor_is_platform_admin=ctx.role == "admin",
     )
+    if target:
+        _audit_event(
+            event_type="agency.member.removed",
+            resource_type="agency_member",
+            resource_id=str(target.id),
+            ctx=ctx,
+            payload={
+                "agency_id": str(agency_id),
+                "target_user_id": str(target.user_id),
+                "member_role": target.role,
+            },
+        )
     return {"status": "removed"}
 
 
@@ -3993,7 +4533,20 @@ def platform_revoke_agency_client(
     ctx: RequestContext = Depends(auth_context),
 ):
     ensure_admin(ctx)
+    target = next(
+        (row for row in _platform_admin_store().list_clients(agency_id) if row.id == access_id),
+        None,
+    )
     _platform_admin_store().revoke_client(agency_id, access_id)
+    if target:
+        _audit_event(
+            event_type="agency.client_access.revoked",
+            resource_type="agency_client_access",
+            resource_id=str(target.id),
+            ctx=ctx,
+            tenant_client_id=target.client_id,
+            payload={"agency_id": str(agency_id)},
+        )
     return {"status": "revoked"}
 
 
@@ -4251,6 +4804,7 @@ def revoke_client_invite(
 def create_ad_account(payload: AdAccountCreate, ctx: RequestContext = Depends(auth_context)):
     ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, payload.client_id)
+    _reject_server_managed_ad_account_metadata(payload.metadata)
     _ensure_client_currency(payload.client_id, payload.currency, resource="Ad account")
     return _ad_account_store().create(payload)
 
@@ -4351,6 +4905,9 @@ def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestCont
     ensure_tenant_write_access(ctx)
     existing = _account_or_404(account_id)
     ensure_account_access(ctx, existing.client_id, account_id=existing.id)
+    metadata_provided = "metadata" in payload.model_fields_set
+    if metadata_provided:
+        _reject_server_managed_ad_account_metadata(payload.metadata)
     if payload.client_id:
         ensure_client_access(ctx, payload.client_id)
     target_client_id = payload.client_id or existing.client_id
@@ -4377,7 +4934,38 @@ def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestCont
                     "details": {"account_id": str(existing.id), "budgets": len(conflicting_budgets)},
                 },
             )
-    return _ad_account_store().patch(account_id, payload)
+    patch_data = payload.model_dump(exclude_unset=True)
+    if metadata_provided:
+        # Public metadata updates may replace user-owned annotations, but they
+        # must never erase or overwrite provider/sync state maintained by the
+        # discovery and sync services.
+        patch_data["metadata"] = {
+            **_server_managed_ad_account_metadata(existing.metadata),
+            **(payload.metadata or {}),
+        }
+
+    client_changed = payload.client_id is not None and payload.client_id != existing.client_id
+    existing_platform = normalize_account_platform(existing.platform)
+    target_platform = normalize_account_platform(payload.platform or existing.platform)
+    if client_changed and "meta" in {existing_platform, target_platform}:
+        next_metadata = dict(
+            patch_data.get("metadata")
+            if "metadata" in patch_data
+            else (existing.metadata or {})
+        )
+        for key in list(next_metadata):
+            normalized_key = str(key).strip().lower()
+            if normalized_key == "integration_credential_id" or normalized_key == "meta_rediscovery_required":
+                next_metadata.pop(key, None)
+            elif normalized_key.startswith("meta_connection_"):
+                next_metadata.pop(key, None)
+        if target_platform == "meta":
+            next_metadata["meta_rediscovery_required"] = True
+            next_metadata["meta_connection_status"] = "error"
+            next_metadata["meta_connection_diagnostic_code"] = "meta_client_changed_rediscovery_required"
+        patch_data["metadata"] = next_metadata
+
+    return _ad_account_store().patch(account_id, AdAccountPatch(**patch_data))
 
 
 @app.delete("/ad-accounts/{account_id}", summary="Archive ad account")
@@ -4733,8 +5321,8 @@ def ad_account_sync_diagnostics(
 
         empty_response = bool((job.request_meta or {}).get("empty_response"))
         if job.status == "success" and empty_response:
-            state = "error"
-            message = "Provider request succeeded but returned no metric rows; data freshness is not confirmed."
+            state = "no_data"
+            message = "Last sync completed successfully, but the provider returned no metric rows for this date range."
         elif job.status == "success":
             state = "healthy"
             message = "Last sync completed successfully."
@@ -4780,6 +5368,7 @@ def ad_account_sync_diagnostics(
     summary = {
         "total_accounts": len(items),
         "healthy": len([x for x in items if x.sync_state == "healthy"]),
+        "no_data": len([x for x in items if x.sync_state == "no_data"]),
         "error": len([x for x in items if x.sync_state == "error"]),
         "retry_scheduled": len([x for x in items if x.sync_state == "retry_scheduled"]),
         "never_synced": len([x for x in items if x.sync_state == "never_synced"]),
