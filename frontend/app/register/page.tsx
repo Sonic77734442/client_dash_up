@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useState } from "react";
 import { useLocale } from "../../hooks/useLocale";
 import styles from "./register.module.css";
 
@@ -30,7 +30,7 @@ export default function RegisterPage() {
     "We will verify your details and send an invitation.",
     "Мы проверим данные и отправим приглашение.",
   ));
-  const features = useMemo(() => [
+  const features = [
     {
       icon: "speed",
       title: tr("Everything in one place", "Всё в одном месте"),
@@ -46,7 +46,7 @@ export default function RegisterPage() {
       title: tr("Ready to scale", "Готово к росту"),
       text: tr("Add accounts, teams and new data sources as you grow.", "Добавляйте кабинеты, команды и новые источники данных."),
     },
-  ], [locale]);
+  ];
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

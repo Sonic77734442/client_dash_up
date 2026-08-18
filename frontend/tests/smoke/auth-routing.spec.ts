@@ -171,17 +171,18 @@ test("Facebook button starts a platform login flow, not an ads connection", asyn
   await expect(page.getByText(/Facebook и Google здесь используются только для входа/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Подключить Meta Ads" })).toHaveCount(0);
 
-  await page.route("**/auth/facebook/start?**", async (route) => {
+  await page.route("**/api/connect/start?**", async (route) => {
     await route.fulfill({ status: 200, contentType: "text/html", body: "ok" });
   });
   const requestPromise = page.waitForRequest((request) =>
-    request.url().includes("/auth/facebook/start?"),
+    request.url().includes("/api/connect/start?"),
   );
   await facebookLogin.click();
   const oauthRequest = await requestPromise;
   const oauthUrl = new URL(oauthRequest.url());
 
-  expect(oauthUrl.pathname).toMatch(/\/auth\/facebook\/start$/);
+  expect(oauthUrl.pathname).toBe("/api/connect/start");
+  expect(oauthUrl.searchParams.get("source")).toBe("m");
   expect(oauthUrl.searchParams.get("intent")).toBe("login");
   expect(oauthUrl.searchParams.get("next")).toBe("/");
 });

@@ -6,7 +6,7 @@ import "./globals.css";
 import "./envidicy-march.css";
 
 export const metadata: Metadata = {
-  title: "Envidicy",
+  title: "Dash Envidicy",
   description: "Операционный центр эффективности рекламы",
 };
 

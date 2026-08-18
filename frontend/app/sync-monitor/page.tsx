@@ -12,6 +12,7 @@ import { useSession } from "../../hooks/useSession";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson } from "../../lib/api";
 import { scopeIntegrationsOverview } from "../../lib/agencyScope";
+import { oauthRelayLaunchPath } from "../../lib/oauthLaunchRelay";
 import {
   DataFreshnessState,
   dataFreshnessMeta,
@@ -215,6 +216,45 @@ export default function SyncMonitorPage() {
   const [historyProgress, setHistoryProgress] = useState("");
   const currentRole = agencyContext.role || "unknown";
   const actionClientId = soloClient ? agencyContext.managedClientId : discoverClientId;
+  const canManageAgencyConnections = useMemo(() => {
+    if (currentRole === "admin" || soloClient) return true;
+    if (currentRole !== "agency") return false;
+    const member = agencyContext.currentMember;
+    return !!member
+      && member.status === "active"
+      && (member.role === "owner" || member.role === "manager");
+  }, [agencyContext.currentMember, currentRole, soloClient]);
+  const activeBoundClients = useMemo(
+    () => clients.filter((client) => client.status === "active"),
+    [clients],
+  );
+  const connectionManagementReason = useMemo(() => {
+    if (currentRole === "client") return "Клиент видит данные, но не управляет подключениями.";
+    if (currentRole === "agency" && !agencyContext.selectedAgencyId) return agencySelectionRequiredMessage();
+    if (currentRole === "agency" && !agencyContext.portfolioReady) {
+      return agencyContext.portfolioError || "Портфель агентства ещё загружается.";
+    }
+    if (currentRole === "agency" && !canManageAgencyConnections) {
+      return "Подключать платформы и искать новые аккаунты может только владелец или менеджер агентства. Участник может обновлять уже добавленные аккаунты.";
+    }
+    if (currentRole === "agency" && activeBoundClients.length === 0) {
+      return "Сначала администратор должен добавить агентству хотя бы одного активного клиента.";
+    }
+    if (soloClient && !agencyContext.soloClientReady) {
+      return "Для подключения должен быть назначен ровно один активный клиент.";
+    }
+    return "";
+  }, [
+    activeBoundClients.length,
+    agencyContext.portfolioError,
+    agencyContext.portfolioReady,
+    agencyContext.selectedAgencyId,
+    agencyContext.soloClientReady,
+    canManageAgencyConnections,
+    currentRole,
+    soloClient,
+  ]);
+  const connectionControlsEnabled = canManageAgencyConnections && !connectionManagementReason;
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -475,12 +515,8 @@ export default function SyncMonitorPage() {
   const providerOptions = useMemo(() => ["all", ...Array.from(new Set(jobs.map((j) => j.provider))).sort()], [jobs]);
 
   function openConnectProvider(providerName: "google" | "facebook") {
-    if (currentRole === "client") {
-      push("Подключать платформы может агентство или администратор", "info");
-      return;
-    }
-    if (currentRole === "agency" && !agencyContext.selectedAgencyId) {
-      push(agencySelectionRequiredMessage(), "info");
+    if (!connectionControlsEnabled) {
+      push(connectionManagementReason || "У вас нет права управлять подключениями.", "info");
       return;
     }
     if (soloClient && !agencyContext.soloClientReady) {
@@ -493,6 +529,10 @@ export default function SyncMonitorPage() {
   }
 
   function openOverwriteConnection(row: IntegrationConnection) {
+    if (!connectionControlsEnabled) {
+      push(connectionManagementReason || "У вас нет права управлять подключениями.", "info");
+      return;
+    }
     const p = (row.provider || "").toLowerCase().trim();
     const providerName = p === "google" ? "google" : (p === "meta" || p === "facebook" ? "facebook" : null);
     if (!providerName) {
@@ -512,8 +552,8 @@ export default function SyncMonitorPage() {
 
   function startConnectProvider() {
     if (!connectProviderName) return;
-    if (currentRole === "agency" && !agencyContext.selectedAgencyId) {
-      push(agencySelectionRequiredMessage(), "info");
+    if (!connectionControlsEnabled) {
+      push(connectionManagementReason || "У вас нет права управлять подключениями.", "info");
       return;
     }
     if (soloClient && !agencyContext.soloClientReady) {
@@ -540,7 +580,9 @@ export default function SyncMonitorPage() {
       q.set("client_id", agencyContext.managedClientId);
     }
     localStorage.setItem("ops_api_base", base);
-    window.location.href = `${base}/auth/${connectProviderName}/start?${q.toString()}`;
+    window.location.href = base.startsWith("/")
+      ? oauthRelayLaunchPath(connectProviderName, q)
+      : `${base}/auth/${connectProviderName}/start?${q.toString()}`;
   }
 
   async function runSync(opts?: { platform?: "meta" | "google" | "tiktok"; accountId?: string }) {
@@ -603,15 +645,8 @@ export default function SyncMonitorPage() {
   }
 
   async function discoverAccounts(providerName?: "meta" | "google" | "tiktok") {
-    if (currentRole === "client") {
-      push("Искать рекламные аккаунты может агентство или администратор", "info");
-      return;
-    }
-    if (
-      currentRole === "agency"
-      && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady)
-    ) {
-      push(agencySelectionRequiredMessage(), "info");
+    if (!connectionControlsEnabled) {
+      push(connectionManagementReason || "У вас нет права искать новые рекламные аккаунты.", "info");
       return;
     }
     if (soloClient && !agencyContext.soloClientReady) {
@@ -739,8 +774,8 @@ export default function SyncMonitorPage() {
   }
 
   async function disconnectConnection(row: IntegrationConnection) {
-    if (currentRole === "client") {
-      push("Отключать платформы может агентство или администратор", "info");
+    if (!connectionControlsEnabled) {
+      push(connectionManagementReason || "У вас нет права управлять подключениями.", "info");
       return;
     }
     if (!window.confirm(`Отключить ${providerLabel(row.provider)} — ${connectionLabel(row)}?`)) {
@@ -843,7 +878,7 @@ export default function SyncMonitorPage() {
               <div>
                 <h3 style={{ margin: 0 }}>1. Подключите рекламную платформу</h3>
                 <div className="panel-subtitle">
-                  Предоставьте доступ к рекламным кабинетам Google Ads или Meta Ads. Это не вход в платформу.
+                  Порядок работы: подключить платформу → найти аккаунты → назначить их клиенту → запустить синхронизацию. Это не вход в платформу.
                 </div>
               </div>
               <div className="data-connection-actions">
@@ -872,16 +907,44 @@ export default function SyncMonitorPage() {
                   onClick={() => void discoverAccounts()}
                   disabled={
                     syncLoading
-                    || (currentRole === "agency" && (!agencyContext.selectedAgencyId || !agencyContext.portfolioReady))
-                    || (soloClient && !agencyContext.soloClientReady)
+                    || !connectionControlsEnabled
                   }
+                  title={connectionManagementReason || (!discoverClientId && !soloClient ? "Можно найти аккаунты без назначения и распределить их позже" : undefined)}
                 >
                   Найти аккаунты
                 </button>
-                <button className="primary-btn" onClick={() => openConnectProvider("google")}>Подключить Google Ads</button>
-                <button className="primary-btn" onClick={() => openConnectProvider("facebook")}>Подключить Meta Ads</button>
+                <button
+                  className="primary-btn"
+                  onClick={() => openConnectProvider("google")}
+                  disabled={!connectionControlsEnabled}
+                  title={connectionManagementReason || undefined}
+                >
+                  Подключить Google Ads
+                </button>
+                <button
+                  className="primary-btn"
+                  onClick={() => openConnectProvider("facebook")}
+                  disabled={!connectionControlsEnabled}
+                  title={connectionManagementReason || undefined}
+                >
+                  Подключить Meta Ads
+                </button>
               </div>
             </div>
+            {currentRole === "agency" && agencyContext.portfolioReady && !agencyContext.loading && !canManageAgencyConnections ? (
+              <div className="data-next-step" style={{ marginTop: 8 }}>
+                <strong>Режим участника</strong>
+                <span>
+                  Вы можете запускать синхронизацию уже добавленных рекламных аккаунтов. Подключить новую платформу, найти аккаунты, переподключить или отключить авторизацию может владелец или менеджер агентства.
+                </span>
+              </div>
+            ) : null}
+            {currentRole === "agency" && canManageAgencyConnections && activeBoundClients.length === 0 ? (
+              <div className="data-next-step" style={{ marginTop: 8 }}>
+                <strong>Сначала добавьте клиента</strong>
+                <span>Попросите администратора привязать к агентству хотя бы одного активного клиента. После этого станут доступны подключение платформы и поиск рекламных аккаунтов.</span>
+              </div>
+            ) : null}
             {currentRole === "client" ? (
               <div className="muted-note" style={{ marginTop: 8 }}>
                 У клиента здесь режим просмотра. Подключениями и обновлением управляет агентство.
@@ -909,11 +972,21 @@ export default function SyncMonitorPage() {
                   <div style={{ marginTop: 8 }}>
                     {!p.sync_ready ? (
                       asSyncPlatform(p.provider) === "google" ? (
-                        <button className="primary-btn" onClick={() => openConnectProvider("google")}>
+                        <button
+                          className="primary-btn"
+                          onClick={() => openConnectProvider("google")}
+                          disabled={!connectionControlsEnabled}
+                          title={connectionManagementReason || undefined}
+                        >
                           Подключить Google Ads
                         </button>
                       ) : asSyncPlatform(p.provider) === "meta" ? (
-                        <button className="primary-btn" onClick={() => openConnectProvider("facebook")}>
+                        <button
+                          className="primary-btn"
+                          onClick={() => openConnectProvider("facebook")}
+                          disabled={!connectionControlsEnabled}
+                          title={connectionManagementReason || undefined}
+                        >
                           Подключить Meta Ads
                         </button>
                       ) : (
@@ -952,7 +1025,8 @@ export default function SyncMonitorPage() {
                             }
                             void discoverAccounts(platform);
                           }}
-                          disabled={syncLoading}
+                          disabled={syncLoading || !connectionControlsEnabled}
+                          title={connectionManagementReason || undefined}
                         >
                           Найти аккаунты
                         </button>
@@ -1112,10 +1186,20 @@ export default function SyncMonitorPage() {
                       </td>
                       <td>{fmtDate(row.updated_at)}</td>
                       <td>
-                        <button className="ghost-btn" onClick={() => openOverwriteConnection(row)} disabled={syncLoading}>
+                        <button
+                          className="ghost-btn"
+                          onClick={() => openOverwriteConnection(row)}
+                          disabled={syncLoading || !connectionControlsEnabled}
+                          title={connectionManagementReason || undefined}
+                        >
                           Переподключить
                         </button>
-                        <button className="ghost-btn" onClick={() => void disconnectConnection(row)} disabled={syncLoading || row.status !== "active"}>
+                        <button
+                          className="ghost-btn"
+                          onClick={() => void disconnectConnection(row)}
+                          disabled={syncLoading || row.status !== "active" || !connectionControlsEnabled}
+                          title={connectionManagementReason || (row.status !== "active" ? "Подключение уже находится в архиве" : undefined)}
+                        >
                           Отключить
                         </button>
                       </td>
@@ -1307,7 +1391,14 @@ export default function SyncMonitorPage() {
               </div>
             )}
             <div className="budgets-detail-actions" style={{ marginTop: 14 }}>
-              <button className="primary-btn" onClick={startConnectProvider}>Перейти к авторизации</button>
+              <button
+                className="primary-btn"
+                onClick={startConnectProvider}
+                disabled={!connectionControlsEnabled}
+                title={connectionManagementReason || undefined}
+              >
+                Перейти к авторизации
+              </button>
               <button className="ghost-btn" onClick={closeConnectDialog}>Отмена</button>
             </div>
           </div>
