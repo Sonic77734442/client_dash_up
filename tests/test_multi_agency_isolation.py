@@ -128,6 +128,39 @@ def test_multi_agency_oauth_connect_requires_selection_and_writes_one_scope(monk
     assert str(credentials[0].scope_id) != second_agency_id
 
 
+def test_agency_context_operations_fail_closed_on_partial_membership_read(monkeypatch):
+    _reset_state()
+    _admin_token, agency_token, first_agency_id, second_agency_id = _bootstrap_two_agencies()
+    app.state.oauth_adapters = {"google": FakeGoogleConnectAdapter()}
+
+    original_list_members = app.state.platform_admin_store.list_members
+
+    def partial_membership_failure(agency_id):
+        if str(agency_id) == second_agency_id:
+            raise RuntimeError("simulated partial membership read failure")
+        return original_list_members(agency_id)
+
+    monkeypatch.setattr(app.state.platform_admin_store, "list_members", partial_membership_failure)
+
+    responses = [
+        client.get(
+            f"/auth/google/start?next=/sync-monitor&intent=connect&agency_id={first_agency_id}",
+            headers=_auth(agency_token),
+            follow_redirects=False,
+        ),
+        client.post(
+            "/ad-accounts/discover",
+            json={"provider": "meta", "agency_id": first_agency_id},
+            headers=_auth(agency_token),
+        ),
+        client.get("/platform/agencies?status=active", headers=_auth(agency_token)),
+    ]
+
+    for response in responses:
+        assert response.status_code == 503, response.text
+        assert _error_code(response) == "agency_membership_check_failed"
+
+
 def test_multi_agency_discovery_inbox_is_created_and_bound_only_in_selected_agency():
     _reset_state()
     _admin_token, agency_token, first_agency_id, second_agency_id = _bootstrap_two_agencies()

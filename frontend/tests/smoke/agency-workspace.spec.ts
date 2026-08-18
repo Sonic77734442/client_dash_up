@@ -241,3 +241,29 @@ test("switching agency drops delayed old scope and constrains bulk sync", async 
   const syncRequest = await syncRequestPromise;
   expect(syncRequest.postDataJSON()).toMatchObject({ account_ids: [south.accountId] });
 });
+
+test("integrations offers an in-page agency picker before enabling connection controls", async ({ page, context, request }) => {
+  test.setTimeout(90_000);
+  const fixture = await createMultiAgencySessionWithAccess(request);
+  const [north] = fixture.fixtures;
+  await attachSession(page, context, fixture.token);
+
+  await page.goto("/integrations");
+
+  const agencySelect = page.getByLabel("Агентство для источников рекламы");
+  await expect(agencySelect).toBeVisible({ timeout: 30_000 });
+  await expect(agencySelect).toHaveValue("");
+  await expect(page.getByText("Сначала выберите агентство", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "+ Подключить" })).toBeDisabled();
+  await expect(page.locator("main .warning")).toHaveClass(/hidden/);
+
+  await agencySelect.selectOption(north.agencyId);
+
+  await expect(agencySelect).toHaveValue(north.agencyId);
+  await expect(page.getByRole("region", { name: "Источники выбранного агентства" })).toContainText(
+    "Сейчас показаны подключения агентства",
+  );
+  const connectLink = page.getByRole("link", { name: "+ Подключить" });
+  await expect(connectLink).toBeVisible({ timeout: 30_000 });
+  await expect(connectLink).toHaveAttribute("href", "/sync-monitor#provider-connections");
+});

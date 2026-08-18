@@ -1404,7 +1404,7 @@ def _active_agency_memberships_for_user(
                 status_code=503,
                 detail={
                     "code": "agency_membership_check_failed",
-                    "message": "Cannot verify solo owner agency isolation",
+                    "message": "Cannot verify agency memberships",
                 },
             ) from exc
         return out
@@ -1417,7 +1417,7 @@ def _active_agency_memberships_for_user(
                     status_code=503,
                     detail={
                         "code": "agency_membership_check_failed",
-                        "message": "Cannot verify solo owner agency isolation",
+                        "message": "Cannot verify agency memberships",
                     },
                 ) from exc
             continue
@@ -1428,7 +1428,10 @@ def _active_agency_memberships_for_user(
 
 
 def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
-    return [agency_id for agency_id, _member in _active_agency_memberships_for_user(user_id)]
+    return [
+        agency_id
+        for agency_id, _member in _active_agency_memberships_for_user(user_id, fail_closed=True)
+    ]
 
 
 def _solo_owner_client_id_for_user(
@@ -1510,7 +1513,7 @@ def _resolve_agency_context_for_user(
     require_manage: bool = True,
 ) -> UUID:
     """Resolve one active agency without ever fanning an action out to every membership."""
-    memberships = _active_agency_memberships_for_user(user_id)
+    memberships = _active_agency_memberships_for_user(user_id, fail_closed=True)
     if requested_agency_id is not None:
         selected = next((row for row in memberships if row[0] == requested_agency_id), None)
         if selected is None:
@@ -2685,11 +2688,11 @@ def _ensure_client_restore_assignments_available(client_id: UUID) -> None:
             )
 
 
-def _resolve_discovery_client_id(
+def _resolve_discovery_context(
     ctx: RequestContext,
     requested_client_id: Optional[UUID],
     requested_agency_id: Optional[UUID] = None,
-) -> UUID:
+) -> tuple[UUID, Optional[UUID]]:
     if ctx.role == "solo_client":
         if requested_agency_id is not None:
             raise HTTPException(
@@ -2706,7 +2709,7 @@ def _resolve_discovery_client_id(
                     "details": {"client_id": str(requested_client_id)},
                 },
             )
-        return owned_client_id
+        return owned_client_id, None
 
     selected_agency_id: Optional[UUID] = None
     if ctx.role == "agency":
@@ -2721,7 +2724,7 @@ def _resolve_discovery_client_id(
         ensure_client_access(ctx, requested_client_id)
         if selected_agency_id is not None:
             _ensure_client_bound_to_agency(selected_agency_id, requested_client_id)
-        return requested_client_id
+        return requested_client_id, selected_agency_id
 
     if selected_agency_id is not None:
         bindings = _platform_admin_store().list_clients(selected_agency_id)
@@ -2740,7 +2743,7 @@ def _resolve_discovery_client_id(
             if (client := _client_store().get(cid)) is not None and client.status == "active"
         ]
     if len(candidates) == 1:
-        return candidates[0]
+        return candidates[0], selected_agency_id
     inbox_scope = (
         f"agency:{selected_agency_id}"
         if selected_agency_id is not None
@@ -2758,7 +2761,7 @@ def _resolve_discovery_client_id(
                 selected_agency_id,
                 AgencyClientAccessCreate(client_id=row.id),
             )
-        return row.id
+        return row.id, selected_agency_id
 
     created = _client_store().create(
         ClientCreate(
@@ -2773,7 +2776,7 @@ def _resolve_discovery_client_id(
             selected_agency_id,
             AgencyClientAccessCreate(client_id=created.id),
         )
-    return created.id
+    return created.id, selected_agency_id
 
 
 def _infer_single_tenant_client(ctx: RequestContext) -> Optional[UUID]:
@@ -4402,12 +4405,11 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             status_code=403,
             detail={"code": "forbidden", "message": "This role cannot run account discovery"},
         )
-    selected_agency_id = (
-        _resolve_agency_context_for_user(ctx.user_id, payload.agency_id, require_manage=True)
-        if ctx.role == "agency" and ctx.user_id
-        else None
+    target_client_id, selected_agency_id = _resolve_discovery_context(
+        ctx,
+        payload.client_id,
+        payload.agency_id,
     )
-    target_client_id = _resolve_discovery_client_id(ctx, payload.client_id, selected_agency_id)
     target_client = _client_or_404(target_client_id)
     if target_client.status != "active":
         raise HTTPException(

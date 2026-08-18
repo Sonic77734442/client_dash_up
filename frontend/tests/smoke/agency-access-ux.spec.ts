@@ -100,12 +100,21 @@ test("agency member cannot manage connections but can sync imported accounts", a
   await attachSession(page, context, fixture.token);
 
   await page.goto("/sync-monitor");
-  await expect(page.getByText("Режим участника", { exact: true })).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByRole("button", { name: "Подключить Google Ads" }).first()).toBeDisabled();
+  await expect(page.getByText("Ваша роль — «Участник»", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("попросите владельца или менеджера агентства назначить вам роль «Менеджер»", { exact: false })).toBeVisible();
+  const googleConnectButton = page.getByRole("button", { name: "Подключить Google Ads" }).first();
+  await expect(googleConnectButton).toBeDisabled();
+  await expect(googleConnectButton).toHaveCSS("cursor", "not-allowed");
+  await expect(googleConnectButton).toHaveCSS("background-color", "rgb(236, 238, 241)");
+  await expect(googleConnectButton).toHaveCSS("background-image", "none");
   await expect(page.getByRole("button", { name: "Найти аккаунты", exact: true }).first()).toBeDisabled();
   await expect(page.getByRole("button", { name: "Обновить данные за 30 дней" })).toBeEnabled();
 
   await page.goto("/integrations");
-  await expect(page.getByText("Режим участника", { exact: true })).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByRole("button", { name: "+ Подключить" })).toBeDisabled();
+  await expect(page.getByText("Ваша роль — «Участник»", { exact: true })).toBeVisible({ timeout: 30_000 });
+  const connectButton = page.getByRole("button", { name: "+ Подключить" });
+  await expect(connectButton).toBeDisabled();
+  await expect(connectButton).toHaveCSS("cursor", "not-allowed");
+  await expect(connectButton).toHaveCSS("background-color", "rgb(244, 244, 245)");
+  await expect(connectButton).toHaveCSS("background-image", "none");
 });
