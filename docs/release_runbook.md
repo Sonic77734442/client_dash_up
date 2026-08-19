@@ -20,8 +20,8 @@ CI workflow (`.github/workflows/ci.yml`) enforces:
 - `APP_ENV=production`
 - `AUTH_COOKIE_SECURE=true`
 - `AUTH_COOKIE_SAMESITE=lax`
-- `ALLOWED_ORIGINS=https://client-dash-up.vercel.app`
-- `FRONTEND_BASE_URL=https://client-dash-up.vercel.app`
+- `ALLOWED_ORIGINS=https://dash.envidicy.kz`
+- `FRONTEND_BASE_URL=https://dash.envidicy.kz`
 - `BUDGETS_DB_PATH=/var/data/budgets.db`
 - `METRICS_BEARER_TOKEN=<long random secret>` when `OBSERVABILITY_PUBLIC=false`
 4. Run release gate:
@@ -124,14 +124,14 @@ Before promoting the frontend, configure Vercel with:
 - `API_UPSTREAM_BASE=https://client-dash-up.onrender.com`
 - `NEXT_PUBLIC_ENABLE_TOKEN_LOGIN=false`
 
-Configure the backend with `FRONTEND_BASE_URL=https://client-dash-up.vercel.app`,
+Configure the backend with `FRONTEND_BASE_URL=https://dash.envidicy.kz`,
 `AUTH_COOKIE_SECURE=true`, and `AUTH_COOKIE_SAMESITE=lax`.
 
 Register the following exact OAuth callback URLs in Google/Facebook and in the
 backend provider configuration:
 
-- `https://client-dash-up.vercel.app/api/backend/auth/google/callback`
-- `https://client-dash-up.vercel.app/api/backend/auth/facebook/callback`
+- `https://dash.envidicy.kz/api/backend/auth/google/callback`
+- `https://dash.envidicy.kz/api/backend/auth/facebook/callback`
 
 Release verification:
 

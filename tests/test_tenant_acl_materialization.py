@@ -10,6 +10,7 @@ from app.schemas import (
     AgencyMemberCreate,
     AgencyPatch,
     ClientCreate,
+    UserClientAccessCreate,
     UserCreate,
     UserPatch,
 )
@@ -66,6 +67,27 @@ def test_agency_status_rebuilds_materialized_access_for_both_stores(kind, tmp_pa
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_reactivating_agency_user_restores_scope_from_active_memberships(kind, tmp_path):
+    auth_store, client_store, platform_store = _stores(kind, tmp_path)
+    user = auth_store.create_user(
+        UserCreate(email=f"reactivate-{kind}@test.local", name="Member", role="agency", status="active")
+    )
+    tenant = client_store.create(ClientCreate(name="Reactivation tenant", default_currency="USD"))
+    agency = platform_store.create_agency(AgencyCreate(name=f"Reactivation {kind}", status="active"))
+    platform_store.upsert_member(
+        agency.id,
+        AgencyMemberCreate(user_id=user.id, role="member", status="active"),
+    )
+    platform_store.assign_client(agency.id, AgencyClientAccessCreate(client_id=tenant.id))
+    assert {row.client_id for row in auth_store.list_client_access(user.id)} == {tenant.id}
+
+    auth_store.patch_user(user.id, UserPatch(status="inactive"))
+    assert auth_store.list_client_access(user.id) == []
+    auth_store.patch_user(user.id, UserPatch(status="active"))
+    assert {row.client_id for row in auth_store.list_client_access(user.id)} == {tenant.id}
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
 @pytest.mark.parametrize("target_role", ["client", "admin"])
 def test_role_transition_removes_agency_grants_without_later_regrant(kind, target_role, tmp_path):
     auth_store, client_store, platform_store = _stores(kind, tmp_path)
@@ -86,6 +108,92 @@ def test_role_transition_removes_agency_grants_without_later_regrant(kind, targe
     platform_store.patch_agency(agency.id, AgencyPatch(status="suspended"))
     platform_store.patch_agency(agency.id, AgencyPatch(status="active"))
     assert auth_store.list_client_access(user.id) == []
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_client_direct_grant_survives_cleanup_of_stale_agency_membership(kind, tmp_path):
+    auth_store, client_store, platform_store = _stores(kind, tmp_path)
+    user = auth_store.create_user(
+        UserCreate(email=f"stale-member-{kind}@test.local", name="Member", role="agency", status="active")
+    )
+    agency_client = client_store.create(ClientCreate(name="Agency tenant", default_currency="USD"))
+    direct_client = client_store.create(ClientCreate(name="Direct tenant", default_currency="USD"))
+    agency = platform_store.create_agency(AgencyCreate(name=f"Stale membership {kind}", status="active"))
+    platform_store.upsert_member(
+        agency.id,
+        AgencyMemberCreate(user_id=user.id, role="member", status="active"),
+    )
+    platform_store.assign_client(agency.id, AgencyClientAccessCreate(client_id=agency_client.id))
+
+    auth_store.patch_user(user.id, UserPatch(role="client"))
+    assert auth_store.list_client_access(user.id) == []
+    auth_store.assign_client_access(
+        UserClientAccessCreate(user_id=user.id, client_id=direct_client.id, role="client")
+    )
+
+    # The still-present membership is stale, but its lifecycle must not erase
+    # an independent direct viewer grant after the global-role demotion.
+    platform_store.patch_agency(agency.id, AgencyPatch(status="suspended"))
+    assert {row.client_id for row in auth_store.list_client_access(user.id)} == {direct_client.id}
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_multi_agency_rebuild_keeps_scope_from_the_other_active_agency(kind, tmp_path):
+    auth_store, client_store, platform_store = _stores(kind, tmp_path)
+    user = auth_store.create_user(
+        UserCreate(email=f"multi-agency-{kind}@test.local", name="Member", role="agency", status="active")
+    )
+    first_client = client_store.create(ClientCreate(name="First agency tenant", default_currency="USD"))
+    second_client = client_store.create(ClientCreate(name="Second agency tenant", default_currency="USD"))
+    first_agency = platform_store.create_agency(AgencyCreate(name=f"First multi {kind}", status="active"))
+    second_agency = platform_store.create_agency(AgencyCreate(name=f"Second multi {kind}", status="active"))
+    for agency in (first_agency, second_agency):
+        platform_store.upsert_member(
+            agency.id,
+            AgencyMemberCreate(user_id=user.id, role="member", status="active"),
+        )
+    first_binding = platform_store.assign_client(
+        first_agency.id,
+        AgencyClientAccessCreate(client_id=first_client.id),
+    )
+    platform_store.assign_client(
+        second_agency.id,
+        AgencyClientAccessCreate(client_id=second_client.id),
+    )
+    assert {row.client_id for row in auth_store.list_client_access(user.id)} == {
+        first_client.id,
+        second_client.id,
+    }
+
+    platform_store.revoke_client(first_agency.id, first_binding.id)
+    assert {row.client_id for row in auth_store.list_client_access(user.id)} == {second_client.id}
+
+
+@pytest.mark.parametrize("kind", ["memory", "sqlite"])
+def test_solo_owner_must_revoke_archived_grant_before_reassignment(kind, tmp_path):
+    auth_store, client_store, _platform_store = _stores(kind, tmp_path)
+    user = auth_store.create_user(
+        UserCreate(email=f"solo-archived-{kind}@test.local", name="Solo", role="solo_client", status="active")
+    )
+    archived_client = client_store.create(ClientCreate(name="Archived solo tenant", default_currency="USD"))
+    new_client = client_store.create(ClientCreate(name="New solo tenant", default_currency="USD"))
+    auth_store.assign_client_access(
+        UserClientAccessCreate(user_id=user.id, client_id=archived_client.id, role="client")
+    )
+    client_store.archive(archived_client.id)
+
+    with pytest.raises(HTTPException) as exc:
+        auth_store.assign_client_access(
+            UserClientAccessCreate(user_id=user.id, client_id=new_client.id, role="client")
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "solo_owner_provisioning_conflict"
+
+    auth_store.remove_client_access(user.id, archived_client.id)
+    reassigned = auth_store.assign_client_access(
+        UserClientAccessCreate(user_id=user.id, client_id=new_client.id, role="client")
+    )
+    assert reassigned.client_id == new_client.id
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])

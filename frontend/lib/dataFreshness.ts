@@ -13,6 +13,7 @@ export type DataFreshnessState =
   | "current"
   | "stale"
   | "never_synced"
+  | "no_data"
   | "insufficient_data"
   | "retry_scheduled"
   | "error";
@@ -43,6 +44,10 @@ function dataDateState(value?: unknown, now = Date.now()): DataFreshnessState | 
 export function accountDataFreshness(account: AdAccount, now = Date.now()): DataFreshnessState {
   if (String(account.sync_status || "").toLowerCase() === "error") return "error";
   if (account.status !== "active") return "insufficient_data";
+  if (
+    String(account.sync_status || "").toLowerCase() === "success"
+    && String(account.metadata?.sync_data_status || "").toLowerCase() === "empty"
+  ) return "no_data";
 
   const exactDataDate = account.metadata?.latest_data_date ?? account.metadata?.last_data_at;
   const exactState = dataDateState(exactDataDate, now);
@@ -59,6 +64,7 @@ export function accountDataFreshness(account: AdAccount, now = Date.now()): Data
 
 export function providerDataFreshness(provider: IntegrationProvider, now = Date.now()): DataFreshnessState {
   if (!provider.sync_ready || provider.status === "error" || provider.status === "disconnected") return "error";
+  if (provider.last_successful_sync_at && !provider.rows_present) return "no_data";
 
   const exactState = dataDateState(provider.latest_data_date, now);
   if (exactState && exactState !== "current") return exactState;
@@ -79,6 +85,7 @@ export function diagnosticDataFreshness(
 ): DataFreshnessState {
   if (diagnostic.sync_state === "error") return "error";
   if (diagnostic.sync_state === "retry_scheduled") return "retry_scheduled";
+  if (diagnostic.sync_state === "no_data") return "no_data";
 
   const timestamp = timestampState(diagnostic.last_sync_at, now);
   if (timestamp !== "current") return timestamp;
@@ -97,6 +104,7 @@ export function aggregateAccountFreshness(
   if (states.includes("error")) return "error";
   if (states.includes("retry_scheduled")) return "retry_scheduled";
   if (states.includes("never_synced")) return "never_synced";
+  if (states.includes("no_data")) return "no_data";
   if (states.includes("stale")) return "stale";
   if (states.includes("insufficient_data")) return "insufficient_data";
   if (options?.hasMetricRows === false) return "insufficient_data";
@@ -141,6 +149,13 @@ export function dataFreshnessMeta(state: DataFreshnessState): DataFreshnessMeta 
     return {
       label: "Данные ещё не загружались",
       description: "У аккаунта нет ни одной подтверждённой успешной синхронизации с данными.",
+      tone: "warn",
+    };
+  }
+  if (state === "no_data") {
+    return {
+      label: "Нет активности за период",
+      description: "Платформа ответила успешно, но за выбранный период не вернула строк с рекламной активностью.",
       tone: "warn",
     };
   }

@@ -5,9 +5,10 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 import app.services.oauth as oauth_module
 from app.main import _oauth_provider_config_or_400, app
-from app.schemas import AuthIdentityLink, ClientCreate, SessionIssueRequest, UserCreate
+from app.schemas import AuthIdentityLink, ClientCreate, SessionIssueRequest, UserClientAccessCreate, UserCreate
 from app.services.oauth import (
     ExternalIdentityPayload,
     FacebookOAuthAdapter,
@@ -42,6 +43,16 @@ def set_facebook_connect_env(monkeypatch):
         "https://dashboard.example/api/backend/auth/facebook/callback",
     )
     monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "business-config-id")
+
+
+def set_facebook_migration_env(monkeypatch):
+    set_facebook_auth_env(monkeypatch)
+    monkeypatch.setenv("FACEBOOK_AUTH_LEGACY_CLIENT_ID", "facebook-legacy-client")
+    monkeypatch.setenv("FACEBOOK_AUTH_LEGACY_CLIENT_SECRET", "facebook-legacy-secret")
+    monkeypatch.setenv(
+        "FACEBOOK_AUTH_LEGACY_REDIRECT_URI",
+        "https://dashboard.example/api/backend/auth/facebook/callback",
+    )
 
 
 class FakeProviderAdapter:
@@ -569,6 +580,16 @@ def test_oauth_provider_scopes_depend_on_login_or_connect_intent():
     assert "config_id" not in facebook_login
     assert "override_default_response_type" not in facebook_login
 
+    for identity_intent in ("link", "migrate_legacy", "migrate_primary"):
+        identity_url = FacebookOAuthAdapter().build_authorize_url(
+            OAuthProviderConfig(**facebook_base, intent=identity_intent),
+            "state",
+        )
+        identity_query = parse_qs(urlparse(identity_url).query)
+        assert set(identity_query["scope"][0].split(",")) == {"public_profile", "email"}
+        assert "config_id" not in identity_query
+        assert "override_default_response_type" not in identity_query
+
     facebook_connect_url = FacebookOAuthAdapter().build_authorize_url(
         OAuthProviderConfig(**facebook_base, intent="connect"),
         "state",
@@ -645,9 +666,31 @@ def test_facebook_connect_callback_reuses_business_credentials_from_state(monkey
 
         def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
             seen.append(("callback", cfg.intent, cfg.client_id, cfg.client_secret, cfg.config_id))
-            return super().fetch_identity(cfg, code)
+            identity = super().fetch_identity(cfg, code)
+            identity.oauth_tokens = {"access_token": "meta-access-token", "expires_in": 3600}
+            return identity
 
     app.state.oauth_adapters = {"facebook": TrackingFacebookAdapter()}
+    validated_calls = []
+
+    def validate_connection(**kwargs):
+        validated_calls.append(kwargs)
+        return {
+            "meta_validation_version": 1,
+            "meta_validated_at": "2026-08-18T12:00:00+00:00",
+            "meta_app_id": "facebook-business-client",
+            "meta_business_config_id": "business-config-id",
+            "meta_business_config_source": "oauth_state",
+            "meta_user_id": "fb-user-123",
+            "meta_scopes": ["ads_management", "business_management"],
+            "meta_granted_permissions": ["ads_management", "business_management"],
+            "meta_granular_scopes": [],
+            "meta_expires_at": 4_102_444_800,
+            "meta_data_access_expires_at": 4_102_444_800,
+            "meta_absolute_expires_at": 4_102_444_800,
+        }
+
+    monkeypatch.setattr(main_module, "validate_meta_business_connection", validate_connection)
     admin = client.post(
         "/auth/internal/users",
         json={"email": "admin@facebook.test", "name": "Admin", "role": "admin", "status": "active"},
@@ -672,6 +715,88 @@ def test_facebook_connect_callback_reuses_business_credentials_from_state(monkey
     assert app.state.auth_store.list_identities() == []
     assert client.cookies.get("ops_session") == session.json()["token"]
     assert "ops_session=" not in callback.headers.get("set-cookie", "")
+    assert len(validated_calls) == 1
+    assert validated_calls[0]["access_token"] == "meta-access-token"
+    assert validated_calls[0]["app_id"] == "facebook-business-client"
+    assert validated_calls[0]["app_secret"] == "facebook-business-secret"
+    assert validated_calls[0]["config_id"] == "business-config-id"
+    assert validated_calls[0]["expected_user_id"] == "fb-user-123"
+    stored = app.state.integration_credential_store.list(status="all")
+    assert len(stored) == 1
+    assert stored[0].provider == "meta"
+    assert stored[0].credentials["access_token"] == "meta-access-token"
+    assert stored[0].credentials["meta_validation_version"] == 1
+    assert stored[0].credentials["meta_business_config_id"] == "business-config-id"
+
+
+def test_facebook_connect_callback_rejects_missing_business_permissions(monkeypatch):
+    reset_state()
+    set_facebook_connect_env(monkeypatch)
+
+    class TokenFacebookAdapter(FakeProviderAdapter):
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            identity = super().fetch_identity(cfg, code)
+            identity.oauth_tokens = {"access_token": "meta-access-token", "expires_in": 3600}
+            return identity
+
+    def reject_connection(**_kwargs):
+        raise main_module.MetaConnectionValidationError(
+            "meta_permissions_missing",
+            "Meta Ads access is incomplete.",
+        )
+
+    app.state.oauth_adapters = {"facebook": TokenFacebookAdapter()}
+    monkeypatch.setattr(main_module, "validate_meta_business_connection", reject_connection)
+    admin = app.state.auth_store.create_user(
+        UserCreate(email="admin@facebook.test", name="Admin", role="admin", status="active")
+    )
+    session = app.state.auth_store.issue_session(SessionIssueRequest(user_id=admin.id, ttl_minutes=60))
+    client.cookies.set("ops_session", session.token)
+
+    start = client.get("/auth/facebook/start?next=/sync-monitor&intent=connect", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["access_not_granted"]
+    assert app.state.integration_credential_store.list(status="all") == []
+    assert app.state.auth_store.list_identities() == []
+
+
+def test_facebook_connect_callback_rejects_business_config_rotation_before_token_exchange(monkeypatch):
+    reset_state()
+    set_facebook_connect_env(monkeypatch)
+
+    class TrackingFacebookAdapter(FakeProviderAdapter):
+        def __init__(self):
+            self.fetch_calls = 0
+
+        def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+            self.fetch_calls += 1
+            return super().fetch_identity(cfg, code)
+
+    adapter = TrackingFacebookAdapter()
+    app.state.oauth_adapters = {"facebook": adapter}
+    admin = app.state.auth_store.create_user(
+        UserCreate(email="admin@facebook.test", name="Admin", role="admin", status="active")
+    )
+    session = app.state.auth_store.issue_session(SessionIssueRequest(user_id=admin.id, ttl_minutes=60))
+    client.cookies.set("ops_session", session.token)
+
+    start = client.get(
+        "/auth/facebook/start?next=/sync-monitor%3Fops_meta_config_id%3Dattacker&intent=connect",
+        follow_redirects=False,
+    )
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    monkeypatch.setenv("FACEBOOK_LOGIN_CONFIG_ID", "rotated-business-config-id")
+
+    callback = client.get(f"/auth/facebook/callback?code=ok-code&state={state}", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["provider_error"]
+    assert adapter.fetch_calls == 0
+    assert app.state.integration_credential_store.list(status="all") == []
 
 
 def test_facebook_login_auto_provisions_isolated_client_workspace(monkeypatch):
@@ -1055,3 +1180,420 @@ def test_oauth_connect_callback_rejects_session_switch():
     assert callback.status_code == 302
     assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == ["session_mismatch"]
     assert app.state.integration_credential_store.list(status="all") == []
+
+
+class FakeFacebookMigrationAdapter:
+    provider = "facebook"
+
+    def __init__(
+        self,
+        *,
+        legacy_user_id: str = "legacy-user",
+        primary_user_id: str = "primary-user",
+        legacy_email: str | None = "owner@example.com",
+        primary_email: str | None = "owner@example.com",
+    ):
+        self.legacy_user_id = legacy_user_id
+        self.primary_user_id = primary_user_id
+        self.legacy_email = legacy_email
+        self.primary_email = primary_email
+
+    def build_authorize_url(self, cfg, state: str) -> str:
+        return (
+            "https://provider.example/facebook-auth?"
+            f"state={state}&client_id={cfg.client_id}&intent={cfg.intent}"
+        )
+
+    def fetch_identity(self, cfg, code: str) -> ExternalIdentityPayload:
+        legacy = cfg.intent == "migrate_legacy"
+        provider_user_id = self.legacy_user_id if legacy else self.primary_user_id
+        email = self.legacy_email if legacy else self.primary_email
+        return ExternalIdentityPayload(
+            provider_user_id=provider_user_id,
+            email=email,
+            email_verified=True if email else None,
+            name="Migrating Owner",
+            raw_profile={"id": provider_user_id, **({"email": email} if email else {})},
+        )
+
+
+def seed_legacy_facebook_solo_owner(*, raw_subject: bool = False, prefixed_subject: bool = True):
+    owner = app.state.auth_store.create_user(
+        UserCreate(email="owner@example.com", name="Legacy Owner", role="solo_client", status="active")
+    )
+    workspace = app.state.client_store.create(
+        ClientCreate(name="Legacy Workspace", status="active", default_currency="USD")
+    )
+    app.state.auth_store.assign_client_access(
+        UserClientAccessCreate(user_id=owner.id, client_id=workspace.id, role="client")
+    )
+    legacy_subjects = []
+    if prefixed_subject:
+        legacy_subjects.append("facebook-legacy-client:legacy-user")
+    if raw_subject:
+        legacy_subjects.append("legacy-user")
+    for legacy_subject in legacy_subjects:
+        app.state.auth_store.link_identity(
+            AuthIdentityLink(
+                user_id=owner.id,
+                provider="facebook",
+                provider_user_id=legacy_subject,
+                email="owner@example.com",
+                email_verified=True,
+                raw_profile={"id": "legacy-user"},
+            )
+        )
+    return owner, workspace
+
+
+def complete_facebook_migration_first_step():
+    start = client.get("/auth/facebook/start?intent=migrate&next=/", follow_redirects=False)
+    assert start.status_code == 302
+    start_params = parse_qs(urlparse(start.headers["location"]).query)
+    assert start_params["client_id"] == ["facebook-legacy-client"]
+    assert start_params["intent"] == ["migrate_legacy"]
+    first_state = start_params["state"][0]
+
+    legacy_callback = client.get(
+        f"/auth/facebook/callback?code=legacy-code&state={first_state}",
+        follow_redirects=False,
+    )
+    assert legacy_callback.status_code == 302
+    primary_params = parse_qs(urlparse(legacy_callback.headers["location"]).query)
+    assert primary_params["client_id"] == ["facebook-auth-client"]
+    assert primary_params["intent"] == ["migrate_primary"]
+    return primary_params["state"][0]
+
+
+def test_facebook_app_migration_accepts_prefixed_legacy_subject_without_duplicate_workspace(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    owner, workspace = seed_legacy_facebook_solo_owner()
+    before = {
+        "users": len(app.state.auth_store.list_users()),
+        "clients": len(app.state.client_store.list(status="all")),
+        "access": len(app.state.auth_store.list_client_access()),
+    }
+
+    primary_state = complete_facebook_migration_first_step()
+    primary_callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={primary_state}",
+        follow_redirects=False,
+    )
+
+    assert primary_callback.status_code == 302
+    assert urlparse(primary_callback.headers["location"]).path == "/login/success"
+    assert "ops_session=" in primary_callback.headers.get("set-cookie", "")
+    me = client.get("/auth/me")
+    assert me.status_code == 200
+    assert me.json()["user"]["id"] == str(owner.id)
+    assert me.json()["session"]["accessible_client_ids"] == [str(workspace.id)]
+    assert len(app.state.auth_store.list_users()) == before["users"]
+    assert len(app.state.client_store.list(status="all")) == before["clients"]
+    assert len(app.state.auth_store.list_client_access()) == before["access"]
+    identities = app.state.auth_store.list_identities(user_id=owner.id)
+    assert {identity.provider_user_id for identity in identities} == {
+        "facebook-legacy-client:legacy-user",
+        "facebook-auth-client:primary-user",
+    }
+
+    # Migration mode remains fail-closed for unknown subjects, but an already
+    # linked primary subject must keep logging in normally.
+    client.cookies.clear()
+    login_start = client.get("/auth/facebook/start?intent=login&next=/", follow_redirects=False)
+    login_state = parse_qs(urlparse(login_start.headers["location"]).query)["state"][0]
+    login_callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={login_state}",
+        follow_redirects=False,
+    )
+    assert login_callback.status_code == 302
+    assert urlparse(login_callback.headers["location"]).path == "/login/success"
+    assert client.get("/auth/me").json()["user"]["id"] == str(owner.id)
+    assert len(app.state.auth_store.list_users()) == before["users"]
+    assert len(app.state.client_store.list(status="all")) == before["clients"]
+
+
+def test_facebook_app_migration_accepts_raw_legacy_subject(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    owner, workspace = seed_legacy_facebook_solo_owner(raw_subject=True, prefixed_subject=False)
+
+    primary_state = complete_facebook_migration_first_step()
+    primary_callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={primary_state}",
+        follow_redirects=False,
+    )
+
+    assert primary_callback.status_code == 302
+    assert urlparse(primary_callback.headers["location"]).path == "/login/success"
+    assert client.get("/auth/me").json()["user"]["id"] == str(owner.id)
+    assert client.get("/auth/me").json()["session"]["accessible_client_ids"] == [str(workspace.id)]
+    assert {
+        row.provider_user_id for row in app.state.auth_store.list_identities(user_id=owner.id)
+    } == {"legacy-user", "facebook-auth-client:primary-user"}
+
+
+def test_facebook_app_migration_accepts_raw_and_prefixed_subjects_on_same_user(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    owner, _workspace = seed_legacy_facebook_solo_owner(raw_subject=True, prefixed_subject=True)
+
+    primary_state = complete_facebook_migration_first_step()
+    primary_callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={primary_state}",
+        follow_redirects=False,
+    )
+
+    assert primary_callback.status_code == 302
+    assert urlparse(primary_callback.headers["location"]).path == "/login/success"
+    assert client.get("/auth/me").json()["user"]["id"] == str(owner.id)
+    assert {
+        row.provider_user_id for row in app.state.auth_store.list_identities(user_id=owner.id)
+    } == {
+        "legacy-user",
+        "facebook-legacy-client:legacy-user",
+        "facebook-auth-client:primary-user",
+    }
+
+
+def test_facebook_app_migration_rejects_raw_prefixed_cross_user_collision(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    prefixed_owner, _workspace = seed_legacy_facebook_solo_owner()
+    raw_owner = app.state.auth_store.create_user(
+        UserCreate(email="raw-owner@example.com", name="Raw Owner", role="client", status="active")
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=raw_owner.id,
+            provider="facebook",
+            provider_user_id="legacy-user",
+            email="raw-owner@example.com",
+            email_verified=True,
+            raw_profile={"id": "legacy-user"},
+        )
+    )
+    identities_before = len(app.state.auth_store.list_identities())
+
+    start = client.get("/auth/facebook/start?intent=migrate&next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/auth/facebook/callback?code=legacy-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_identity_conflict"
+    ]
+    assert len(app.state.auth_store.list_identities()) == identities_before
+    assert app.state.auth_store.find_identity(
+        "facebook", "facebook-legacy-client:legacy-user"
+    ).user_id == prefixed_owner.id
+    assert app.state.auth_store.find_identity("facebook", "legacy-user").user_id == raw_owner.id
+    assert app.state.auth_store.find_identity("facebook", "facebook-auth-client:primary-user") is None
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+def test_facebook_primary_login_is_fail_closed_during_migration_even_without_email(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {
+        "facebook": FakeFacebookMigrationAdapter(primary_user_id="unlinked-primary", primary_email=None)
+    }
+    seed_legacy_facebook_solo_owner()
+    users_before = len(app.state.auth_store.list_users())
+    clients_before = len(app.state.client_store.list(status="all"))
+    access_before = len(app.state.auth_store.list_client_access())
+
+    start = client.get("/auth/facebook/start?intent=login&next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_migration_required"
+    ]
+    assert len(app.state.auth_store.list_users()) == users_before
+    assert len(app.state.client_store.list(status="all")) == clients_before
+    assert len(app.state.auth_store.list_client_access()) == access_before
+    assert app.state.auth_store.find_identity("facebook", "facebook-auth-client:unlinked-primary") is None
+
+
+def test_facebook_migration_rejects_unproven_legacy_subject(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {
+        "facebook": FakeFacebookMigrationAdapter(legacy_user_id="not-linked-legacy")
+    }
+    seed_legacy_facebook_solo_owner()
+    identity_count = len(app.state.auth_store.list_identities())
+
+    start = client.get("/auth/facebook/start?intent=migrate&next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/auth/facebook/callback?code=legacy-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_migration_identity_not_found"
+    ]
+    assert len(app.state.auth_store.list_identities()) == identity_count
+    assert "ops_session=" not in callback.headers.get("set-cookie", "")
+
+
+def test_facebook_migration_never_reassigns_primary_subject(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    legacy_owner, _workspace = seed_legacy_facebook_solo_owner()
+    primary_owner = app.state.auth_store.create_user(
+        UserCreate(email="primary@example.com", name="Primary Owner", role="client", status="active")
+    )
+    app.state.auth_store.link_identity(
+        AuthIdentityLink(
+            user_id=primary_owner.id,
+            provider="facebook",
+            provider_user_id="facebook-auth-client:primary-user",
+            email="primary@example.com",
+            email_verified=True,
+            raw_profile={"id": "primary-user"},
+        )
+    )
+
+    primary_state = complete_facebook_migration_first_step()
+    callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={primary_state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_identity_conflict"
+    ]
+    linked = app.state.auth_store.find_identity("facebook", "facebook-auth-client:primary-user")
+    assert linked is not None and linked.user_id == primary_owner.id
+    legacy_identities = app.state.auth_store.list_identities(user_id=legacy_owner.id)
+    assert [row.provider_user_id for row in legacy_identities] == ["facebook-legacy-client:legacy-user"]
+
+
+def test_facebook_migration_does_not_merge_by_email(monkeypatch):
+    reset_state()
+    set_facebook_migration_env(monkeypatch)
+    app.state.oauth_adapters = {
+        "facebook": FakeFacebookMigrationAdapter(primary_email="other@example.com")
+    }
+    legacy_owner, _workspace = seed_legacy_facebook_solo_owner()
+    other_user = app.state.auth_store.create_user(
+        UserCreate(email="other@example.com", name="Other", role="client", status="active")
+    )
+
+    primary_state = complete_facebook_migration_first_step()
+    callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={primary_state}",
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_identity_conflict"
+    ]
+    assert app.state.auth_store.find_identity("facebook", "facebook-auth-client:primary-user") is None
+    assert app.state.auth_store.get_user(legacy_owner.id).email == "owner@example.com"
+    assert app.state.auth_store.get_user(other_user.id).email == "other@example.com"
+
+
+def test_facebook_identity_link_requires_same_active_session(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+    first = app.state.auth_store.create_user(
+        UserCreate(email="first@example.com", name="First", role="client", status="active")
+    )
+    second = app.state.auth_store.create_user(
+        UserCreate(email="second@example.com", name="Second", role="client", status="active")
+    )
+    first_token = app.state.auth_store.issue_session(
+        SessionIssueRequest(user_id=first.id, ttl_minutes=60)
+    ).token
+    second_token = app.state.auth_store.issue_session(
+        SessionIssueRequest(user_id=second.id, ttl_minutes=60)
+    ).token
+
+    client.cookies.set("ops_session", first_token)
+    start = client.get("/auth/facebook/start?intent=link&next=/", follow_redirects=False)
+    assert start.status_code == 302
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    client.cookies.set("ops_session", second_token)
+    switched = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={state}",
+        follow_redirects=False,
+    )
+
+    assert switched.status_code == 302
+    assert parse_qs(urlparse(switched.headers["location"]).query)["oauth_error"] == ["session_mismatch"]
+    assert app.state.auth_store.find_identity("facebook", "facebook-auth-client:primary-user") is None
+
+    client.cookies.set("ops_session", first_token)
+    retry_start = client.get("/auth/facebook/start?intent=link&next=/", follow_redirects=False)
+    retry_state = parse_qs(urlparse(retry_start.headers["location"]).query)["state"][0]
+    linked = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={retry_state}",
+        follow_redirects=False,
+    )
+    assert linked.status_code == 302
+    assert urlparse(linked.headers["location"]).path == "/login/success"
+    identity = app.state.auth_store.find_identity("facebook", "facebook-auth-client:primary-user")
+    assert identity is not None and identity.user_id == first.id
+    assert client.get("/auth/me").json()["user"]["id"] == str(first.id)
+
+
+def test_facebook_legacy_migration_partial_configuration_fails_safely(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    monkeypatch.setenv("FACEBOOK_AUTH_LEGACY_CLIENT_ID", "facebook-legacy-client")
+    monkeypatch.delenv("FACEBOOK_AUTH_LEGACY_CLIENT_SECRET", raising=False)
+    monkeypatch.delenv("FACEBOOK_AUTH_LEGACY_REDIRECT_URI", raising=False)
+    app.state.oauth_adapters = {"facebook": FakeFacebookMigrationAdapter()}
+
+    response = client.get("/auth/facebook/start?intent=migrate&next=/", follow_redirects=False)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "facebook_legacy_auth_not_configured"
+
+
+def test_facebook_legacy_migration_partial_configuration_without_client_id_blocks_signup(monkeypatch):
+    reset_state()
+    set_facebook_auth_env(monkeypatch)
+    monkeypatch.delenv("FACEBOOK_AUTH_LEGACY_CLIENT_ID", raising=False)
+    monkeypatch.setenv("FACEBOOK_AUTH_LEGACY_CLIENT_SECRET", "partially-configured-secret")
+    monkeypatch.delenv("FACEBOOK_AUTH_LEGACY_REDIRECT_URI", raising=False)
+    app.state.oauth_adapters = {
+        "facebook": FakeFacebookMigrationAdapter(primary_user_id="unlinked-primary", primary_email=None)
+    }
+
+    start = client.get("/auth/facebook/start?intent=login&next=/", follow_redirects=False)
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    callback = client.get(
+        f"/auth/facebook/callback?code=primary-code&state={state}",
+        follow_redirects=False,
+    )
+    migrate = client.get("/auth/facebook/start?intent=migrate&next=/", follow_redirects=False)
+
+    assert callback.status_code == 302
+    assert parse_qs(urlparse(callback.headers["location"]).query)["oauth_error"] == [
+        "facebook_migration_required"
+    ]
+    assert app.state.auth_store.find_identity("facebook", "facebook-auth-client:unlinked-primary") is None
+    assert app.state.auth_store.list_users() == []
+    assert migrate.status_code == 400
+    assert migrate.json()["error"]["code"] == "facebook_legacy_auth_not_configured"

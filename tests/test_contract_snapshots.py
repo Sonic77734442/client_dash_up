@@ -78,7 +78,18 @@ def reset_and_seed_minimal():
     )
 
     u = client.post("/auth/internal/users", json={"email": "ctx@example.com", "name": "Ctx", "role": "agency", "status": "active"}).json()
-    client.post("/auth/internal/access", json={"user_id": u["id"], "client_id": c["id"], "role": "agency"})
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Snapshot agency", "status": "active", "plan": "starter"},
+    ).json()
+    assert client.post(
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": u["id"], "role": "member", "status": "active"},
+    ).status_code == 200
+    assert client.post(
+        f"/platform/agencies/{agency['id']}/clients",
+        json={"client_id": c["id"]},
+    ).status_code == 200
     token = client.post("/auth/internal/sessions/issue", json={"user_id": u["id"], "ttl_minutes": 60}).json()["token"]
 
     return c, a, token

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "./AppSidebar";
 import { AppTopTabs } from "./AppTopTabs";
+import { ProviderBudgetControl } from "./ProviderBudgetControl";
 import { TimelineChart } from "./TimelineChart";
 import { ToastHost } from "./ToastHost";
 import { useSession } from "../hooks/useSession";
@@ -1340,6 +1341,16 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   </table>
                 </div>
               </article>
+
+              <ProviderBudgetControl
+                apiBase={session.apiBase}
+                token={session.token}
+                clients={clients}
+                accounts={accounts}
+                role={soloClientMode ? "solo_client" : "client"}
+                initialClientId={selectedClientId}
+                compact
+              />
             </>
           ) : null}
         </main>

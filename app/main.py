@@ -2,18 +2,19 @@
 
 import asyncio
 import logging
+import re
 import secrets
 import threading
 import time
 import os
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -66,6 +67,15 @@ from app.schemas import (
     BudgetTransferOut,
     BudgetTransferRequest,
     BudgetTransferResponse,
+    MetaBudgetChangeInput,
+    MetaBudgetCommandListResponse,
+    MetaBudgetCommandOut,
+    MetaBudgetCommandResponse,
+    MetaBudgetConfirmRequest,
+    MetaBudgetPreviewResponse,
+    MetaBudgetReadinessResponse,
+    MetaBudgetResolveUnknownRequest,
+    MetaBudgetTargetsResponse,
     ClientCreate,
     ClientInviteAcceptResponse,
     ClientInviteAcceptPublicResponse,
@@ -137,6 +147,13 @@ from app.services.integration_credentials import (
     InMemoryIntegrationCredentialStore,
     IntegrationCredentialStore,
     SqliteIntegrationCredentialStore,
+    public_credential_diagnostics,
+)
+from app.services.meta_connection import (
+    MetaConnectionValidationError,
+    MetaCredentialReconnectRequiredError,
+    require_usable_validated_meta_credentials,
+    validate_meta_business_connection,
 )
 from app.services.overview import OverviewService
 from app.services.operational_insights import OperationalInsightsService
@@ -153,6 +170,33 @@ from app.services.acl import (
     ensure_tenant_write_access,
 )
 from app.services.providers import google_ads
+from app.services.provider_budget_commands import (
+    ActorRole,
+    AgencyMemberRole,
+    BudgetActorContext,
+    BudgetChangeRequest,
+    BudgetCommandStatus,
+    BudgetConflictError,
+    BudgetCredentialContext,
+    BudgetExecutionAuthorization,
+    BudgetField,
+    BudgetPolicyError,
+    BudgetTargetType,
+    BudgetTenantContext,
+    BudgetValidationError,
+    CommandNotExecutableError,
+    CredentialScope,
+    IdempotencyConflictError,
+    InMemoryBudgetCommandStore,
+    PreviewExpiredError,
+    PreviewSigner,
+    PreviewTokenError,
+    ProviderBudgetCommand,
+    ProviderBudgetCommandError,
+    ProviderBudgetCommandService,
+    ProviderBudgetError,
+)
+from app.services.providers.meta_budget import MetaBudgetAdapter
 from app.services.audit_log import AuditLogStore, InMemoryAuditLogStore, SqliteAuditLogStore
 from app.services.alerts import AlertSignal, AlertStore, InMemoryAlertStore, SqliteAlertStore
 from app.services.platform_admin import (
@@ -172,7 +216,7 @@ from app.services.oauth import (
     SqliteOAuthStateStore,
 )
 from app.settings import get_settings, load_accounts
-from app.db import sqlite_conn
+from app.db import SqliteProviderBudgetCommandStore, sqlite_conn
 
 
 logger = logging.getLogger(__name__)
@@ -294,11 +338,13 @@ def _resolve_provider_credentials(
                 and row.scope_id == owned_client_id
                 and row.created_by == user_id
             ]
+        elif requesting_user and requesting_user.role == "agency":
+            rows = [row for row in rows if row.scope_type == "agency"]
     if agency_id is not None:
         rows = [
             row
             for row in rows
-            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            if row.scope_type == "agency" and row.scope_id == agency_id
         ]
     if not rows:
         return None
@@ -325,17 +371,22 @@ def _resolve_provider_credentials_candidates(
                 and row.scope_id == owned_client_id
                 and row.created_by == user_id
             ]
+        elif requesting_user and requesting_user.role == "agency":
+            rows = [row for row in rows if row.scope_type == "agency"]
     if agency_id is not None:
         rows = [
             row
             for row in rows
-            if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+            if row.scope_type == "agency" and row.scope_id == agency_id
         ]
     out: List[dict] = []
     for row in rows:
         cred = dict(row.credentials)
         cred["__credential_id"] = str(row.id)
         cred["__connection_key"] = row.connection_key
+        cred["__scope_type"] = row.scope_type
+        cred["__scope_id"] = str(row.scope_id) if row.scope_id else None
+        cred["__created_by"] = str(row.created_by) if row.created_by else None
         out.append(cred)
     return out
 
@@ -354,6 +405,7 @@ ad_account_discovery_service = AdAccountDiscoveryService(
     credential_candidates_resolver=_resolve_provider_credentials_candidates,
 )
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
+provider_budget_command_store = SqliteProviderBudgetCommandStore(settings.budgets_db_path)
 auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
 platform_admin_store: PlatformAdminStore = SqlitePlatformAdminStore(settings.budgets_db_path, auth_store)
 audit_log_store: AuditLogStore = SqliteAuditLogStore(settings.budgets_db_path)
@@ -379,6 +431,9 @@ app.state.ad_account_sync_service = ad_account_sync_service
 app.state.ad_account_discovery_service = ad_account_discovery_service
 app.state.ad_stats_store = ad_stats_store
 app.state.budget_store = budget_store
+app.state.provider_budget_command_store = provider_budget_command_store
+app.state.provider_budget_target_locks = {}
+app.state.provider_budget_target_locks_guard = threading.RLock()
 app.state.auth_store = auth_store
 app.state.platform_admin_store = platform_admin_store
 app.state.assignment_conflict_service = assignment_conflict_service
@@ -436,7 +491,9 @@ def _attach_cors_headers(request: Request, response: Response) -> Response:
         return response
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Access-Control-Allow-Headers"] = "authorization,content-type,x-csrf-token"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "authorization,content-type,idempotency-key,x-csrf-token,x-request-id"
+    )
     response.headers["Access-Control-Allow-Methods"] = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
     response.headers["Vary"] = "Origin"
     return response
@@ -453,23 +510,6 @@ def _attach_security_headers(response: Response) -> Response:
     return response
 
 
-def _mask_secret_value(value: object) -> object:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return ""
-    if len(text) <= 8:
-        return "********"
-    return f"{'*' * (len(text) - 4)}{text[-4:]}"
-
-
-def _is_sensitive_credential_key(key: str) -> bool:
-    lowered = (key or "").lower()
-    tokens = ("token", "secret", "password", "api_key", "key", "refresh")
-    return any(t in lowered for t in tokens)
-
-
 def _to_public_provider_config(cfg: AuthProviderConfigOut) -> AuthProviderConfigPublicOut:
     return AuthProviderConfigPublicOut(
         id=cfg.id,
@@ -484,14 +524,7 @@ def _to_public_provider_config(cfg: AuthProviderConfigOut) -> AuthProviderConfig
 
 
 def _to_public_integration_credential(row: IntegrationCredentialOut) -> IntegrationCredentialPublicOut:
-    preview: dict = {}
-    keys = sorted(row.credentials.keys())
-    for k in keys:
-        v = row.credentials.get(k)
-        if _is_sensitive_credential_key(k):
-            preview[k] = _mask_secret_value(v)
-        else:
-            preview[k] = v
+    keys, preview = public_credential_diagnostics(row.credentials)
     connected_label: Optional[str] = None
     if row.created_by:
         provider_norm = str(row.provider or "").strip().lower()
@@ -646,6 +679,8 @@ def _safe_sync_error_message(raw: Optional[str]) -> str:
     msg = str(raw or "").strip().lower()
     if not msg:
         return "No provider error details available."
+    if "reconnect" in msg or "rediscover" in msg:
+        return "This account's provider connection must be reconnected before sync can continue."
     if "expired" in msg or "unauthorized" in msg or "invalid token" in msg:
         return "Authentication expired or invalid. Reconnect provider."
     if "scope" in msg or "permission" in msg or "forbidden" in msg or "access" in msg:
@@ -664,19 +699,71 @@ def _safe_sync_error_message(raw: Optional[str]) -> str:
 def _sync_action_hint(*, state: str, error_code: Optional[str], retryable: bool) -> str:
     if state == "healthy":
         return "No action needed."
+    if state == "no_data":
+        return "Check the selected date range and account activity, then run sync again if data is expected."
     if state == "never_synced":
         return "Run initial sync for this account."
     if state == "retry_scheduled":
         if _sync_automation_enabled():
             return "The retry is eligible for the configured sync scheduler. You can force sync if needed."
         return "The retry is eligible at the shown time. Run it manually or enable the sync scheduler."
-    if error_code == "auth_failed":
+    if error_code in {"auth_failed", "provider_reconnect_required"}:
         return "Reconnect provider credentials or fix account permissions."
     if error_code == "invalid_request":
         return "Check account mapping and provider account configuration."
     if retryable:
         return "Retry later or run force sync after provider recovers."
     return "Inspect account/provider diagnostics and retry sync."
+
+
+_SERVER_MANAGED_AD_ACCOUNT_METADATA_KEYS = frozenset(
+    {
+        "integration_credential_id",
+        "last_data_at",
+        "latest_data_date",
+        "meta_rediscovery_required",
+    }
+)
+_SERVER_MANAGED_AD_ACCOUNT_METADATA_PREFIXES = (
+    "__",
+    "discovery_",
+    "history_backfill_",
+    "last_sync_",
+    "meta_connection_",
+    "sync_",
+)
+
+
+def _is_server_managed_ad_account_metadata_key(key: object) -> bool:
+    normalized = str(key).strip().lower()
+    return normalized in _SERVER_MANAGED_AD_ACCOUNT_METADATA_KEYS or normalized.startswith(
+        _SERVER_MANAGED_AD_ACCOUNT_METADATA_PREFIXES
+    )
+
+
+def _reject_server_managed_ad_account_metadata(metadata: Optional[dict]) -> None:
+    if not metadata:
+        return
+    reserved = sorted(
+        str(key) for key in metadata if _is_server_managed_ad_account_metadata_key(key)
+    )
+    if reserved:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "ad_account_metadata_reserved",
+                "message": "Sync and provider connection metadata is managed by the server.",
+                "details": {"keys": reserved},
+            },
+        )
+
+
+def _server_managed_ad_account_metadata(metadata: Optional[dict]) -> dict:
+    return {
+        key: value
+        for key, value in (metadata or {}).items()
+        if _is_server_managed_ad_account_metadata_key(key)
+    }
 
 
 def _error_envelope(status_code: int, detail) -> dict:
@@ -705,17 +792,42 @@ async def http_exception_handler(_: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError):
+    safe_errors = []
+    safe_type_characters = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+    safe_location_roots = frozenset({"body", "query", "path", "header", "cookie"})
+
+    for error in exc.errors():
+        raw_type = error.get("type")
+        error_type = (
+            raw_type
+            if isinstance(raw_type, str)
+            and 0 < len(raw_type) <= 128
+            and all(character in safe_type_characters for character in raw_type)
+            else "validation_error"
+        )
+
+        raw_location = error.get("loc")
+        safe_location = []
+        if isinstance(raw_location, (list, tuple)):
+            for index, segment in enumerate(raw_location):
+                if isinstance(segment, int) and not isinstance(segment, bool):
+                    safe_location.append(segment)
+                elif index == 0 and isinstance(segment, str) and segment in safe_location_roots:
+                    safe_location.append(segment)
+                else:
+                    safe_location.append("field")
+
+        safe_errors.append({"type": error_type, "loc": safe_location, "msg": "Invalid value"})
+
     return JSONResponse(
         status_code=422,
-        content=jsonable_encoder(
-            {
-                "error": {
-                    "code": "validation_error",
-                    "message": "Validation failed",
-                    "details": {"errors": exc.errors()},
-                }
+        content={
+            "error": {
+                "code": "validation_error",
+                "message": "Validation failed",
+                "details": {"errors": safe_errors},
             }
-        ),
+        },
     )
 
 
@@ -858,11 +970,13 @@ def use_inmemory_stores():
                     and row.scope_id == owned_client_id
                     and row.created_by == user_id
                 ]
+            elif requesting_user and requesting_user.role == "agency":
+                rows = [row for row in rows if row.scope_type == "agency"]
         if agency_id is not None:
             rows = [
                 row
                 for row in rows
-                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+                if row.scope_type == "agency" and row.scope_id == agency_id
             ]
         if not rows:
             return None
@@ -887,17 +1001,22 @@ def use_inmemory_stores():
                     and row.scope_id == owned_client_id
                     and row.created_by == user_id
                 ]
+            elif requesting_user and requesting_user.role == "agency":
+                rows = [row for row in rows if row.scope_type == "agency"]
         if agency_id is not None:
             rows = [
                 row
                 for row in rows
-                if row.scope_type == "client" or (row.scope_type == "agency" and row.scope_id == agency_id)
+                if row.scope_type == "agency" and row.scope_id == agency_id
             ]
         out: List[dict] = []
         for row in rows:
             cred = dict(row.credentials)
             cred["__credential_id"] = str(row.id)
             cred["__connection_key"] = row.connection_key
+            cred["__scope_type"] = row.scope_type
+            cred["__scope_id"] = str(row.scope_id) if row.scope_id else None
+            cred["__created_by"] = str(row.created_by) if row.created_by else None
             out.append(cred)
         return out
     sync_jobs = InMemoryAdAccountSyncJobStore()
@@ -956,6 +1075,10 @@ def use_inmemory_stores():
     app.state.ad_account_discovery_service = discovery_service
     app.state.ad_stats_store = s
     app.state.budget_store = b
+    app.state.provider_budget_command_store = InMemoryBudgetCommandStore()
+    app.state.provider_budget_target_locks = {}
+    app.state.provider_budget_target_locks_guard = threading.RLock()
+    app.state.meta_budget_adapter_factory = None
     app.state.auth_store = auth
     app.state.platform_admin_store = platform_admin
     app.state.assignment_conflict_service = AssignmentConflictService(
@@ -1005,6 +1128,10 @@ def _ad_account_discovery_service() -> AdAccountDiscoveryService:
 
 def _budget_store() -> BudgetStore:
     return app.state.budget_store
+
+
+def _provider_budget_command_store():
+    return app.state.provider_budget_command_store
 
 
 def _auth_store() -> AuthStore:
@@ -1209,7 +1336,7 @@ def _build_sync_alert_signal(job: AdAccountSyncJobOut, *, client_id: UUID) -> Op
             context={"error_code": job.error_code, "raw_error": message},
         )
 
-    if error_code == "auth_failed":
+    if error_code in {"auth_failed", "provider_reconnect_required"}:
         return AlertSignal(
             code="provider.auth_failed",
             severity="high",
@@ -1295,10 +1422,36 @@ def _process_discovery_alerts(
             _alert_store().resolve_by_fingerprint(f"discovery-failed:{provider}:{target_client_id}")
 
 
+_FACEBOOK_PRIMARY_IDENTITY_INTENTS = {"login", "link", "migrate_primary"}
+
+
+def _facebook_legacy_migration_enabled() -> bool:
+    """Return whether the operator deliberately enabled legacy-app migration.
+
+    A completely empty legacy configuration is disabled. Any partial legacy
+    configuration activates the fail-closed login guard; the migration
+    entrypoint then reports a safe configuration error instead of silently
+    creating users.
+    """
+
+    return any(
+        os.getenv(name, "").strip()
+        for name in (
+            "FACEBOOK_AUTH_LEGACY_CLIENT_ID",
+            "FACEBOOK_AUTH_LEGACY_CLIENT_SECRET",
+            "FACEBOOK_AUTH_LEGACY_REDIRECT_URI",
+        )
+    )
+
+
 def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OAuthProviderConfig:
     cfg = next((x for x in _auth_store().list_provider_configs() if x.provider == provider), None)
     normalized_intent = (intent or "login").strip().lower()
-    if cfg and not cfg.enabled and not (provider == "facebook" and normalized_intent == "login"):
+    facebook_identity_intent = provider == "facebook" and (
+        normalized_intent in _FACEBOOK_PRIMARY_IDENTITY_INTENTS
+        or normalized_intent == "migrate_legacy"
+    )
+    if cfg and not cfg.enabled and not facebook_identity_intent:
         raise HTTPException(
             status_code=400,
             detail={
@@ -1307,7 +1460,7 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
             },
         )
 
-    if provider == "facebook" and normalized_intent == "login":
+    if provider == "facebook" and normalized_intent in _FACEBOOK_PRIMARY_IDENTITY_INTENTS:
         auth_env = {
             "client_id": os.getenv("FACEBOOK_AUTH_CLIENT_ID", "").strip(),
             "client_secret": os.getenv("FACEBOOK_AUTH_CLIENT_SECRET", "").strip(),
@@ -1328,6 +1481,42 @@ def _oauth_provider_config_or_400(provider: str, *, intent: str = "login") -> OA
         client_id = auth_env["client_id"]
         client_secret = auth_env["client_secret"]
         redirect_uri = auth_env["redirect_uri"]
+        config_id = None
+    elif provider == "facebook" and normalized_intent == "migrate_legacy":
+        legacy_env = {
+            "client_id": os.getenv("FACEBOOK_AUTH_LEGACY_CLIENT_ID", "").strip(),
+            "client_secret": os.getenv("FACEBOOK_AUTH_LEGACY_CLIENT_SECRET", "").strip(),
+            "redirect_uri": os.getenv("FACEBOOK_AUTH_LEGACY_REDIRECT_URI", "").strip(),
+        }
+        missing = [key for key, value in legacy_env.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_legacy_auth_not_configured",
+                    "message": "Legacy Facebook identity migration is not fully configured",
+                },
+            )
+        primary_client_id = os.getenv("FACEBOOK_AUTH_CLIENT_ID", "").strip()
+        if not primary_client_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_auth_not_configured",
+                    "message": "Primary Facebook platform login is not configured",
+                },
+            )
+        if legacy_env["client_id"] == primary_client_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "facebook_legacy_auth_invalid",
+                    "message": "Legacy and primary Facebook applications must be different",
+                },
+            )
+        client_id = legacy_env["client_id"]
+        client_secret = legacy_env["client_secret"]
+        redirect_uri = legacy_env["redirect_uri"]
         config_id = None
     else:
         if not cfg and provider not in {"facebook", "google"}:
@@ -1404,7 +1593,7 @@ def _active_agency_memberships_for_user(
                 status_code=503,
                 detail={
                     "code": "agency_membership_check_failed",
-                    "message": "Cannot verify solo owner agency isolation",
+                    "message": "Cannot verify agency memberships",
                 },
             ) from exc
         return out
@@ -1417,7 +1606,7 @@ def _active_agency_memberships_for_user(
                     status_code=503,
                     detail={
                         "code": "agency_membership_check_failed",
-                        "message": "Cannot verify solo owner agency isolation",
+                        "message": "Cannot verify agency memberships",
                     },
                 ) from exc
             continue
@@ -1428,7 +1617,10 @@ def _active_agency_memberships_for_user(
 
 
 def _agency_scope_ids_for_user(user_id: UUID) -> List[UUID]:
-    return [agency_id for agency_id, _member in _active_agency_memberships_for_user(user_id)]
+    return [
+        agency_id
+        for agency_id, _member in _active_agency_memberships_for_user(user_id, fail_closed=True)
+    ]
 
 
 def _solo_owner_client_id_for_user(
@@ -1510,7 +1702,7 @@ def _resolve_agency_context_for_user(
     require_manage: bool = True,
 ) -> UUID:
     """Resolve one active agency without ever fanning an action out to every membership."""
-    memberships = _active_agency_memberships_for_user(user_id)
+    memberships = _active_agency_memberships_for_user(user_id, fail_closed=True)
     if requested_agency_id is not None:
         selected = next((row for row in memberships if row[0] == requested_agency_id), None)
         if selected is None:
@@ -1577,6 +1769,30 @@ def _ensure_client_bound_to_agency(agency_id: UUID, client_id: UUID) -> None:
     )
 
 
+def _active_agency_backing_for_client(user_id: UUID, client_id: UUID) -> Optional[UUID]:
+    """Return the active agency that currently materializes this tenant grant.
+
+    Direct access cleanup must fail closed if the agency graph cannot be read:
+    otherwise a transient membership-store failure could delete a grant that
+    is still managed by an active agency binding.
+    """
+    memberships = _active_agency_memberships_for_user(user_id, fail_closed=True)
+    for agency_id, _member in memberships:
+        try:
+            bindings = _platform_admin_store().list_clients(agency_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "agency_membership_check_failed",
+                    "message": "Cannot verify agency client access",
+                },
+            ) from exc
+        if any(binding.client_id == client_id for binding in bindings):
+            return agency_id
+    return None
+
+
 def _ensure_client_invites_allowed_for_agency(ctx: RequestContext, client_id: UUID) -> None:
     if ctx.role != "agency" or not ctx.user_id:
         return
@@ -1612,7 +1828,23 @@ def _integration_credentials_from_oauth(
         if not access_token:
             return None
         business_ids = [x.strip() for x in str(os.getenv("META_BUSINESS_IDS", "")).split(",") if x.strip()]
-        return {"access_token": access_token, "business_ids": business_ids}
+        payload = {"access_token": access_token, "business_ids": business_ids}
+        safe_validation_fields = {
+            "meta_validation_version",
+            "meta_validated_at",
+            "meta_app_id",
+            "meta_business_config_id",
+            "meta_business_config_source",
+            "meta_user_id",
+            "meta_scopes",
+            "meta_granted_permissions",
+            "meta_granular_scopes",
+            "meta_expires_at",
+            "meta_data_access_expires_at",
+            "meta_absolute_expires_at",
+        }
+        payload.update({key: tokens[key] for key in safe_validation_fields if key in tokens})
+        return payload
 
     if p == "google":
         refresh_token = str(tokens.get("refresh_token") or "").strip()
@@ -2083,6 +2315,9 @@ def _normalize_next_path(next_path: Optional[str]) -> str:
     return value
 
 
+_OAUTH_INTERNAL_INTENTS = {"login", "connect", "link", "migrate_legacy", "migrate_primary"}
+
+
 def _with_oauth_connect_options(
     next_path: str,
     *,
@@ -2091,6 +2326,7 @@ def _with_oauth_connect_options(
     connection_key: Optional[str],
     agency_id: Optional[UUID],
     client_id: Optional[UUID],
+    meta_config_id: Optional[str],
 ) -> str:
     parsed = urlsplit(_normalize_next_path(next_path))
     query_items = [
@@ -2103,10 +2339,11 @@ def _with_oauth_connect_options(
             "ops_connection_key",
             "ops_agency_id",
             "ops_client_id",
+            "ops_meta_config_id",
         }
     ]
     normalized_intent = (intent or "login").strip().lower()
-    if normalized_intent not in {"login", "connect"}:
+    if normalized_intent not in _OAUTH_INTERNAL_INTENTS:
         normalized_intent = "login"
     query_items.append(("ops_oauth_intent", normalized_intent))
     mode = (connect_mode or "add").strip().lower()
@@ -2120,23 +2357,27 @@ def _with_oauth_connect_options(
         query_items.append(("ops_agency_id", str(agency_id)))
     if normalized_intent == "connect" and client_id is not None:
         query_items.append(("ops_client_id", str(client_id)))
+    bound_meta_config_id = str(meta_config_id or "").strip()
+    if normalized_intent == "connect" and bound_meta_config_id:
+        query_items.append(("ops_meta_config_id", bound_meta_config_id))
     return urlunsplit(("", "", parsed.path or "/", urlencode(query_items, doseq=True), ""))
 
 
 def _extract_oauth_connect_options(
     next_path: str,
-) -> tuple[str, str, str, Optional[str], Optional[UUID], Optional[UUID]]:
+) -> tuple[str, str, str, Optional[str], Optional[UUID], Optional[UUID], Optional[str]]:
     parsed = urlsplit(_normalize_next_path(next_path))
     intent = "login"
     mode = "add"
     key: Optional[str] = None
     agency_id: Optional[UUID] = None
     client_id: Optional[UUID] = None
+    meta_config_id: Optional[str] = None
     clean_items: List[tuple[str, str]] = []
     for k, v in parse_qsl(parsed.query, keep_blank_values=True):
         if k == "ops_oauth_intent":
             candidate = str(v or "").strip().lower()
-            if candidate in {"login", "connect"}:
+            if candidate in _OAUTH_INTERNAL_INTENTS:
                 intent = candidate
             continue
         if k == "ops_connect_mode":
@@ -2165,11 +2406,16 @@ def _extract_oauth_connect_options(
                 except ValueError:
                     client_id = None
             continue
+        if k == "ops_meta_config_id":
+            candidate = str(v or "").strip()
+            if candidate:
+                meta_config_id = candidate
+            continue
         clean_items.append((k, v))
     if mode == "overwrite" and not key:
         mode = "add"
     clean_next = urlunsplit(("", "", parsed.path or "/", urlencode(clean_items, doseq=True), ""))
-    return clean_next, intent, mode, key, agency_id, client_id
+    return clean_next, intent, mode, key, agency_id, client_id, meta_config_id
 
 
 def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
@@ -2186,6 +2432,9 @@ def _oauth_error_redirect(error_code: Optional[str]) -> RedirectResponse:
             "access_pending",
             "account_link_required",
             "facebook_auth_not_configured",
+            "facebook_migration_required",
+            "facebook_migration_identity_not_found",
+            "facebook_identity_conflict",
         }
         else "provider_error"
     )
@@ -2219,6 +2468,127 @@ def _find_user_by_normalized_email(value: Optional[str]) -> Optional[UserOut]:
 
 def _facebook_login_subject(cfg: OAuthProviderConfig, identity: ExternalIdentityPayload) -> str:
     return f"{cfg.client_id}:{identity.provider_user_id}"
+
+
+def _resolve_facebook_legacy_migration_user(
+    *,
+    cfg: OAuthProviderConfig,
+    identity: ExternalIdentityPayload,
+) -> Optional[UserOut]:
+    """Resolve a legacy Facebook subject without guessing or merging.
+
+    Older records may contain either the app-qualified subject introduced by
+    the current OAuth implementation or the raw provider subject written by a
+    previous implementation. A fresh OAuth response from the configured
+    legacy app proves both candidate forms. If those records point at different
+    internal users, migration must stop instead of choosing either account.
+    """
+
+    subjects = tuple(
+        dict.fromkeys(
+            (
+                _facebook_login_subject(cfg, identity),
+                identity.provider_user_id,
+            )
+        )
+    )
+    linked_identities = [
+        linked
+        for subject in subjects
+        if (linked := _auth_store().find_identity("facebook", subject)) is not None
+    ]
+    owner_ids = {linked.user_id for linked in linked_identities}
+    if len(owner_ids) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "facebook_identity_conflict",
+                "message": "Legacy Facebook identity is linked to multiple accounts",
+            },
+        )
+    if not owner_ids:
+        return None
+    owner = _auth_store().get_user(next(iter(owner_ids)))
+    return owner if owner and owner.status == "active" else None
+
+
+def _link_facebook_identity_to_proven_user(
+    *,
+    cfg: OAuthProviderConfig,
+    identity: ExternalIdentityPayload,
+    user_id: UUID,
+) -> UserOut:
+    """Link one primary-app Facebook subject after independent user proof.
+
+    The proof is supplied by either the current backend session (``link``)
+    or a freshly completed legacy-app OAuth step (``migrate_primary``).
+    This helper never resolves by email and never reassigns an identity.
+    """
+
+    user = _auth_store().get_user(user_id)
+    if not user or user.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity cannot be linked"},
+        )
+
+    subject = _facebook_login_subject(cfg, identity)
+    linked = _auth_store().find_identity("facebook", subject)
+    if linked and linked.user_id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity is already linked"},
+        )
+
+    # One canonical Facebook subject per primary application and internal
+    # user. Legacy subjects use another app-id prefix and remain as immutable
+    # evidence/fallback during the migration window.
+    primary_prefix = f"{cfg.client_id}:"
+    conflicting_primary = next(
+        (
+            row
+            for row in _auth_store().list_identities(user_id=user.id)
+            if row.provider == "facebook"
+            and row.provider_user_id.startswith(primary_prefix)
+            and row.provider_user_id != subject
+        ),
+        None,
+    )
+    if conflicting_primary:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Another Facebook identity is already linked"},
+        )
+
+    # Email is contact metadata only. It may detect a conflict, but it must
+    # never select or merge users across Facebook applications.
+    contact_email = _normalized_oauth_email(identity.email)
+    email_owner = _find_user_by_normalized_email(contact_email)
+    if email_owner and email_owner.id != user.id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "facebook_identity_conflict", "message": "Facebook identity conflicts with another account"},
+        )
+
+    try:
+        _auth_store().link_identity(
+            AuthIdentityLink(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id=subject,
+                email=contact_email,
+                email_verified=identity.email_verified,
+                raw_profile=identity.raw_profile,
+            )
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "facebook_identity_conflict", "message": "Facebook identity is already linked"},
+            ) from exc
+        raise
+    return user
 
 
 def _auto_provision_facebook_client(
@@ -2609,6 +2979,776 @@ def _client_or_404(client_id: UUID) -> ClientOut:
     return client
 
 
+def _budget_env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _meta_budget_feature_enabled() -> bool:
+    return _budget_env_enabled("META_BUDGET_COMMANDS_ENABLED", False)
+
+
+def _meta_budget_rollout_configuration() -> tuple[bool, set[UUID], Optional[tuple[str, str]]]:
+    allow_all_raw = os.getenv("META_BUDGET_ALLOW_ALL_CLIENTS", "false").strip().lower()
+    if allow_all_raw not in {"1", "true", "yes", "on", "0", "false", "no", "off", ""}:
+        return False, set(), (
+            "meta_budget_rollout_configuration_invalid",
+            "META_BUDGET_ALLOW_ALL_CLIENTS must be an explicit boolean.",
+        )
+    allow_all = allow_all_raw in {"1", "true", "yes", "on"}
+    allowed: set[UUID] = set()
+    for item in os.getenv("META_BUDGET_ALLOWED_CLIENT_IDS", "").split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            allowed.add(UUID(candidate))
+        except (TypeError, ValueError):
+            return False, set(), (
+                "meta_budget_rollout_configuration_invalid",
+                "META_BUDGET_ALLOWED_CLIENT_IDS must contain only comma-separated UUIDs.",
+            )
+    return allow_all, allowed, None
+
+
+def _meta_budget_client_allowed(client_id: UUID) -> tuple[bool, Optional[tuple[str, str]]]:
+    allow_all, allowed, problem = _meta_budget_rollout_configuration()
+    if problem:
+        return False, problem
+    if allow_all or client_id in allowed:
+        return True, None
+    return False, (
+        "meta_budget_client_not_allowed",
+        "Meta budget controls are not enabled for this pilot client.",
+    )
+
+
+def _require_meta_budget_client_allowed(client_id: UUID) -> None:
+    allowed, problem = _meta_budget_client_allowed(client_id)
+    if not allowed:
+        code, message = problem or (
+            "meta_budget_client_not_allowed",
+            "Meta budget controls are not enabled for this pilot client.",
+        )
+        raise HTTPException(status_code=403, detail={"code": code, "message": message})
+
+
+def _meta_spend_cap_enabled() -> bool:
+    # Account-level spend caps have a materially larger blast radius.  The
+    # generic feature flag can never activate them.
+    return _budget_env_enabled("META_BUDGET_SPEND_CAP_ENABLED", False)
+
+
+def _meta_budget_configuration_error() -> Optional[tuple[str, str]]:
+    if not _meta_budget_feature_enabled():
+        return "meta_budget_controls_disabled", "Meta budget controls are not enabled."
+    preview_secret = os.getenv("META_BUDGET_PREVIEW_SECRET", "")
+    if len(preview_secret.encode("utf-8")) < 32:
+        return (
+            "meta_budget_preview_secret_missing",
+            "Meta budget controls require a dedicated preview signing secret.",
+        )
+    try:
+        preview_ttl = int(os.getenv("META_BUDGET_PREVIEW_TTL_SECONDS", "300"))
+    except (TypeError, ValueError):
+        preview_ttl = 0
+    if not 30 <= preview_ttl <= 900:
+        return (
+            "meta_budget_preview_ttl_invalid",
+            "Meta budget preview TTL must be an integer between 30 and 900 seconds.",
+        )
+    _allow_all, _allowed, rollout_problem = _meta_budget_rollout_configuration()
+    if rollout_problem:
+        return rollout_problem
+    required = {
+        "FACEBOOK_CLIENT_ID": os.getenv("FACEBOOK_CLIENT_ID", "").strip(),
+        "FACEBOOK_CLIENT_SECRET": os.getenv("FACEBOOK_CLIENT_SECRET", "").strip(),
+        "FACEBOOK_LOGIN_CONFIG_ID": os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip(),
+    }
+    if any(not value for value in required.values()):
+        return (
+            "meta_budget_provider_configuration_missing",
+            "Meta Ads application configuration is incomplete.",
+        )
+    return None
+
+
+def _require_meta_budget_feature() -> None:
+    problem = _meta_budget_configuration_error()
+    if problem:
+        code, message = problem
+        raise HTTPException(status_code=503, detail={"code": code, "message": message})
+
+
+def _meta_budget_preview_signer() -> PreviewSigner:
+    _require_meta_budget_feature()
+    ttl = int(os.getenv("META_BUDGET_PREVIEW_TTL_SECONDS", "300"))
+    return PreviewSigner(os.environ["META_BUDGET_PREVIEW_SECRET"], ttl_seconds=ttl)
+
+
+def _meta_budget_unknown_settlement_seconds() -> int:
+    try:
+        value = int(os.getenv("META_BUDGET_UNKNOWN_SETTLEMENT_SECONDS", "600"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_unknown_settlement_invalid",
+                "message": "Unknown-command settlement window must be an integer from 60 to 86400 seconds.",
+            },
+        ) from exc
+    if not 60 <= value <= 86400:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_unknown_settlement_invalid",
+                "message": "Unknown-command settlement window must be an integer from 60 to 86400 seconds.",
+            },
+        )
+    return value
+
+
+def _meta_budget_adapter(credentials: dict[str, Any]) -> MetaBudgetAdapter:
+    access_token = str(credentials.get("access_token") or "").strip()
+    if not access_token:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_credential_incomplete",
+                "message": "The bound Meta credential has no usable access token. Reconnect Meta Ads.",
+            },
+        )
+    factory = getattr(app.state, "meta_budget_adapter_factory", None)
+    if callable(factory):
+        return factory(credentials)
+    return MetaBudgetAdapter(
+        access_token=access_token,
+        app_secret=os.getenv("FACEBOOK_CLIENT_SECRET", "").strip(),
+    )
+
+
+def _meta_budget_live_request_context(
+    ctx: RequestContext,
+    http_request: Request,
+) -> RequestContext:
+    """Rebuild mutable actor role/status/tenant grants at the money-write boundary."""
+
+    token = _get_session_token(
+        http_request.headers.get("Authorization"),
+        http_request.headers.get("X-Session-Token"),
+        http_request.cookies.get(settings.auth_cookie_name),
+        required=True,
+    )
+    session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
+    user = _auth_store().get_user(ctx.user_id)
+    if user is None or user.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_actor_revoked",
+                "message": "The budget command actor is no longer active.",
+            },
+        )
+    if not session.valid or session.user_id != ctx.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_session_revoked",
+                "message": "The budget command session is no longer valid for the original actor.",
+            },
+        )
+    if user.role != ctx.role or session.role != ctx.role:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "meta_budget_actor_revoked",
+                "message": "The budget command actor is no longer active in the original role.",
+            },
+        )
+    try:
+        accessible_client_ids = {
+            row.client_id for row in _auth_store().list_client_access(user_id=ctx.user_id)
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "meta_budget_actor_scope_check_failed",
+                "message": "Current tenant access could not be verified.",
+            },
+        ) from exc
+    return RequestContext(
+        user_id=user.id,
+        role=user.role,
+        global_access=user.role == "admin",
+        accessible_client_ids=accessible_client_ids,
+    )
+
+
+def _meta_budget_actor_context(
+    ctx: RequestContext,
+    *,
+    client_id: UUID,
+    requested_agency_id: Optional[UUID],
+    for_write: bool,
+) -> BudgetActorContext:
+    ensure_client_access(ctx, client_id)
+    if ctx.role == "agency":
+        selected_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            requested_agency_id,
+            require_manage=for_write,
+        )
+        agency = _platform_admin_store().get_agency(selected_agency_id)
+        member = next(
+            (
+                row
+                for row in _platform_admin_store().list_members(selected_agency_id)
+                if row.user_id == ctx.user_id and row.status == "active"
+            ),
+            None,
+        )
+        bound_clients = frozenset(
+            row.client_id for row in _platform_admin_store().list_clients(selected_agency_id)
+        )
+        member_role = (
+            AgencyMemberRole(member.role)
+            if member is not None and member.role in {"owner", "manager", "member"}
+            else None
+        )
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.AGENCY,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            selected_agency_id=selected_agency_id,
+            agency_active=bool(agency and agency.status == "active"),
+            agency_member_role=member_role,
+            agency_bound_client_ids=bound_clients,
+            can_manage_spend_cap=(
+                _meta_spend_cap_enabled()
+                and member_role == AgencyMemberRole.OWNER
+            ),
+        )
+    if requested_agency_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "agency_context_not_applicable",
+                "message": "agency_id is valid only for an agency session.",
+            },
+        )
+    if ctx.role == "solo_client":
+        owned_client_id = _solo_owner_client_id_for_context(ctx)
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.SOLO_CLIENT,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            solo_owner_client_id=owned_client_id,
+            can_manage_spend_cap=False,
+        )
+    if ctx.role == "client":
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.CLIENT,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+        )
+    if ctx.role == "admin":
+        return BudgetActorContext(
+            user_id=ctx.user_id,
+            role=ActorRole.ADMIN,
+            accessible_client_ids=frozenset(ctx.accessible_client_ids),
+            can_admin_provider_write=_budget_env_enabled("META_BUDGET_ADMIN_WRITES_ENABLED", False),
+            can_manage_spend_cap=(
+                _budget_env_enabled("META_BUDGET_ADMIN_WRITES_ENABLED", False)
+                and _meta_spend_cap_enabled()
+            ),
+        )
+    raise HTTPException(
+        status_code=403,
+        detail={"code": "meta_budget_role_forbidden", "message": "This role cannot use Meta budget controls."},
+    )
+
+
+def _meta_budget_bound_context(
+    ctx: RequestContext,
+    *,
+    account: AdAccountOut,
+    requested_agency_id: Optional[UUID],
+    for_write: bool,
+):
+    client = _client_or_404(account.client_id)
+    ensure_account_access(ctx, account.client_id, account_id=account.id)
+    if client.status != "active" or account.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_scope_inactive",
+                "message": "The client and Meta advertising account must both be active.",
+            },
+        )
+    if normalize_account_platform(account.platform) != "meta":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "meta_budget_provider_mismatch", "message": "The selected account is not a Meta account."},
+        )
+    provider_account_id = canonical_external_account_id(account.platform, account.external_account_id)
+    if not provider_account_id.isdigit():
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "meta_budget_account_invalid", "message": "The Meta account identity is invalid."},
+        )
+    if account.id in active_assignment_conflict_ids(_ad_account_store()):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_assignment_conflict",
+                "message": "This Meta account has multiple active client assignments. Resolve ownership first.",
+            },
+        )
+
+    bound = _integration_credential_store().resolve_bound_credential(
+        ad_account_id=account.id,
+        provider="meta",
+        external_account_id=provider_account_id,
+    )
+    if bound is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_rediscovery_required",
+                "message": "Rediscover this Meta account to create a verified credential binding.",
+            },
+        )
+    if not bound.security.write_eligible:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_credential_storage_not_ready",
+                "message": "Rotate this Meta credential into encrypted storage before enabling budget controls.",
+                "details": {"reason": bound.security.reason},
+            },
+        )
+    credential = bound.credential
+    values = dict(credential.credentials or {})
+    try:
+        require_usable_validated_meta_credentials(
+            values,
+            expected_app_id=os.getenv("FACEBOOK_CLIENT_ID", "").strip(),
+            expected_config_id=os.getenv("FACEBOOK_LOGIN_CONFIG_ID", "").strip(),
+            required_permissions=("ads_management",),
+            allow_unverified_legacy=False,
+        )
+    except MetaCredentialReconnectRequiredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": str(getattr(exc, "code", "meta_budget_credential_not_ready")),
+                "message": str(exc),
+            },
+        ) from exc
+    if "ads_management" not in {
+        str(value or "").strip().lower()
+        for value in values.get("meta_granted_permissions", [])
+        if str(value or "").strip()
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_ads_management_missing",
+                "message": "Reconnect Meta and grant ads_management before changing budgets.",
+            },
+        )
+
+    try:
+        meta_validated_at = datetime.fromisoformat(
+            str(values.get("meta_validated_at") or "").replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_validation_timestamp_invalid",
+                "message": "Reconnect Meta so the validated authorization timestamp can be verified.",
+            },
+        ) from exc
+    if meta_validated_at.tzinfo is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_validation_timestamp_invalid",
+                "message": "Reconnect Meta so the validated authorization timestamp can be verified.",
+            },
+        )
+
+    actor = _meta_budget_actor_context(
+        ctx,
+        client_id=account.client_id,
+        requested_agency_id=requested_agency_id,
+        for_write=for_write,
+    )
+    tenant = BudgetTenantContext(
+        client_id=account.client_id,
+        ad_account_id=account.id,
+        account_client_id=account.client_id,
+        client_active=client.status == "active",
+        account_active=account.status == "active",
+        account_platform="meta",
+    )
+    credential_ctx = BudgetCredentialContext(
+        id=credential.id,
+        provider=credential.provider,
+        status=credential.status,
+        scope_type=CredentialScope(credential.scope_type),
+        scope_id=credential.scope_id,
+        created_by=credential.created_by,
+        has_ads_management=True,
+        revision=bound.security.semantic_revision,
+        meta_app_id=str(values.get("meta_app_id") or "").strip(),
+        meta_business_config_id=str(values.get("meta_business_config_id") or "").strip(),
+        meta_user_id=str(values.get("meta_user_id") or "").strip(),
+        granted_permissions=tuple(values.get("meta_granted_permissions") or ()),
+        validation_version=int(values.get("meta_validation_version") or 0),
+        validated_at=meta_validated_at,
+        expired=False,
+    )
+    return actor, tenant, credential_ctx, values, provider_account_id
+
+
+def _meta_budget_final_execution_authorization(
+    ctx: RequestContext,
+    http_request: Request,
+    command: ProviderBudgetCommand,
+) -> BudgetExecutionAuthorization:
+    """Perform the last live authorization read immediately before Meta POST."""
+
+    try:
+        _require_meta_budget_feature()
+        _require_meta_budget_client_allowed(command.request.client_id)
+        live_ctx = _meta_budget_live_request_context(ctx, http_request)
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, _values, provider_account_id = _meta_budget_bound_context(
+            live_ctx,
+            account=account,
+            requested_agency_id=command.request.agency_id,
+            for_write=True,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        candidate_code = str(detail.get("code") or "provider_budget_reauthorization_failed")
+        safe_code = (
+            candidate_code
+            if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", candidate_code)
+            else "provider_budget_reauthorization_failed"
+        )
+        message = str(
+            detail.get("message")
+            or detail.get("detail")
+            or "Live provider budget authorization failed."
+        )
+        raise BudgetPolicyError(safe_code, message) from exc
+    # Read the independent high-blast-radius kill switch after every mutable
+    # store lookup. The actor capability is derived from this exact last read,
+    # so an agency owner cannot bypass a switch-off via an older context.
+    spend_cap_enabled = _meta_spend_cap_enabled()
+    actor = replace(
+        actor,
+        can_manage_spend_cap=(
+            spend_cap_enabled
+            and (
+                (
+                    actor.role == ActorRole.AGENCY
+                    and actor.agency_member_role == AgencyMemberRole.OWNER
+                )
+                or (
+                    actor.role == ActorRole.ADMIN
+                    and actor.can_admin_provider_write
+                )
+            )
+        ),
+    )
+    return BudgetExecutionAuthorization(
+        actor=actor,
+        tenant=tenant,
+        credential=credential,
+        provider_account_id=provider_account_id,
+        feature_enabled=True,
+        client_rollout_allowed=True,
+        binding_verified=True,
+        spend_cap_enabled=spend_cap_enabled,
+    )
+
+
+def _meta_budget_change_request(
+    payload: MetaBudgetChangeInput,
+    *,
+    account: AdAccountOut,
+    credential_id: UUID,
+    provider_account_id: str,
+) -> BudgetChangeRequest:
+    if payload.client_id != account.client_id or payload.ad_account_id != account.id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_account_scope_mismatch",
+                "message": "The selected advertising account does not belong to the requested client.",
+            },
+        )
+    if payload.currency != account.currency.strip().upper():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_currency_mismatch",
+                "message": "The requested currency does not match the Meta account currency.",
+            },
+        )
+    if payload.target_type == "account" or payload.field == "spend_cap":
+        if not _meta_spend_cap_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "meta_spend_cap_disabled",
+                    "message": "Account spend-cap changes require a separate operator feature flag.",
+                },
+            )
+    return BudgetChangeRequest(
+        client_id=account.client_id,
+        agency_id=payload.agency_id,
+        ad_account_id=account.id,
+        provider_account_id=provider_account_id,
+        credential_id=credential_id,
+        target_type=payload.target_type,
+        provider_target_id=payload.provider_target_id,
+        field=payload.field,
+        amount_minor=payload.amount_minor,
+        expected_current_minor=payload.expected_current_minor,
+        currency=payload.currency,
+        reason=payload.reason,
+        source_action_id=None,
+    )
+
+
+def _assert_meta_budget_target_allowlisted(
+    adapter: MetaBudgetAdapter,
+    request: BudgetChangeRequest,
+) -> None:
+    """Bounded proof of exact provider type and effective budget owner."""
+    adapter.verify_budget_target(request)
+
+
+def _assert_meta_budget_target_not_quarantined(request: BudgetChangeRequest) -> None:
+    lookup = getattr(_provider_budget_command_store(), "target_quarantine_command_id", None)
+    quarantined_by = lookup(request) if callable(lookup) else None
+    if quarantined_by is not None:
+        raise BudgetConflictError(
+            "meta_budget_target_quarantined",
+            "An earlier budget write has an unresolved outcome; reconcile it before another change",
+        )
+
+
+def _meta_budget_public_request(request: BudgetChangeRequest) -> dict[str, Any]:
+    return {
+        "client_id": request.client_id,
+        "ad_account_id": request.ad_account_id,
+        "agency_id": request.agency_id,
+        "target_type": request.target_type.value,
+        "provider_target_id": request.provider_target_id,
+        "field": request.field.value,
+        "amount_minor": request.amount_minor,
+        "expected_current_minor": request.expected_current_minor,
+        "currency": request.currency,
+        "reason": request.reason,
+    }
+
+
+def _meta_budget_command_out(command: ProviderBudgetCommand) -> MetaBudgetCommandOut:
+    def _error(error):
+        if error is None:
+            return None
+        return {
+            "code": error.code,
+            "message": error.message,
+            "subcode": error.subcode,
+            "trace_id": error.trace_id,
+            "retryable": error.retryable,
+        }
+
+    return MetaBudgetCommandOut(
+        id=command.id,
+        status=command.status.value,
+        request=_meta_budget_public_request(command.request),
+        observed_before_minor=command.observed_before_minor,
+        confirmed_after_minor=command.confirmed_after_minor,
+        provider_trace_id=command.provider_trace_id,
+        error=_error(command.error),
+        attempt_count=command.attempt_count,
+        attempts=[
+            {
+                "attempt_no": attempt.attempt_no,
+                "started_at": attempt.started_at,
+                "finished_at": attempt.finished_at,
+                "outcome": attempt.outcome.value,
+                "observed_before_minor": attempt.observed_before_minor,
+                "confirmed_after_minor": attempt.confirmed_after_minor,
+                "provider_trace_id": attempt.provider_trace_id,
+                "error": _error(attempt.error),
+                "reconciliation": attempt.reconciliation,
+            }
+            for attempt in command.attempts
+        ],
+        created_at=command.created_at,
+        updated_at=command.updated_at,
+        completed_at=command.completed_at,
+    )
+
+
+def _raise_meta_budget_domain_error(exc: ProviderBudgetCommandError) -> None:
+    if isinstance(exc, IdempotencyConflictError):
+        status = 409
+    elif isinstance(exc, (BudgetConflictError, PreviewExpiredError, CommandNotExecutableError)):
+        status = 409
+    elif isinstance(exc, BudgetPolicyError):
+        status = 403
+    elif isinstance(exc, (BudgetValidationError, PreviewTokenError)):
+        status = 400
+    elif isinstance(exc, ProviderBudgetError):
+        status = 502
+    else:
+        status = 400
+    if isinstance(exc, CommandNotExecutableError) and exc.code == "command_not_found":
+        status = 404
+    raise HTTPException(status_code=status, detail={"code": exc.code, "message": exc.message}) from exc
+
+
+def _list_meta_budget_commands(
+    *,
+    client_id: UUID,
+    ad_account_id: Optional[UUID],
+    agency_id: Optional[UUID],
+    agency_id_is_null: bool,
+    limit: int,
+) -> list[ProviderBudgetCommand]:
+    store = _provider_budget_command_store()
+    list_method = getattr(store, "list", None)
+    if callable(list_method):
+        return list_method(
+            client_id=client_id,
+            ad_account_id=ad_account_id,
+            agency_id=agency_id,
+            agency_id_is_null=agency_id_is_null,
+            limit=limit,
+        )
+    # Isolated test-only in-memory store; production always uses the durable
+    # SQLite adapter above.
+    rows = list(getattr(store, "_items", {}).values())
+    rows = [row for row in rows if row.request.client_id == client_id]
+    if ad_account_id is not None:
+        rows = [row for row in rows if row.request.ad_account_id == ad_account_id]
+    if agency_id is not None:
+        rows = [row for row in rows if row.request.agency_id == agency_id]
+    elif agency_id_is_null:
+        rows = [row for row in rows if row.request.agency_id is None]
+    rows.sort(key=lambda row: row.created_at, reverse=True)
+    return rows[:limit]
+
+
+def _acquire_meta_budget_target_lock(
+    command: ProviderBudgetCommand,
+    *,
+    for_reconciliation: bool = False,
+) -> Optional[str]:
+    store = _provider_budget_command_store()
+    if not for_reconciliation:
+        lookup = getattr(store, "target_quarantine_command_id", None)
+        if callable(lookup) and lookup(command.request) is not None:
+            return None
+    acquire = getattr(store, "acquire_target_lock", None)
+    if callable(acquire):
+        return acquire(
+            command,
+            allow_quarantined_command=for_reconciliation,
+        )
+    key = (
+        "meta",
+        command.request.target_type.value,
+        command.request.provider_target_id,
+        command.request.field.value,
+    )
+    token = secrets.token_urlsafe(24)
+    with app.state.provider_budget_target_locks_guard:
+        if key in app.state.provider_budget_target_locks:
+            return None
+        app.state.provider_budget_target_locks[key] = (command.id, token)
+    return token
+
+
+def _release_meta_budget_target_lock(command: ProviderBudgetCommand, lease_token: str) -> None:
+    store = _provider_budget_command_store()
+    release = getattr(store, "release_target_lock", None)
+    if callable(release):
+        release(command, lease_token)
+        return
+    key = (
+        "meta",
+        command.request.target_type.value,
+        command.request.provider_target_id,
+        command.request.field.value,
+    )
+    with app.state.provider_budget_target_locks_guard:
+        if app.state.provider_budget_target_locks.get(key) == (command.id, lease_token):
+            app.state.provider_budget_target_locks.pop(key, None)
+
+
+def _renew_meta_budget_target_lock(command: ProviderBudgetCommand, lease_token: str) -> None:
+    store = _provider_budget_command_store()
+    renew = getattr(store, "renew_target_lock", None)
+    if callable(renew):
+        valid = renew(command, lease_token)
+    else:
+        key = (
+            "meta",
+            command.request.target_type.value,
+            command.request.provider_target_id,
+            command.request.field.value,
+        )
+        with app.state.provider_budget_target_locks_guard:
+            valid = app.state.provider_budget_target_locks.get(key) == (command.id, lease_token)
+    if not valid:
+        raise BudgetConflictError(
+            "meta_budget_target_lock_lost",
+            "The budget target execution lease was lost; no provider write was attempted",
+        )
+
+
+def _bind_hardened_meta_discovery_accounts(evidence: Iterable[object], *, actor_user_id: UUID) -> int:
+    """Create explicit write bindings only from this successful live discovery.
+
+    Historical metadata is never scanned or backfilled.  A validated discovery
+    service emits server-only evidence while the exact current provider
+    candidate is still in scope. Stored account metadata is never consulted.
+    """
+    bound_count = 0
+    for row in evidence:
+        try:
+            _integration_credential_store().bind_provider_account(
+                ad_account_id=row.ad_account_id,
+                provider=row.provider,
+                external_account_id=row.external_account_id,
+                credential_id=row.credential_id,
+                bound_by=actor_user_id,
+            )
+            bound_count += 1
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            logger.warning(
+                "Meta discovery binding failed account_id=%s code=%s",
+                row.ad_account_id,
+                detail.get("code", "credential_binding_failed"),
+            )
+    return bound_count
+
+
 def _ensure_client_currency(client_id: UUID, currency: str, *, resource: str) -> ClientOut:
     client = _client_store().get(client_id)
     if not client:
@@ -2685,11 +3825,11 @@ def _ensure_client_restore_assignments_available(client_id: UUID) -> None:
             )
 
 
-def _resolve_discovery_client_id(
+def _resolve_discovery_context(
     ctx: RequestContext,
     requested_client_id: Optional[UUID],
     requested_agency_id: Optional[UUID] = None,
-) -> UUID:
+) -> tuple[UUID, Optional[UUID]]:
     if ctx.role == "solo_client":
         if requested_agency_id is not None:
             raise HTTPException(
@@ -2706,7 +3846,7 @@ def _resolve_discovery_client_id(
                     "details": {"client_id": str(requested_client_id)},
                 },
             )
-        return owned_client_id
+        return owned_client_id, None
 
     selected_agency_id: Optional[UUID] = None
     if ctx.role == "agency":
@@ -2721,7 +3861,7 @@ def _resolve_discovery_client_id(
         ensure_client_access(ctx, requested_client_id)
         if selected_agency_id is not None:
             _ensure_client_bound_to_agency(selected_agency_id, requested_client_id)
-        return requested_client_id
+        return requested_client_id, selected_agency_id
 
     if selected_agency_id is not None:
         bindings = _platform_admin_store().list_clients(selected_agency_id)
@@ -2740,7 +3880,7 @@ def _resolve_discovery_client_id(
             if (client := _client_store().get(cid)) is not None and client.status == "active"
         ]
     if len(candidates) == 1:
-        return candidates[0]
+        return candidates[0], selected_agency_id
     inbox_scope = (
         f"agency:{selected_agency_id}"
         if selected_agency_id is not None
@@ -2758,7 +3898,7 @@ def _resolve_discovery_client_id(
                 selected_agency_id,
                 AgencyClientAccessCreate(client_id=row.id),
             )
-        return row.id
+        return row.id, selected_agency_id
 
     created = _client_store().create(
         ClientCreate(
@@ -2773,7 +3913,7 @@ def _resolve_discovery_client_id(
             selected_agency_id,
             AgencyClientAccessCreate(client_id=created.id),
         )
-    return created.id
+    return created.id, selected_agency_id
 
 
 def _infer_single_tenant_client(ctx: RequestContext) -> Optional[UUID]:
@@ -2972,17 +4112,13 @@ def auth_patch_user(
                     "message": "Remove active agency memberships before assigning solo client role",
                 },
             )
-        active_access = [
-            row
-            for row in _auth_store().list_client_access(user_id=user_id)
-            if (client := _client_store().get(row.client_id)) is not None and client.status == "active"
-        ]
-        if len(active_access) > 1 or any(row.role != "client" for row in active_access):
+        access_rows = _auth_store().list_client_access(user_id=user_id)
+        if len(access_rows) > 1 or any(row.role != "client" for row in access_rows):
             raise HTTPException(
                 status_code=409,
                 detail={
                     "code": "solo_owner_provisioning_conflict",
-                    "message": "Solo client may have at most one active client grant with client access role",
+                    "message": "Solo client may have at most one client grant with client access role",
                 },
             )
     return _auth_store().patch_user(user_id, payload)
@@ -3039,15 +4175,42 @@ def auth_assign_access(
     _enforce_internal_admin(ctx)
     target_user = _auth_store().get_user(payload.user_id)
     target_client = _client_store().get(payload.client_id)
-    if target_user and target_user.role == "solo_client":
-        if payload.role != "client" or not target_client or target_client.status != "active":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "solo_owner_provisioning_conflict",
-                    "message": "Solo client access requires an active client and client access role",
-                },
-            )
+    if not target_user:
+        raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "User not found"})
+    if target_user.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "access_user_inactive", "message": "Access can be assigned only to an active user"},
+        )
+    if target_user.role == "admin":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "admin_access_not_required", "message": "Administrators already have global client access"},
+        )
+    if target_user.role == "agency":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agency_access_managed_by_membership",
+                "message": "Agency client access must be managed through agency members and client bindings",
+            },
+        )
+    if not target_client:
+        raise HTTPException(status_code=404, detail={"code": "client_not_found", "message": "Client not found"})
+    if target_client.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "access_client_inactive", "message": "Access can be assigned only to an active client"},
+        )
+    expected_role = "client"
+    if payload.role != expected_role:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "access_role_mismatch",
+                "message": "Client assignment type must match the user's platform role",
+            },
+        )
     row = _auth_store().assign_client_access(payload)
     _audit_event(
         event_type="access.assigned",
@@ -3068,6 +4231,58 @@ def auth_list_access(
     _enforce_internal_admin(ctx)
     rows = _auth_store().list_client_access(user_id=user_id)
     return {"items": [x.model_dump(mode="json") for x in rows], "count": len(rows)}
+
+
+@app.delete(
+    "/auth/internal/access/{user_id}/{client_id}",
+    summary="Revoke a direct client access assignment",
+)
+def auth_revoke_access(
+    user_id: UUID,
+    client_id: UUID,
+    ctx: Optional[RequestContext] = Depends(optional_auth_context),
+):
+    _enforce_internal_admin(ctx)
+    target_user = _auth_store().get_user(user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail={"code": "user_not_found", "message": "User not found"})
+    existing = next(
+        (row for row in _auth_store().list_client_access(user_id=user_id) if row.client_id == client_id),
+        None,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "access_not_found", "message": "Client access assignment not found"},
+        )
+    backing_agency_id = (
+        _active_agency_backing_for_client(user_id, client_id)
+        if target_user.role == "agency" and target_user.status == "active"
+        else None
+    )
+    if backing_agency_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "agency_access_managed_by_membership",
+                "message": "Agency client access must be managed through agency members and client bindings",
+                "details": {"agency_id": str(backing_agency_id)},
+            },
+        )
+    _auth_store().remove_client_access(user_id, client_id)
+    _audit_event(
+        event_type="access.revoked",
+        resource_type="user_client_access",
+        resource_id=str(existing.id),
+        ctx=ctx,
+        tenant_client_id=client_id,
+        payload={
+            "target_user_id": str(user_id),
+            "role": existing.role,
+            "orphan_agency_cleanup": target_user.role == "agency",
+        },
+    )
+    return {"status": "revoked"}
 
 
 @app.post(
@@ -3289,7 +4504,7 @@ def auth_oauth_start(
     request: Request,
     provider: str,
     next_path: Optional[str] = Query(default="/", alias="next"),
-    intent: str = Query(default="login", pattern="^(login|connect)$"),
+    intent: str = Query(default="login", pattern="^(login|connect|link|migrate)$"),
     connect_mode: str = Query(default="add", pattern="^(add|overwrite)$"),
     connection_key: Optional[str] = Query(default=None),
     agency_id: Optional[UUID] = Query(default=None),
@@ -3299,10 +4514,17 @@ def auth_oauth_start(
     adapter = adapters.get(provider)
     if not adapter:
         raise HTTPException(status_code=404, detail="Unsupported auth provider")
+    if intent in {"link", "migrate"} and provider != "facebook":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_oauth_intent", "message": "Identity migration is supported only for Facebook"},
+        )
     selected_agency_id: Optional[UUID] = None
     selected_client_id: Optional[UUID] = None
     initiator_user_id: Optional[UUID] = None
-    if intent == "connect":
+    internal_intent = "migrate_legacy" if intent == "migrate" else intent
+    current_ctx = None
+    if intent in {"connect", "link"}:
         current_token = _get_session_token(
             request.headers.get("Authorization"),
             request.headers.get("X-Session-Token"),
@@ -3313,8 +4535,24 @@ def auth_oauth_start(
         if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
             raise HTTPException(
                 status_code=401,
-                detail={"code": "session_required", "message": "Sign in before connecting an advertising account"},
+                detail={
+                    "code": "session_required",
+                    "message": (
+                        "Sign in before linking a Facebook identity"
+                        if intent == "link"
+                        else "Sign in before connecting an advertising account"
+                    ),
+                },
             )
+        initiator_user_id = current_ctx.user_id
+    if intent == "link":
+        if agency_id is not None or client_id is not None or connection_key is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "identity_link_scope_invalid", "message": "Identity linking does not accept tenant scope"},
+            )
+    elif intent == "connect":
+        assert current_ctx is not None
         if current_ctx.role not in {"admin", "agency", "solo_client"}:
             raise HTTPException(
                 status_code=403,
@@ -3364,15 +4602,20 @@ def auth_oauth_start(
                     "message": "Admin OAuth connections use global scope and do not accept agency_id or client_id",
                 },
             )
-        initiator_user_id = current_ctx.user_id
-    cfg = _oauth_provider_config_or_400(provider, intent=intent)
+    elif intent == "migrate" and (agency_id is not None or client_id is not None or connection_key is not None):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "identity_migration_scope_invalid", "message": "Identity migration does not accept tenant scope"},
+        )
+    cfg = _oauth_provider_config_or_400(provider, intent=internal_intent)
     normalized_next = _with_oauth_connect_options(
         _normalize_next_path(next_path),
-        intent=intent,
+        intent=internal_intent,
         connect_mode=connect_mode,
         connection_key=connection_key,
         agency_id=selected_agency_id,
         client_id=selected_client_id,
+        meta_config_id=cfg.config_id if provider == "facebook" and internal_intent == "connect" else None,
     )
     nonce = secrets.token_urlsafe(24)
     state = _oauth_state_store().create_state(
@@ -3433,9 +4676,10 @@ def auth_oauth_callback(
         requested_connection_key,
         requested_agency_id,
         requested_client_id,
+        requested_meta_config_id,
     ) = _extract_oauth_connect_options(consumed.next_path or "/")
     current_ctx = None
-    if oauth_intent == "connect":
+    if oauth_intent in {"connect", "link"}:
         current_token = _get_session_token(
             request.headers.get("Authorization"),
             request.headers.get("X-Session-Token"),
@@ -3451,7 +4695,7 @@ def auth_oauth_callback(
             or current_ctx.user_id != consumed.initiator_user_id
         ):
             return _oauth_error_redirect("session_mismatch")
-        if current_ctx.role == "solo_client":
+        if oauth_intent == "connect" and current_ctx.role == "solo_client":
             try:
                 current_client_id = _solo_owner_client_id_for_user(
                     current_ctx.user_id,
@@ -3463,18 +4707,44 @@ def auth_oauth_callback(
                 return _oauth_error_redirect("access_denied")
             if requested_agency_id is not None:
                 return _oauth_error_redirect("access_denied")
-        elif requested_client_id is not None:
+        elif oauth_intent == "connect" and requested_client_id is not None:
             return _oauth_error_redirect("access_denied")
     if error:
         return _oauth_error_redirect(error)
     if not code:
         return _oauth_error_redirect("provider_error")
-    cfg = _oauth_provider_config_or_400(provider, intent=oauth_intent)
+    try:
+        cfg = _oauth_provider_config_or_400(provider, intent=oauth_intent)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return _oauth_error_redirect(str(detail.get("code") or "provider_error"))
+    if provider == "facebook" and oauth_intent == "connect":
+        current_meta_config_id = str(cfg.config_id or "").strip()
+        if not requested_meta_config_id or requested_meta_config_id != current_meta_config_id:
+            logger.warning("Meta Business OAuth state configuration mismatch")
+            return _oauth_error_redirect("provider_error")
     try:
         identity = adapter.fetch_identity(cfg, code)
     except Exception:
         logger.warning("OAuth identity exchange failed for provider=%s intent=%s", provider, oauth_intent)
         return _oauth_error_redirect("provider_error")
+
+    if provider == "facebook" and oauth_intent == "connect":
+        token_payload = dict(identity.oauth_tokens or {})
+        try:
+            validation = validate_meta_business_connection(
+                access_token=token_payload.get("access_token"),
+                app_id=cfg.client_id,
+                app_secret=cfg.client_secret,
+                config_id=requested_meta_config_id,
+                expected_user_id=identity.provider_user_id,
+                token_payload=token_payload,
+            )
+        except MetaConnectionValidationError as exc:
+            logger.warning("Meta Business OAuth validation failed code=%s", exc.code)
+            safe_code = "access_not_granted" if exc.code == "meta_permissions_missing" else "provider_error"
+            return _oauth_error_redirect(safe_code)
+        identity.oauth_tokens = {**token_payload, **validation}
 
     if oauth_intent == "connect":
         if not current_ctx or not current_ctx.valid or not current_ctx.user_id:
@@ -3503,12 +4773,85 @@ def auth_oauth_callback(
         response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
         return response
 
-    if provider == "facebook":
+    if oauth_intent == "migrate_legacy":
+        if provider != "facebook":
+            return _oauth_error_redirect("provider_error")
+        try:
+            legacy_user = _resolve_facebook_legacy_migration_user(cfg=cfg, identity=identity)
+        except HTTPException:
+            return _oauth_error_redirect("facebook_identity_conflict")
+        if not legacy_user:
+            return _oauth_error_redirect("facebook_migration_identity_not_found")
+        try:
+            primary_cfg = _oauth_provider_config_or_400("facebook", intent="migrate_primary")
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return _oauth_error_redirect(str(detail.get("code") or "facebook_auth_not_configured"))
+        primary_nonce = secrets.token_urlsafe(24)
+        primary_next = _with_oauth_connect_options(
+            redirect_next,
+            intent="migrate_primary",
+            connect_mode="add",
+            connection_key=None,
+            agency_id=None,
+            client_id=None,
+            meta_config_id=None,
+        )
+        primary_state = _oauth_state_store().create_state(
+            provider="facebook",
+            next_path=primary_next,
+            nonce=primary_nonce,
+            ttl_minutes=settings.oauth_state_ttl_minutes,
+            initiator_user_id=legacy_user.id,
+        )
+        primary_url = adapter.build_authorize_url(primary_cfg, primary_state.state)
+        response = RedirectResponse(url=primary_url, status_code=302)
+        response.set_cookie(
+            key=settings.oauth_nonce_cookie_name,
+            value=primary_nonce,
+            httponly=True,
+            samesite=_cookie_samesite_value(),
+            secure=settings.auth_cookie_secure,
+            max_age=max(60, settings.oauth_state_ttl_minutes * 60),
+            path="/",
+        )
+        return response
+
+    if oauth_intent in {"link", "migrate_primary"}:
+        proven_user_id = (
+            current_ctx.user_id
+            if oauth_intent == "link" and current_ctx and current_ctx.valid and current_ctx.user_id
+            else consumed.initiator_user_id
+        )
+        if proven_user_id is None:
+            return _oauth_error_redirect("session_mismatch")
+        try:
+            oauth_user = _link_facebook_identity_to_proven_user(
+                cfg=cfg,
+                identity=identity,
+                user_id=proven_user_id,
+            )
+        except HTTPException:
+            return _oauth_error_redirect("facebook_identity_conflict")
+
+        if oauth_intent == "link":
+            base = settings.frontend_base_url.rstrip("/")
+            redirect_url = f"{base}/login/success?{urlencode({'next': redirect_next or '/'})}"
+            response = RedirectResponse(url=redirect_url, status_code=302, background=background_tasks)
+            response.delete_cookie(settings.oauth_nonce_cookie_name, path="/")
+            return response
+        oauth_session = _auth_facade().issue_session(
+            oauth_user.id,
+            ttl_minutes=settings.oauth_session_ttl_minutes,
+        )
+    elif provider == "facebook":
         login_subject = _facebook_login_subject(cfg, identity)
         contact_email = _normalized_oauth_email(identity.email)
         linked_identity = _auth_store().find_identity(provider, login_subject)
         login_user = _auth_store().get_user(linked_identity.user_id) if linked_identity else None
         if not linked_identity:
+            if _facebook_legacy_migration_enabled():
+                return _oauth_error_redirect("facebook_migration_required")
             if _find_user_by_normalized_email(contact_email):
                 return _oauth_error_redirect("account_link_required")
             try:
@@ -3953,12 +5296,24 @@ def platform_deactivate_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
-    return _platform_admin_store().deactivate_member(
+    row = _platform_admin_store().deactivate_member(
         agency_id,
         member_id,
         actor_user_id=ctx.user_id,
         actor_is_platform_admin=ctx.role == "admin",
     )
+    _audit_event(
+        event_type="agency.member.deactivated",
+        resource_type="agency_member",
+        resource_id=str(row.id),
+        ctx=ctx,
+        payload={
+            "agency_id": str(agency_id),
+            "target_user_id": str(row.user_id),
+            "member_role": row.role,
+        },
+    )
+    return row
 
 
 @app.delete(
@@ -3971,12 +5326,28 @@ def platform_remove_agency_member(
     ctx: RequestContext = Depends(auth_context),
 ):
     _ensure_agency_member_access(ctx, agency_id, manage=True)
+    target = next(
+        (row for row in _platform_admin_store().list_members(agency_id) if row.id == member_id),
+        None,
+    )
     _platform_admin_store().remove_member(
         agency_id,
         member_id,
         actor_user_id=ctx.user_id,
         actor_is_platform_admin=ctx.role == "admin",
     )
+    if target:
+        _audit_event(
+            event_type="agency.member.removed",
+            resource_type="agency_member",
+            resource_id=str(target.id),
+            ctx=ctx,
+            payload={
+                "agency_id": str(agency_id),
+                "target_user_id": str(target.user_id),
+                "member_role": target.role,
+            },
+        )
     return {"status": "removed"}
 
 
@@ -3990,7 +5361,20 @@ def platform_revoke_agency_client(
     ctx: RequestContext = Depends(auth_context),
 ):
     ensure_admin(ctx)
+    target = next(
+        (row for row in _platform_admin_store().list_clients(agency_id) if row.id == access_id),
+        None,
+    )
     _platform_admin_store().revoke_client(agency_id, access_id)
+    if target:
+        _audit_event(
+            event_type="agency.client_access.revoked",
+            resource_type="agency_client_access",
+            resource_id=str(target.id),
+            ctx=ctx,
+            tenant_client_id=target.client_id,
+            payload={"agency_id": str(agency_id)},
+        )
     return {"status": "revoked"}
 
 
@@ -4248,6 +5632,7 @@ def revoke_client_invite(
 def create_ad_account(payload: AdAccountCreate, ctx: RequestContext = Depends(auth_context)):
     ensure_tenant_write_access(ctx)
     ensure_client_access(ctx, payload.client_id)
+    _reject_server_managed_ad_account_metadata(payload.metadata)
     _ensure_client_currency(payload.client_id, payload.currency, resource="Ad account")
     return _ad_account_store().create(payload)
 
@@ -4348,6 +5733,9 @@ def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestCont
     ensure_tenant_write_access(ctx)
     existing = _account_or_404(account_id)
     ensure_account_access(ctx, existing.client_id, account_id=existing.id)
+    metadata_provided = "metadata" in payload.model_fields_set
+    if metadata_provided:
+        _reject_server_managed_ad_account_metadata(payload.metadata)
     if payload.client_id:
         ensure_client_access(ctx, payload.client_id)
     target_client_id = payload.client_id or existing.client_id
@@ -4374,7 +5762,38 @@ def patch_ad_account(account_id: UUID, payload: AdAccountPatch, ctx: RequestCont
                     "details": {"account_id": str(existing.id), "budgets": len(conflicting_budgets)},
                 },
             )
-    return _ad_account_store().patch(account_id, payload)
+    patch_data = payload.model_dump(exclude_unset=True)
+    if metadata_provided:
+        # Public metadata updates may replace user-owned annotations, but they
+        # must never erase or overwrite provider/sync state maintained by the
+        # discovery and sync services.
+        patch_data["metadata"] = {
+            **_server_managed_ad_account_metadata(existing.metadata),
+            **(payload.metadata or {}),
+        }
+
+    client_changed = payload.client_id is not None and payload.client_id != existing.client_id
+    existing_platform = normalize_account_platform(existing.platform)
+    target_platform = normalize_account_platform(payload.platform or existing.platform)
+    if client_changed and "meta" in {existing_platform, target_platform}:
+        next_metadata = dict(
+            patch_data.get("metadata")
+            if "metadata" in patch_data
+            else (existing.metadata or {})
+        )
+        for key in list(next_metadata):
+            normalized_key = str(key).strip().lower()
+            if normalized_key == "integration_credential_id" or normalized_key == "meta_rediscovery_required":
+                next_metadata.pop(key, None)
+            elif normalized_key.startswith("meta_connection_"):
+                next_metadata.pop(key, None)
+        if target_platform == "meta":
+            next_metadata["meta_rediscovery_required"] = True
+            next_metadata["meta_connection_status"] = "error"
+            next_metadata["meta_connection_diagnostic_code"] = "meta_client_changed_rediscovery_required"
+        patch_data["metadata"] = next_metadata
+
+    return _ad_account_store().patch(account_id, AdAccountPatch(**patch_data))
 
 
 @app.delete("/ad-accounts/{account_id}", summary="Archive ad account")
@@ -4402,12 +5821,11 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             status_code=403,
             detail={"code": "forbidden", "message": "This role cannot run account discovery"},
         )
-    selected_agency_id = (
-        _resolve_agency_context_for_user(ctx.user_id, payload.agency_id, require_manage=True)
-        if ctx.role == "agency" and ctx.user_id
-        else None
+    target_client_id, selected_agency_id = _resolve_discovery_context(
+        ctx,
+        payload.client_id,
+        payload.agency_id,
     )
-    target_client_id = _resolve_discovery_client_id(ctx, payload.client_id, selected_agency_id)
     target_client = _client_or_404(target_client_id)
     if target_client.status != "active":
         raise HTTPException(
@@ -4421,6 +5839,9 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
         agency_id=selected_agency_id,
         upsert_existing=payload.upsert_existing,
         expected_currency=target_client.default_currency,
+    )
+    budget_bindings_created = (
+        _bind_hardened_meta_discovery_accounts(result.credential_bindings, actor_user_id=ctx.user_id)
     )
     _process_discovery_alerts(
         target_client_id=target_client_id,
@@ -4439,6 +5860,7 @@ def discover_ad_accounts(payload: AdAccountDiscoverRequest, ctx: RequestContext 
             "created": result.created,
             "updated": result.updated,
             "skipped": result.skipped,
+            "provider_budget_bindings_created": budget_bindings_created,
             "providers_failed": result.providers_failed,
         },
     )
@@ -4731,8 +6153,8 @@ def ad_account_sync_diagnostics(
 
         empty_response = bool((job.request_meta or {}).get("empty_response"))
         if job.status == "success" and empty_response:
-            state = "error"
-            message = "Provider request succeeded but returned no metric rows; data freshness is not confirmed."
+            state = "no_data"
+            message = "Last sync completed successfully, but the provider returned no metric rows for this date range."
         elif job.status == "success":
             state = "healthy"
             message = "Last sync completed successfully."
@@ -4778,6 +6200,7 @@ def ad_account_sync_diagnostics(
     summary = {
         "total_accounts": len(items),
         "healthy": len([x for x in items if x.sync_state == "healthy"]),
+        "no_data": len([x for x in items if x.sync_state == "no_data"]),
         "error": len([x for x in items if x.sync_state == "error"]),
         "retry_scheduled": len([x for x in items if x.sync_state == "retry_scheduled"]),
         "never_synced": len([x for x in items if x.sync_state == "never_synced"]),
@@ -4938,6 +6361,626 @@ def list_ad_stats(
         allowed = {a.id for a in _ad_account_store().list(status="all") if a.client_id in ctx.accessible_client_ids}
         items = [x for x in items if x.ad_account_id in allowed]
     return {"items": [x.model_dump(mode="json") for x in items], "count": len(items)}
+
+
+@app.get(
+    "/provider-controls/meta/readiness",
+    response_model=MetaBudgetReadinessResponse,
+    summary="Check Meta budget-control readiness",
+)
+def meta_budget_readiness(
+    client_id: UUID,
+    ad_account_id: Optional[UUID] = None,
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    client = _client_or_404(client_id)
+    ensure_client_access(ctx, client_id)
+    feature_enabled = _meta_budget_feature_enabled()
+    allowed_targets: list[str] = ["campaign", "ad_set"]
+    fields_by_target: dict[str, list[str]] = {
+        "campaign": ["daily_budget", "lifetime_budget"],
+        "ad_set": ["daily_budget", "lifetime_budget"],
+    }
+    if _meta_spend_cap_enabled():
+        allowed_targets.append("account")
+        fields_by_target["account"] = ["spend_cap"]
+    base = {
+        "provider": "meta",
+        "feature_enabled": feature_enabled,
+        "visible": True,
+        "can_read_history": True,
+        "can_preview": False,
+        "can_confirm": False,
+        "can_reconcile": False,
+        "credential_ready": False,
+        "binding_ready": False,
+        "role": ctx.role,
+        "account": None,
+        "allowed": {
+            "target_types": allowed_targets,
+            "fields_by_target": fields_by_target,
+        },
+    }
+    if client.status != "active":
+        return {**base, "reason_code": "client_not_active", "message": "The selected client is not active."}
+    if ad_account_id is None:
+        return {
+            **base,
+            "reason_code": "meta_account_required",
+            "message": "Select a Meta advertising account to check readiness.",
+        }
+    account = _account_or_404(ad_account_id)
+    ensure_account_access(ctx, account.client_id, account_id=account.id)
+    if account.client_id != client_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "account_scope_mismatch", "message": "Advertising account does not belong to client."},
+        )
+    base["account"] = {
+        "id": account.id,
+        "name": account.name,
+        "provider_account_id": canonical_external_account_id(account.platform, account.external_account_id),
+        "currency": account.currency,
+    }
+    try:
+        actor, _tenant, credential, _values, _provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=agency_id,
+            for_write=False,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return {
+            **base,
+            "reason_code": str(detail.get("code") or "meta_budget_not_ready"),
+            "message": str(detail.get("message") or "Meta budget controls are not ready."),
+            "binding_ready": str(detail.get("code") or "") not in {
+                "meta_budget_rediscovery_required",
+                "meta_budget_assignment_conflict",
+            },
+        }
+
+    base["binding_ready"] = True
+    base["credential_ready"] = True
+    if actor.role == ActorRole.AGENCY:
+        base["can_reconcile"] = bool(
+            actor.agency_active
+            and actor.agency_member_role in {AgencyMemberRole.OWNER, AgencyMemberRole.MANAGER}
+            and client_id in actor.agency_bound_client_ids
+            and credential.scope_type == CredentialScope.AGENCY
+            and credential.scope_id == actor.selected_agency_id
+        )
+    elif actor.role == ActorRole.SOLO_CLIENT:
+        base["can_reconcile"] = bool(
+            actor.solo_owner_client_id == client_id
+            and credential.scope_type == CredentialScope.CLIENT
+            and credential.scope_id == client_id
+            and credential.created_by == actor.user_id
+        )
+    elif actor.role == ActorRole.ADMIN:
+        # Recovery is provider-read-only, but remains an explicitly delegated
+        # operator capability. Exact command/account/credential scope is
+        # rechecked again by the reconcile endpoint.
+        base["can_reconcile"] = bool(actor.can_admin_provider_write)
+
+    # Mutation rollout/config gates do not hide read-only incident recovery.
+    # This lets the UI reconcile UNKNOWN commands after writes are disabled,
+    # without weakening the live binding, credential or role checks above.
+    config_problem = _meta_budget_configuration_error()
+    if config_problem:
+        return {**base, "reason_code": config_problem[0], "message": config_problem[1]}
+    client_allowed, rollout_problem = _meta_budget_client_allowed(client_id)
+    if not client_allowed:
+        code, message = rollout_problem or (
+            "meta_budget_client_not_allowed",
+            "Meta budget controls are not enabled for this pilot client.",
+        )
+        return {**base, "reason_code": code, "message": message}
+    can_write = False
+    if actor.role == ActorRole.AGENCY:
+        can_write = bool(
+            actor.agency_active
+            and actor.agency_member_role in {AgencyMemberRole.OWNER, AgencyMemberRole.MANAGER}
+            and client_id in actor.agency_bound_client_ids
+            and credential.scope_type == CredentialScope.AGENCY
+            and credential.scope_id == actor.selected_agency_id
+        )
+    elif actor.role == ActorRole.SOLO_CLIENT:
+        can_write = bool(
+            actor.solo_owner_client_id == client_id
+            and credential.scope_type == CredentialScope.CLIENT
+            and credential.scope_id == client_id
+            and credential.created_by == actor.user_id
+        )
+    elif actor.role == ActorRole.ADMIN:
+        can_write = bool(
+            actor.can_admin_provider_write
+            and credential.scope_type == CredentialScope.GLOBAL
+            and credential.scope_id is None
+        )
+    base["can_preview"] = can_write
+    base["can_confirm"] = can_write
+    if not can_write:
+        reason_code = "client_read_only" if actor.role == ActorRole.CLIENT else "meta_budget_write_scope_not_ready"
+        message = (
+            "Client access is read-only."
+            if actor.role == ActorRole.CLIENT
+            else "The current role or credential scope is not authorized for Meta budget writes."
+        )
+        return {**base, "reason_code": reason_code, "message": message}
+    return {**base, "reason_code": None, "message": "Meta budget controls are ready."}
+
+
+@app.get(
+    "/provider-controls/meta/accounts/{ad_account_id}/budget-targets",
+    response_model=MetaBudgetTargetsResponse,
+    summary="List effective Meta campaign and ad-set budget owners",
+)
+def list_meta_budget_targets(
+    ad_account_id: UUID,
+    agency_id: Optional[UUID] = None,
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    account = _account_or_404(ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    _actor, _tenant, _credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=agency_id,
+        for_write=False,
+    )
+    try:
+        targets = _meta_budget_adapter(values).list_budget_targets(provider_account_id)
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+    items = [
+        {
+            "target_type": target.target_type.value,
+            "provider_target_id": target.provider_target_id,
+            "name": target.name,
+            "status": target.status,
+            "budget_fields": [
+                {
+                    "field": field.field.value,
+                    "current_minor": field.current_minor,
+                    "currency": field.currency,
+                    "observed_at": field.observed_at,
+                    "editable": field.editable,
+                    "reason_code": field.reason_code,
+                    "message": field.message,
+                }
+                for field in target.budget_fields
+                if field.field in {BudgetField.DAILY_BUDGET, BudgetField.LIFETIME_BUDGET}
+            ],
+        }
+        for target in targets
+        if target.target_type in {BudgetTargetType.CAMPAIGN, BudgetTargetType.AD_SET}
+    ]
+    return {"provider": "meta", "account_id": account.id, "items": items, "count": len(items)}
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/preview",
+    response_model=MetaBudgetPreviewResponse,
+    summary="Preview a Meta budget change without mutating Meta",
+)
+def preview_meta_budget_change(
+    payload: MetaBudgetChangeInput,
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    account = _account_or_404(payload.ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    actor, tenant, credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=payload.agency_id,
+        for_write=True,
+    )
+    effective_payload = payload.model_copy(update={"agency_id": actor.selected_agency_id})
+    request = _meta_budget_change_request(
+        effective_payload,
+        account=account,
+        credential_id=credential.id,
+        provider_account_id=provider_account_id,
+    )
+    adapter = _meta_budget_adapter(values)
+    service = ProviderBudgetCommandService(
+        adapter=adapter,
+        store=_provider_budget_command_store(),
+        preview_signer=_meta_budget_preview_signer(),
+    )
+    try:
+        _assert_meta_budget_target_not_quarantined(request)
+        _assert_meta_budget_target_allowlisted(adapter, request)
+        preview = service.preview(request, actor=actor, tenant=tenant, credential=credential)
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+    warnings = []
+    if preview.observed_before_minor > 0:
+        change_ratio = abs(request.amount_minor - preview.observed_before_minor) / preview.observed_before_minor
+        if change_ratio >= 0.5:
+            warnings.append(
+                {
+                    "code": "large_budget_change",
+                    "message": "The requested budget differs from the current value by at least 50%.",
+                    "severity": "warning",
+                }
+            )
+    return {
+        "preview_token": preview.token,
+        "issued_at": preview.issued_at,
+        "expires_at": preview.expires_at,
+        "current_minor": preview.observed_before_minor,
+        "requested_minor": request.amount_minor,
+        "delta_minor": request.amount_minor - preview.observed_before_minor,
+        "currency": request.currency,
+        "request": _meta_budget_public_request(request),
+        "warnings": warnings,
+    }
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes",
+    response_model=MetaBudgetCommandResponse,
+    summary="Explicitly confirm and execute a Meta budget change",
+)
+def confirm_meta_budget_change(
+    payload: MetaBudgetConfirmRequest,
+    http_request: Request,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ctx: RequestContext = Depends(auth_context),
+):
+    _require_meta_budget_feature()
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    account = _account_or_404(payload.ad_account_id)
+    _require_meta_budget_client_allowed(account.client_id)
+    actor, tenant, credential, values, provider_account_id = _meta_budget_bound_context(
+        ctx,
+        account=account,
+        requested_agency_id=payload.agency_id,
+        for_write=True,
+    )
+    change_payload = MetaBudgetChangeInput(**payload.model_dump(exclude={"preview_token", "confirm"}))
+    change_payload = change_payload.model_copy(update={"agency_id": actor.selected_agency_id})
+    request = _meta_budget_change_request(
+        change_payload,
+        account=account,
+        credential_id=credential.id,
+        provider_account_id=provider_account_id,
+    )
+    service = ProviderBudgetCommandService(
+        adapter=_meta_budget_adapter(values),
+        store=_provider_budget_command_store(),
+        preview_signer=_meta_budget_preview_signer(),
+    )
+    try:
+        submission = service.submit(
+            request,
+            preview_token=payload.preview_token,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            tenant=tenant,
+            credential=credential,
+        )
+    except ProviderBudgetCommandError as exc:
+        _raise_meta_budget_domain_error(exc)
+
+    command = submission.command
+    if command.status != BudgetCommandStatus.QUEUED:
+        return {"command": _meta_budget_command_out(command), "replayed": True}
+    lease_token = _acquire_meta_budget_target_lock(command)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        # Re-read every mutable tenant, binding, credential and permission fact
+        # after queueing and immediately before the provider write.
+        current_account = _account_or_404(command.request.ad_account_id)
+        current_actor, current_tenant, current_credential, current_values, _ = _meta_budget_bound_context(
+            ctx,
+            account=current_account,
+            requested_agency_id=command.request.agency_id,
+            for_write=True,
+        )
+        execution_adapter = _meta_budget_adapter(current_values)
+        execution_service = ProviderBudgetCommandService(
+            adapter=execution_adapter,
+            store=_provider_budget_command_store(),
+            preview_signer=_meta_budget_preview_signer(),
+            before_provider_write=lambda claimed: _renew_meta_budget_target_lock(claimed, lease_token),
+            reauthorize_before_write=lambda claimed: _meta_budget_final_execution_authorization(
+                ctx,
+                http_request,
+                claimed,
+            ),
+        )
+        try:
+            _assert_meta_budget_target_allowlisted(execution_adapter, command.request)
+            command = execution_service.execute(
+                command.id,
+                actor=current_actor,
+                tenant=current_tenant,
+                credential=current_credential,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(submission.command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_completed",
+        resource_type="provider_budget_command",
+        resource_id=str(command.id),
+        ctx=ctx,
+        tenant_client_id=command.request.client_id,
+        payload={
+            "provider": "meta",
+            "ad_account_id": str(command.request.ad_account_id),
+            "target_type": command.request.target_type.value,
+            "field": command.request.field.value,
+            "status": command.status.value,
+            "amount_minor": command.request.amount_minor,
+            "currency": command.request.currency,
+        },
+    )
+    return {"command": _meta_budget_command_out(command), "replayed": submission.replayed}
+
+
+@app.get(
+    "/provider-controls/meta/budget-changes",
+    response_model=MetaBudgetCommandListResponse,
+    summary="Read tenant-scoped Meta budget command history",
+)
+def list_meta_budget_change_history(
+    client_id: UUID,
+    ad_account_id: Optional[UUID] = None,
+    agency_id: Optional[UUID] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    ctx: RequestContext = Depends(auth_context),
+):
+    _client_or_404(client_id)
+    ensure_client_access(ctx, client_id)
+    effective_agency_id = agency_id
+    if ctx.role == "agency":
+        effective_agency_id = _resolve_agency_context_for_user(
+            ctx.user_id,
+            agency_id,
+            require_manage=False,
+        )
+        _ensure_client_bound_to_agency(effective_agency_id, client_id)
+    elif agency_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "agency_context_not_applicable", "message": "agency_id is valid only for agency users."},
+        )
+    if ctx.role == "solo_client":
+        if _solo_owner_client_id_for_context(ctx) != client_id:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Tenant access denied."})
+    if ad_account_id is not None:
+        account = _account_or_404(ad_account_id)
+        ensure_account_access(ctx, account.client_id, account_id=account.id)
+        if account.client_id != client_id:
+            raise HTTPException(status_code=409, detail={"code": "account_scope_mismatch", "message": "Account mismatch."})
+    rows = _list_meta_budget_commands(
+        client_id=client_id,
+        ad_account_id=ad_account_id,
+        agency_id=effective_agency_id,
+        agency_id_is_null=ctx.role == "solo_client",
+        limit=limit,
+    )
+    return {"items": [_meta_budget_command_out(row) for row in rows], "count": len(rows)}
+
+
+@app.get(
+    "/provider-controls/meta/budget-changes/{command_id}",
+    response_model=MetaBudgetCommandOut,
+    summary="Read one tenant-scoped Meta budget command",
+)
+def get_meta_budget_change(command_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    ensure_client_access(ctx, command.request.client_id)
+    if ctx.role == "agency":
+        if command.request.agency_id is None:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Command access denied."})
+        selected = _resolve_agency_context_for_user(
+            ctx.user_id,
+            command.request.agency_id,
+            require_manage=False,
+        )
+        _ensure_client_bound_to_agency(selected, command.request.client_id)
+    elif ctx.role == "solo_client":
+        if command.request.agency_id is not None or _solo_owner_client_id_for_context(ctx) != command.request.client_id:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Command access denied."})
+    return _meta_budget_command_out(command)
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/{command_id}/reconcile",
+    response_model=MetaBudgetCommandOut,
+    summary="Read Meta to reconcile an unknown budget command",
+)
+def reconcile_meta_budget_change(command_id: UUID, ctx: RequestContext = Depends(auth_context)):
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    if command.status != BudgetCommandStatus.UNKNOWN:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "command_not_reconcilable",
+                "message": "Only an unknown budget command can be reconciled.",
+            },
+        )
+    lease_token = _acquire_meta_budget_target_lock(command, for_reconciliation=True)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, values, current_provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=(None if ctx.role == "admin" else command.request.agency_id),
+            for_write=True,
+        )
+        if current_provider_account_id != command.request.provider_account_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "meta_budget_recovery_account_binding_mismatch",
+                    "message": "The Meta account identity changed after this command; recovery was not attempted.",
+                },
+            )
+        service = ProviderBudgetCommandService(
+            adapter=_meta_budget_adapter(values),
+            store=_provider_budget_command_store(),
+            preview_signer=None,
+        )
+        try:
+            reconciled = service.reconcile(
+                command.id,
+                actor=actor,
+                tenant=tenant,
+                credential=credential,
+                finalize_mismatch=False,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_reconciled",
+        resource_type="provider_budget_command",
+        resource_id=str(reconciled.id),
+        ctx=ctx,
+        tenant_client_id=reconciled.request.client_id,
+        payload={"provider": "meta", "status": reconciled.status.value, "write_attempted": False},
+    )
+    return _meta_budget_command_out(reconciled)
+
+
+@app.post(
+    "/provider-controls/meta/budget-changes/{command_id}/resolve-unknown",
+    response_model=MetaBudgetCommandOut,
+    summary="Conclude an aged unknown Meta budget command from current provider state",
+)
+def resolve_unknown_meta_budget_change(
+    command_id: UUID,
+    payload: MetaBudgetResolveUnknownRequest,
+    ctx: RequestContext = Depends(auth_context),
+):
+    if ctx.role == "client":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "client_read_only", "message": "Client access is read-only."},
+        )
+    command = _provider_budget_command_store().get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail={"code": "command_not_found", "message": "Command not found."})
+    if command.status != BudgetCommandStatus.UNKNOWN:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "command_not_reconcilable", "message": "Only an unknown command can be resolved."},
+        )
+    settlement_seconds = _meta_budget_unknown_settlement_seconds()
+    unknown_since = command.updated_at
+    if unknown_since.tzinfo is None:
+        unknown_since = unknown_since.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - unknown_since.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < settlement_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_unknown_settlement_pending",
+                "message": "Wait for the settlement window before accepting the current Meta state.",
+                "details": {"retry_after_seconds": max(1, int(settlement_seconds - age_seconds))},
+            },
+        )
+    lease_token = _acquire_meta_budget_target_lock(command, for_reconciliation=True)
+    if lease_token is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "meta_budget_target_busy",
+                "message": "Another budget command is already executing for this target. Retry safely.",
+            },
+        )
+    try:
+        account = _account_or_404(command.request.ad_account_id)
+        actor, tenant, credential, values, current_provider_account_id = _meta_budget_bound_context(
+            ctx,
+            account=account,
+            requested_agency_id=(None if ctx.role == "admin" else command.request.agency_id),
+            for_write=True,
+        )
+        if current_provider_account_id != command.request.provider_account_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "meta_budget_recovery_account_binding_mismatch",
+                    "message": "The Meta account identity changed after this command; recovery was not attempted.",
+                },
+            )
+        service = ProviderBudgetCommandService(
+            adapter=_meta_budget_adapter(values),
+            store=_provider_budget_command_store(),
+            preview_signer=None,
+        )
+        try:
+            resolved = service.reconcile(
+                command.id,
+                actor=actor,
+                tenant=tenant,
+                credential=credential,
+                finalize_mismatch=True,
+            )
+        except ProviderBudgetCommandError as exc:
+            _raise_meta_budget_domain_error(exc)
+    finally:
+        _release_meta_budget_target_lock(command, lease_token)
+    _audit_event(
+        event_type="provider_budget.command_unknown_resolved",
+        resource_type="provider_budget_command",
+        resource_id=str(resolved.id),
+        ctx=ctx,
+        tenant_client_id=resolved.request.client_id,
+        payload={
+            "provider": "meta",
+            "status": resolved.status.value,
+            "resolution": payload.resolution,
+            "write_attempted": False,
+        },
+    )
+    return _meta_budget_command_out(resolved)
 
 
 @app.post(

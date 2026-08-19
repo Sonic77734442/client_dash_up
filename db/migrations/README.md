@@ -19,6 +19,9 @@ Apply in order (idempotent SQL files):
 15. `0015_alter_ad_account_sync_jobs_retry_fields.sql`
 16. `0016_create_integration_credentials.sql`
 17. `0017_add_solo_client_role.sql`
+18. `0018_normalize_user_client_access_roles.sql`
+19. `0019_encrypt_integration_credentials_and_bind_accounts.sql`
+20. `0020_create_provider_budget_command_ledger.sql`
 
 ## Local PostgreSQL example
 ```bash
@@ -39,6 +42,9 @@ psql "$DATABASE_URL" -f db/migrations/0014_create_agency_invites.sql
 psql "$DATABASE_URL" -f db/migrations/0015_alter_ad_account_sync_jobs_retry_fields.sql
 psql "$DATABASE_URL" -f db/migrations/0016_create_integration_credentials.sql
 psql "$DATABASE_URL" -f db/migrations/0017_add_solo_client_role.sql
+psql "$DATABASE_URL" -f db/migrations/0018_normalize_user_client_access_roles.sql
+psql "$DATABASE_URL" -f db/migrations/0019_encrypt_integration_credentials_and_bind_accounts.sql
+psql "$DATABASE_URL" -f db/migrations/0020_create_provider_budget_command_ledger.sql
 ```
 
 ## SQLite local runtime

@@ -130,8 +130,12 @@ Backend for digital analytics with normalized spend, manual budgets, and unified
   - `GET /auth/facebook/start` -> `GET /auth/facebook/callback`
   - `GET /auth/google/start` -> `GET /auth/google/callback`
   - `intent=login` resolves an internal user via `auth_identities`; `intent=connect` requires an existing admin/agency session and stores integration credentials without creating an auth identity
-  - Facebook platform login uses the separate `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`, and `FACEBOOK_AUTH_REDIRECT_URI` app credentials
-  - Meta Ads connection uses `FACEBOOK_CLIENT_ID`, `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and `FACEBOOK_LOGIN_CONFIG_ID`
+  - Facebook platform login uses `FACEBOOK_AUTH_CLIENT_ID`, `FACEBOOK_AUTH_CLIENT_SECRET`, and `FACEBOOK_AUTH_REDIRECT_URI`; these values may point to the same Meta App as the advertising connection, while the OAuth purposes and scopes remain separate
+  - Meta Ads connection uses `FACEBOOK_CLIENT_ID`, `FACEBOOK_CLIENT_SECRET`, `FACEBOOK_REDIRECT_URI`, and `FACEBOOK_LOGIN_CONFIG_ID`; the callback verifies the returned token's app, user, granted permissions, and absolute expiry before persisting it
+  - during a controlled Business Login Configuration migration, `FACEBOOK_LOGIN_LEGACY_CONFIG_IDS` may temporarily allow existing verified credentials to continue read synchronization; new connections and provider budget writes still require the single current `FACEBOOK_LOGIN_CONFIG_ID`
+  - `META_REQUIRED_PERMISSIONS` controls the comma-separated Business Login permission check and defaults to `ads_read`; `ads_management` also satisfies the read requirement and must be enforced separately before provider budget writes, while `business_management` is needed only for configured Business Portfolio enumeration
+  - an App ID migration can be enabled explicitly with `FACEBOOK_AUTH_LEGACY_CLIENT_ID`, `FACEBOOK_AUTH_LEGACY_CLIENT_SECRET`, and `FACEBOOK_AUTH_LEGACY_REDIRECT_URI`; it is disabled only when all three values are empty, while partial configuration fails closed; while enabled, an unknown primary Facebook subject cannot auto-provision a workspace
+  - `intent=migrate` proves the already-linked legacy Facebook subject and then the primary subject in two single-use OAuth steps; both app-qualified and historical raw legacy subjects are accepted only when every matching record belongs to the same active user, otherwise migration fails closed; `intent=link` requires the same active backend session at start and callback; neither flow merges users by email or creates a workspace
   - callback sets `ops_session` httpOnly cookie and redirects to frontend login-success route
   - start/callback flow uses state + nonce cookie validation (double-submit) to harden CSRF protection
   - external auth does not grant authorization; tenant access still comes from role + `user_client_access`
@@ -168,6 +172,30 @@ Backend for digital analytics with normalized spend, manual budgets, and unified
   - provider raw insights endpoints (`/meta/insights`, `/google/insights`, `/tiktok/insights`) are admin-only
   - cookie-auth mutation requests (`POST/PATCH/PUT/DELETE`) require CSRF double-submit header (`X-CSRF-Token`)
 - sensitive auth/invite endpoints are rate-limited (in-memory baseline)
+- Meta provider budget controls use the isolated `/provider-controls/meta/*`
+  namespace and are disabled by default (`META_BUDGET_COMMANDS_ENABLED=false`).
+  Enabling requires a dedicated `META_BUDGET_PREVIEW_SECRET` (at least 32
+  bytes), a 30-900 second `META_BUDGET_PREVIEW_TTL_SECONDS`, an explicit
+  default-deny pilot allowlist in `META_BUDGET_ALLOWED_CLIENT_IDS` (or a
+  separately reviewed `META_BUDGET_ALLOW_ALL_CLIENTS=true`), an explicit
+  post-hardening account/credential binding, encrypted credential storage, an
+  unexpired token for the current Meta App/Business Login configuration, and
+  `ads_management`. The first public release exposes only campaign/ad-set
+  `daily_budget` and `lifetime_budget`; admin writes and account `spend_cap`
+  remain behind separate default-false `META_BUDGET_ADMIN_WRITES_ENABLED` and
+  `META_BUDGET_SPEND_CAP_ENABLED` gates. Preview is read-only, confirmation
+  requires `confirm: true` plus `Idempotency-Key`, and every write performs
+  provider read-before-write/CAS/read-after-write with a durable command and
+  attempt ledger. Ambiguous outcomes quarantine the exact target until a
+  read-only reconciliation resolves them. Runtime and blue/green startup never
+  recover or steal an `in_progress` command, even after its fixed 600-second
+  lease expires or its lock row is missing. If a process is interrupted, stop
+  **all** API/blue-green instances, back up the SQLite database, run a count-only
+  check with `python scripts/recover_provider_budget_commands.py --db-path <db>`,
+  then apply only with
+  `--apply --confirm-all-api-stopped "ALL API INSTANCES ARE STOPPED"`. Restart
+  the API afterward and resolve the resulting quarantine with provider-read-only
+  reconciliation. Never run the apply command while any API instance is alive.
 - runtime ops endpoints:
   - `GET /healthz` (liveness)
   - `GET /readyz` (readiness with store/db checks)

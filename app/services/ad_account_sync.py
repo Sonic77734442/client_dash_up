@@ -20,6 +20,11 @@ from app.db import init_sqlite, sqlite_conn
 from app.schemas import AdAccountOut, AdAccountPatch, AdAccountSyncJobOut, AdStatWrite, AdStatsIngestRequest
 from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
 from app.services.date_utils import meta_safe_date_from
+from app.services.meta_connection import (
+    MetaCredentialDiagnostic,
+    MetaCredentialReconnectRequiredError,
+    require_usable_validated_meta_credentials,
+)
 from app.services.providers import google_ads, meta, tiktok
 from app.services.ad_stats import AdStatsStore
 
@@ -449,6 +454,8 @@ class AdAccountSyncService:
             return ("provider_payload_invalid", "validation", False)
         if isinstance(exc, MissingScopedCredentialsError):
             return ("provider_credentials_missing", "configuration", False)
+        if isinstance(exc, MetaCredentialReconnectRequiredError):
+            return ("provider_reconnect_required", "auth", False)
         raw = AdAccountSyncService._to_error_message(exc).lower()
         if isinstance(exc, HTTPException):
             status = int(exc.status_code or 0)
@@ -484,6 +491,12 @@ class AdAccountSyncService:
         if "invalid" in raw or "bad request" in raw or "missing" in raw:
             return ("invalid_request", "validation", False)
         return ("unknown_error", "unknown", False)
+
+    @staticmethod
+    def _provider_credentials(candidate: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        if candidate is None:
+            return None
+        return {key: value for key, value in candidate.items() if not key.startswith("__")}
 
     @staticmethod
     def _next_retry_at(*, now: datetime, attempt: int) -> datetime:
@@ -625,6 +638,8 @@ class AdAccountSyncService:
             attempt = 1
             if prev and prev.status == "error" and prev.retryable:
                 attempt = int(prev.attempt or 1) + 1
+            used_meta_diagnostic: Optional[MetaCredentialDiagnostic] = None
+            meta_diagnostic_code: Optional[str] = None
             if not fetcher:
                 err = f"Provider not supported: {provider}"
                 status = "error"
@@ -642,6 +657,11 @@ class AdAccountSyncService:
                 provider_rows_count = 0
                 latest_data_date = None
                 try:
+                    if provider == "meta" and bool(account_meta.get("meta_rediscovery_required")):
+                        raise MetaCredentialReconnectRequiredError(
+                            "meta_rediscovery_required",
+                            "This Meta ad account moved to another client. Rediscover it before syncing.",
+                        )
                     credential_candidates: List[Optional[Dict[str, object]]] = []
                     if self.credential_candidates_resolver:
                         credential_candidates = self.credential_candidates_resolver(provider, account.client_id, user_id) or []
@@ -664,21 +684,43 @@ class AdAccountSyncService:
                             )
 
                     preferred_credential_id = str((account.metadata or {}).get("integration_credential_id") or "").strip()
-                    if preferred_credential_id:
+                    if provider == "meta" and preferred_credential_id:
+                        exact_candidates = [
+                            candidate
+                            for candidate in credential_candidates
+                            if str((candidate or {}).get("__credential_id") or "") == preferred_credential_id
+                        ]
+                        if not exact_candidates:
+                            raise MetaCredentialReconnectRequiredError(
+                                "meta_bound_credential_missing",
+                                "The Meta connection assigned to this ad account is no longer active. Reconnect Meta Ads and rediscover the account.",
+                            )
+                        # Meta accounts imported through Business Login are bound
+                        # to the exact credential that discovered them. Never
+                        # silently fall through to another tenant's token.
+                        credential_candidates = exact_candidates[:1]
+                    elif preferred_credential_id:
                         preferred = [c for c in credential_candidates if str((c or {}).get("__credential_id") or "") == preferred_credential_id]
                         remaining = [c for c in credential_candidates if str((c or {}).get("__credential_id") or "") != preferred_credential_id]
                         credential_candidates = [*preferred, *remaining]
+                    elif provider == "meta" and len(credential_candidates) > 1:
+                        raise MetaCredentialReconnectRequiredError(
+                            "meta_credential_selection_required",
+                            "This Meta ad account is not assigned to one connection. Rediscover the account before syncing.",
+                        )
 
                     used_credential_id: Optional[str] = None
                     last_exc: Optional[Exception] = None
                     rows: List[Dict[str, object]] = []
                     for candidate in credential_candidates:
                         used_credential_id = str((candidate or {}).get("__credential_id") or "").strip() or None
-                        provider_credentials = None if candidate is None else dict(candidate)
-                        if provider_credentials is not None:
-                            provider_credentials.pop("__credential_id", None)
-                            provider_credentials.pop("__connection_key", None)
+                        provider_credentials = self._provider_credentials(candidate)
                         try:
+                            if provider == "meta" and provider_credentials:
+                                used_meta_diagnostic = require_usable_validated_meta_credentials(
+                                    provider_credentials,
+                                    allow_unverified_legacy=True,
+                                )
                             try:
                                 rows = fetcher(account.external_account_id, from_str, to_str, provider_credentials)
                             except TypeError:
@@ -717,6 +759,8 @@ class AdAccountSyncService:
                     records = 0
                     error_message = self._to_error_message(exc)
                     error_code, error_category, retryable = self._classify_error(exc)
+                    if isinstance(exc, MetaCredentialReconnectRequiredError):
+                        meta_diagnostic_code = exc.code
                     next_retry_at = self._next_retry_at(now=s_at, attempt=attempt) if retryable else None
 
             f_at = _utcnow()
@@ -761,6 +805,14 @@ class AdAccountSyncService:
             next_meta["sync_data_status"] = (
                 "received" if status == "success" and provider_rows_count > 0 else "empty" if status == "success" else "error"
             )
+            if provider == "meta" and used_meta_diagnostic is not None:
+                next_meta["meta_connection_status"] = used_meta_diagnostic.status
+                next_meta["meta_connection_diagnostic_code"] = used_meta_diagnostic.code
+            elif provider == "meta" and error_code == "provider_reconnect_required":
+                next_meta["meta_connection_status"] = "error"
+                next_meta["meta_connection_diagnostic_code"] = (
+                    meta_diagnostic_code or "meta_reconnect_required"
+                )
             if status == "success":
                 next_meta["last_sync_success_at"] = f_at.isoformat()
                 if provider_rows_count > 0:

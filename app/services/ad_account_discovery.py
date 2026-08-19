@@ -15,11 +15,23 @@ from fastapi import HTTPException
 from app.schemas import AdAccountCreate, AdAccountDiscoverResponse, AdAccountOut, AdAccountPatch
 from app.services.ad_accounts import AdAccountStore
 from app.services.clients import ClientStore
+from app.services.meta_connection import (
+    MetaCredentialDiagnostic,
+    require_usable_validated_meta_credentials,
+)
 from app.services.providers import google_ads, meta, tiktok
 
 
 class AccountDiscoverer(Protocol):
     def __call__(self, credentials: Optional[Dict[str, object]] = None) -> List[Dict[str, object]]: ...
+
+
+@dataclass(frozen=True)
+class DiscoveredCredentialBinding:
+    ad_account_id: UUID
+    provider: str
+    external_account_id: str
+    credential_id: UUID
 
 
 @dataclass
@@ -33,6 +45,10 @@ class DiscoveryResult:
     providers_attempted: List[str]
     providers_failed: Dict[str, str]
     items: List[AdAccountOut]
+    # Internal server-only evidence from this exact provider run. It is not
+    # included by ``to_response`` and must never be reconstructed from stored
+    # ad-account metadata.
+    credential_bindings: List[DiscoveredCredentialBinding]
 
 
 def _normalize_provider(value: Optional[str]) -> str:
@@ -158,6 +174,48 @@ class AdAccountDiscoveryService:
             return str(detail.get("code") or "").strip().lower() == "assignment_conflict"
         return "assignment_conflict" in str(detail or "").lower()
 
+    @staticmethod
+    def _select_meta_candidates_for_tenant(
+        candidates: List[Optional[Dict[str, object]]],
+        *,
+        client_id: UUID,
+        user_id: Optional[UUID],
+        agency_id: Optional[UUID],
+    ) -> List[Optional[Dict[str, object]]]:
+        """Keep Meta credentials owned by the selected actor tenant.
+
+        Production resolvers add the private scope fields below. Custom test or
+        legacy resolvers without those fields retain their historical behavior.
+        """
+        tagged = [candidate for candidate in candidates if candidate and "__scope_type" in candidate]
+        if not tagged:
+            return candidates
+        if agency_id is not None:
+            return [
+                candidate
+                for candidate in tagged
+                if str(candidate.get("__scope_type") or "") == "agency"
+                and str(candidate.get("__scope_id") or "") == str(agency_id)
+            ]
+        if user_id is not None:
+            return [
+                candidate
+                for candidate in tagged
+                if str(candidate.get("__scope_type") or "") == "client"
+                and str(candidate.get("__scope_id") or "") == str(client_id)
+                and str(candidate.get("__created_by") or "") == str(user_id)
+            ]
+        # An admin may intentionally discover through client, agency, or global
+        # credentials. Every returned row is already bound to this client by the
+        # credential store, and each discovered account is pinned to its exact id.
+        return tagged
+
+    @staticmethod
+    def _provider_credentials(candidate: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        if candidate is None:
+            return None
+        return {key: value for key, value in candidate.items() if not key.startswith("__")}
+
     def discover(
         self,
         *,
@@ -207,17 +265,48 @@ class AdAccountDiscoveryService:
         skipped = 0
         discovered = 0
         items: List[AdAccountOut] = []
+        credential_bindings: List[DiscoveredCredentialBinding] = []
         providers_failed: Dict[str, str] = {}
         provider_conflicts: Dict[str, int] = {}
         provider_currency_mismatches: Dict[str, int] = {}
         normalized_expected_currency = str(expected_currency or "").strip().upper()
+
+        def _record_current_binding(
+            account: AdAccountOut,
+            *,
+            provider_name: str,
+            external_account_id: str,
+            credential_id: Optional[str],
+            meta_diagnostic: Optional[MetaCredentialDiagnostic],
+        ) -> None:
+            if (
+                provider_name != "meta"
+                or meta_diagnostic is None
+                or meta_diagnostic.status not in {"ready", "warning"}
+                or not credential_id
+            ):
+                return
+            try:
+                parsed_credential_id = UUID(credential_id)
+            except (TypeError, ValueError):
+                return
+            credential_bindings.append(
+                DiscoveredCredentialBinding(
+                    ad_account_id=account.id,
+                    provider="meta",
+                    external_account_id=external_account_id,
+                    credential_id=parsed_credential_id,
+                )
+            )
 
         for p in providers:
             discoverer = self.discoverers.get(p)
             if not discoverer:
                 providers_failed[p] = "Provider discovery not configured"
                 continue
-            provider_runs: List[tuple[Optional[str], List[Dict[str, object]]]] = []
+            provider_runs: List[
+                tuple[Optional[str], List[Dict[str, object]], Optional[MetaCredentialDiagnostic]]
+            ] = []
             provider_errors: List[str] = []
 
             candidate_credentials: List[Optional[Dict[str, object]]] = []
@@ -231,6 +320,13 @@ class AdAccountDiscoveryService:
                 candidate_credentials = []
             if user_id is not None:
                 candidate_credentials = [candidate for candidate in candidate_credentials if candidate is not None]
+            if p == "meta":
+                candidate_credentials = self._select_meta_candidates_for_tenant(
+                    candidate_credentials,
+                    client_id=client_id,
+                    user_id=user_id,
+                    agency_id=agency_id,
+                )
             if not candidate_credentials:
                 if user_id is None:
                     # Platform-admin and scheduler runs may intentionally use the
@@ -245,17 +341,20 @@ class AdAccountDiscoveryService:
 
             for candidate in candidate_credentials:
                 cred_id = str((candidate or {}).get("__credential_id") or "").strip() or None
-                provider_credentials = None if candidate is None else dict(candidate)
-                if provider_credentials is not None:
-                    provider_credentials.pop("__credential_id", None)
-                    provider_credentials.pop("__connection_key", None)
+                provider_credentials = self._provider_credentials(candidate)
+                meta_diagnostic: Optional[MetaCredentialDiagnostic] = None
                 try:
+                    if p == "meta" and provider_credentials:
+                        meta_diagnostic = require_usable_validated_meta_credentials(
+                            provider_credentials,
+                            allow_unverified_legacy=True,
+                        )
                     try:
                         rows = discoverer(provider_credentials) or []
                     except TypeError:
                         # Backward-compatible path for tests/custom discoverers without credentials param.
                         rows = discoverer() or []
-                    provider_runs.append((cred_id, rows))
+                    provider_runs.append((cred_id, rows, meta_diagnostic))
                 except Exception as exc:
                     provider_errors.append(self._safe_provider_error(exc))
 
@@ -263,12 +362,21 @@ class AdAccountDiscoveryService:
                 providers_failed[p] = provider_errors[-1]
                 continue
 
-            for cred_id, rows in provider_runs:
+            seen_meta_credentials: Dict[str, Optional[str]] = {}
+            for cred_id, rows, meta_diagnostic in provider_runs:
                 for row in rows:
                     external_account_id = _canonical_external_id(p, row.get("external_account_id"))
                     if not external_account_id:
                         skipped += 1
                         continue
+                    if p == "meta" and external_account_id in seen_meta_credentials:
+                        # The same account can be visible through several Business
+                        # connections. Keep the newest resolver result instead of
+                        # letting a later credential silently replace its binding.
+                        skipped += 1
+                        continue
+                    if p == "meta":
+                        seen_meta_credentials[external_account_id] = cred_id
                     discovered += 1
                     name = str(row.get("name") or f"{p.upper()} {external_account_id}").strip()
                     currency = str(row.get("currency") or "USD").strip().upper() or "USD"
@@ -299,6 +407,13 @@ class AdAccountDiscoveryService:
                     }
                     if cred_id:
                         discovery_meta["integration_credential_id"] = cred_id
+                    if p == "meta" and meta_diagnostic is not None:
+                        discovery_meta["meta_connection_status"] = meta_diagnostic.status
+                        discovery_meta["meta_connection_diagnostic_code"] = meta_diagnostic.code
+                    if p == "meta":
+                        # A successful provider discovery is the only operation
+                        # that may rebind an account after it changes clients.
+                        discovery_meta["meta_rediscovery_required"] = False
                     if existing_account:
                         merged_meta = dict(existing_account.metadata or {})
                         merged_meta.update(discovery_meta)
@@ -321,6 +436,13 @@ class AdAccountDiscoveryService:
                                 active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
+                            _record_current_binding(
+                                patched,
+                                provider_name=p,
+                                external_account_id=external_account_id,
+                                credential_id=cred_id,
+                                meta_diagnostic=meta_diagnostic,
+                            )
                         except HTTPException as exc:
                             if exc.status_code == 409:
                                 skipped += 1
@@ -345,6 +467,13 @@ class AdAccountDiscoveryService:
                         active_assignments.setdefault((p, external_account_id), []).append(created_row)
                         items.append(created_row)
                         created += 1
+                        _record_current_binding(
+                            created_row,
+                            provider_name=p,
+                            external_account_id=external_account_id,
+                            credential_id=cred_id,
+                            meta_diagnostic=meta_diagnostic,
+                        )
                     except HTTPException as exc:
                         # Conflict-safe upsert fallback: re-read matching account and patch instead of failing discover.
                         if exc.status_code == 409:
@@ -383,6 +512,13 @@ class AdAccountDiscoveryService:
                                 active_assignments.setdefault((p, external_account_id), []).append(patched)
                             items.append(patched)
                             updated += 1
+                            _record_current_binding(
+                                patched,
+                                provider_name=p,
+                                external_account_id=external_account_id,
+                                credential_id=cred_id,
+                                meta_diagnostic=meta_diagnostic,
+                            )
                             continue
                         raise
 
@@ -416,6 +552,7 @@ class AdAccountDiscoveryService:
             providers_attempted=providers,
             providers_failed=providers_failed,
             items=items,
+            credential_bindings=credential_bindings,
         )
 
     @staticmethod

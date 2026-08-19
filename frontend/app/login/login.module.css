@@ -588,6 +588,38 @@
   opacity: 1;
 }
 
+.migrationNotice {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(51, 156, 255, 0.28);
+  border-radius: 14px;
+  background: rgba(51, 156, 255, 0.08);
+  color: #3d4653;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.migrationNotice p {
+  margin: 0;
+}
+
+.migrationButton {
+  min-height: 42px;
+  border: 0;
+  border-radius: 12px;
+  background: #1769e0;
+  color: #fff;
+  font: inherit;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.migrationButton:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
 @media (max-height: 850px) and (min-width: 1181px) {
   .hero {
     padding-top: 40px;

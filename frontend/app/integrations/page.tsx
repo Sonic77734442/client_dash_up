@@ -125,7 +125,7 @@ export default function IntegrationsPage() {
       return agencyContext.portfolioError || "Портфель агентства ещё загружается.";
     }
     if (currentRole === "agency" && !canManageAgencyConnections) {
-      return "Подключать платформы и искать новые аккаунты может только владелец или менеджер агентства. Участник может обновлять уже добавленные аккаунты.";
+      return "Ваша роль — «Участник». Для управления подключениями попросите владельца или менеджера назначить вам роль «Менеджер».";
     }
     if (currentRole === "agency" && agencyContext.clientIds.length === 0) {
       return "Сначала администратор должен добавить агентству хотя бы одного активного клиента.";
@@ -257,10 +257,15 @@ export default function IntegrationsPage() {
 
   useEffect(() => {
     if (!ready || agencyContext.loading) return;
+    if (agencyContext.selectionRequired) {
+      setLoading(false);
+      setWarning("");
+      return;
+    }
     void loadData().catch((err) =>
       setWarning(err instanceof Error ? err.message : "Не удалось загрузить источники рекламы")
     );
-  }, [agencyContext.loading, ready, loadData]);
+  }, [agencyContext.loading, agencyContext.selectionRequired, ready, loadData]);
 
   useEffect(() => {
     setData(null);
@@ -495,11 +500,44 @@ export default function IntegrationsPage() {
 
           <DataSourcesNav active="overview" />
 
+          {currentRole === "agency" && agencyContext.agencies.length > 1 ? (
+            <section
+              className={`data-agency-context-card ${agencyContext.selectionRequired ? "attention" : ""}`.trim()}
+              aria-labelledby="integrations-agency-context-title"
+            >
+              <div className="data-agency-context-copy">
+                <strong id="integrations-agency-context-title">
+                  {agencyContext.selectionRequired ? "Сначала выберите агентство" : "Источники выбранного агентства"}
+                </strong>
+                <span>
+                  {agencyContext.selectionRequired
+                    ? "Подключения и рекламные аккаунты из разных агентств изолированы. Выберите рабочее пространство, чтобы продолжить."
+                    : `Сейчас показаны подключения агентства «${agencyContext.selectedAgency?.name || "—"}». Здесь можно быстро переключить рабочее пространство.`}
+                </span>
+              </div>
+              <label className="data-agency-context-control" htmlFor="integrations-agency-context-select">
+                <span>Агентство для источников рекламы</span>
+                <select
+                  id="integrations-agency-context-select"
+                  aria-label="Агентство для источников рекламы"
+                  value={agencyContext.selectedAgencyId}
+                  onChange={(event) => agencyContext.setSelectedAgencyId(event.target.value)}
+                  disabled={agencyContext.loading}
+                >
+                  <option value="">Выберите агентство</option>
+                  {agencyContext.agencies.map((agency) => (
+                    <option value={agency.id} key={agency.id}>{agency.name}</option>
+                  ))}
+                </select>
+              </label>
+            </section>
+          ) : null}
+
           {currentRole === "agency" && agencyContext.portfolioReady && !agencyContext.loading && !canManageAgencyConnections ? (
             <section className="data-next-step" style={{ marginTop: 12 }}>
-              <strong>Режим участника</strong>
+              <strong>Ваша роль — «Участник»</strong>
               <span>
-                Вы можете смотреть состояние источников и запускать синхронизацию уже добавленных аккаунтов. Новые подключения, поиск аккаунтов, переподключение и отключение доступны владельцу или менеджеру агентства.
+                Доступно: просмотр состояния источников и обновление уже добавленных аккаунтов. Чтобы подключать платформы, искать рекламные аккаунты и управлять авторизацией, попросите владельца или менеджера агентства назначить вам роль «Менеджер».
               </span>
             </section>
           ) : null}

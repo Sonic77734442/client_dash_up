@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppSidebar } from "../../components/AppSidebar";
 import { AppTopTabs } from "../../components/AppTopTabs";
+import { ProviderBudgetControl } from "../../components/ProviderBudgetControl";
 import { ToastHost } from "../../components/ToastHost";
 import { agencySelectionRequiredMessage, useAgencyContext } from "../../hooks/useAgencyContext";
 import { useSession } from "../../hooks/useSession";
@@ -810,11 +811,11 @@ export default function BudgetsPage() {
           <header className="topbar budgets-topbar">
             <div className="topbar-left">
               <AppTopTabs active="budgets" />
-              <div className="topbar-title">Реестр бюджетов</div>
+              <div className="topbar-title">Плановые бюджеты</div>
               <div className="panel-subtitle">
                 {agencyContext.role === "solo_client"
-                  ? "Контроль бюджета вашего клиента и рекламных аккаунтов."
-                  : "Контроль бюджетов клиентов и рекламных аккаунтов."}
+                  ? "Внутренние лимиты для отчётности — они не меняют настройки рекламных платформ."
+                  : "Внутренние лимиты клиентов для отчётности — они не меняют настройки рекламных платформ."}
               </div>
             </div>
             <div className="session-controls">
@@ -851,7 +852,7 @@ export default function BudgetsPage() {
                   </button>
                 </>
               ) : null}
-              <button className="primary-btn" onClick={openCreateModal}>Создать бюджет</button>
+              <button className="primary-btn" onClick={openCreateModal}>Создать плановый бюджет</button>
             </div>
           </header>
 
@@ -990,7 +991,7 @@ export default function BudgetsPage() {
             <aside className="panel budgets-detail">
               <div className="budgets-detail-head">
                 <div>
-                  <div className="kpi-title">Детали бюджета</div>
+                  <div className="kpi-title">Детали планового бюджета</div>
                   <h3>{selected?.resolvedAccountName || selected?.resolvedClientName || "Ничего не выбрано"}</h3>
                 </div>
               </div>
@@ -1163,6 +1164,17 @@ export default function BudgetsPage() {
             </div>
             <button className="budgets-fab" onClick={openCreateModal}>+</button>
           </section>
+
+          <ProviderBudgetControl
+            apiBase={session.apiBase}
+            token={session.token}
+            clients={clients}
+            accounts={accounts}
+            role={agencyContext.role}
+            agencyId={agencyContext.selectedAgencyId}
+            agencyMemberRole={agencyContext.currentMember?.role}
+            initialClientId={agencyContext.role === "solo_client" ? agencyContext.managedClientId : clientId}
+          />
         </main>
       </div>
 
@@ -1175,8 +1187,8 @@ export default function BudgetsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>Новый бюджет</h3>
-              <div className="panel-subtitle">Задайте бюджет для клиента или рекламного аккаунта.</div>
+              <h3 style={{ margin: 0 }}>Новый плановый бюджет</h3>
+              <div className="panel-subtitle">Задайте внутренний ориентир. Эта операция не меняет бюджет в рекламной платформе.</div>
             </div>
             <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Закрыть</button>
           </div>
@@ -1282,7 +1294,7 @@ export default function BudgetsPage() {
           <div className="session-controls" style={{ marginTop: 12, justifyContent: "flex-end" }}>
             <button className="ghost-btn" onClick={() => setCreateOpen(false)} disabled={createLoading}>Отмена</button>
             <button className="primary-btn" disabled={!canCreate || createLoading || createCapBlocksSubmit} onClick={() => void createBudget()}>
-              {createLoading ? "Создаём…" : "Создать бюджет"}
+              {createLoading ? "Создаём…" : "Создать плановый бюджет"}
             </button>
           </div>
         </div>
@@ -1297,8 +1309,8 @@ export default function BudgetsPage() {
         <div className="modal-card budgets-modal" onClick={(e) => e.stopPropagation()}>
           <div className="modal-head">
             <div>
-              <h3 style={{ margin: 0 }}>Перевод бюджета</h3>
-              <div className="panel-subtitle">Перенесите часть бюджета с выбранного аккаунта на другой.</div>
+              <h3 style={{ margin: 0 }}>Перевод планового бюджета</h3>
+              <div className="panel-subtitle">Перенесите часть внутреннего лимита между аккаунтами. Настройки Meta и Google не изменятся.</div>
             </div>
             <button className="ghost-btn" onClick={() => setTransferOpen(false)} disabled={transferLoading}>Закрыть</button>
           </div>

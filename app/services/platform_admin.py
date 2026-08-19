@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.db import init_sqlite, provider_budget_retention_summary, sqlite_conn
 from app.schemas import (
     AgencyClientAccessCreate,
     AgencyClientAccessOut,
@@ -341,10 +341,24 @@ class SqlitePlatformAdminStore:
 
     def _rebuild_user_agency_access(self, conn, user_id: UUID) -> None:
         now = _utcnow().isoformat()
-        conn.execute(
-            "DELETE FROM user_client_access WHERE user_id=? AND role='agency'",
-            (str(user_id),),
-        )
+        user = conn.execute("SELECT role, status FROM users WHERE id=?", (str(user_id),)).fetchone()
+        if not user:
+            return
+        if user["role"] == "agency":
+            conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
+        elif user["role"] == "admin":
+            conn.execute("DELETE FROM user_client_access WHERE user_id=?", (str(user_id),))
+            return
+        else:
+            # A stale membership must not erase an independent direct grant
+            # after an agency user has been demoted to client/solo_client.
+            conn.execute(
+                "DELETE FROM user_client_access WHERE user_id=? AND role='agency'",
+                (str(user_id),),
+            )
+            return
+        if user["status"] != "active":
+            return
         rows = conn.execute(
             """
             SELECT DISTINCT aca.client_id
@@ -481,7 +495,25 @@ class SqlitePlatformAdminStore:
     def delete_agency(self, agency_id: UUID) -> None:
         now = _utcnow().isoformat()
         with sqlite_conn(self.db_path) as conn:
+            # Keep the immutable-ledger retention check, binding cleanup and
+            # agency deletion in one serialized write transaction. Otherwise a
+            # new command could be queued after the check and turn the final
+            # delete into an unhandled foreign-key failure.
+            conn.execute("BEGIN IMMEDIATE")
             self._agency_or_404(conn, agency_id)
+            retention = provider_budget_retention_summary(conn, agency_id=agency_id)
+            if retention["history_count"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "provider_budget_ledger_retention_required",
+                        "message": (
+                            "This agency is referenced by immutable provider budget history; "
+                            "archive the agency instead of deleting it."
+                        ),
+                        "details": retention,
+                    },
+                )
             member_rows = conn.execute(
                 "SELECT DISTINCT user_id FROM agency_members WHERE agency_id=?",
                 (str(agency_id),),
@@ -491,6 +523,23 @@ class SqlitePlatformAdminStore:
             conn.execute("DELETE FROM agency_invites WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_client_access WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_members WHERE agency_id=?", (str(agency_id),))
+            binding_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='provider_account_credential_bindings'
+                """
+            ).fetchone()
+            if binding_table:
+                conn.execute(
+                    """
+                    DELETE FROM provider_account_credential_bindings
+                    WHERE credential_id IN (
+                      SELECT id FROM integration_credentials
+                      WHERE scope_type='agency' AND scope_id=?
+                    )
+                    """,
+                    (str(agency_id),),
+                )
             conn.execute(
                 "DELETE FROM integration_credentials WHERE scope_type='agency' AND scope_id=?",
                 (str(agency_id),),
@@ -563,10 +612,7 @@ class SqlitePlatformAdminStore:
                     (member_id, str(agency_id), str(payload.user_id), payload.role, payload.status, now, now),
                 )
 
-            if payload.status == "active":
-                self._sync_user_access_for_new_member(conn, agency_id, payload.user_id)
-            else:
-                self._rebuild_user_agency_access(conn, payload.user_id)
+            self._rebuild_user_agency_access(conn, payload.user_id)
 
             conn.commit()
             row = conn.execute("SELECT * FROM agency_members WHERE id=?", (member_id,)).fetchone()
@@ -606,7 +652,12 @@ class SqlitePlatformAdminStore:
                     (access_id, str(agency_id), str(payload.client_id), now, now),
                 )
 
-            self._sync_user_access_for_agency_client(conn, agency_id, payload.client_id)
+            affected_users = conn.execute(
+                "SELECT user_id FROM agency_members WHERE agency_id=?",
+                (str(agency_id),),
+            ).fetchall()
+            for affected in affected_users:
+                self._rebuild_user_agency_access(conn, UUID(affected["user_id"]))
             conn.commit()
             row = conn.execute("SELECT * FROM agency_client_access WHERE id=?", (access_id,)).fetchone()
         return self._to_client_access(row)
@@ -918,7 +969,7 @@ class SqlitePlatformAdminStore:
                     (member_id, row["agency_id"], str(user.id), row["member_role"], now.isoformat(), now.isoformat()),
                 )
 
-            self._sync_user_access_for_new_member(conn, UUID(row["agency_id"]), user.id)
+            self._rebuild_user_agency_access(conn, user.id)
             accepted = conn.execute(
                 """
                 UPDATE agency_invites
@@ -1005,6 +1056,9 @@ class InMemoryPlatformAdminStore:
         register_owner_guard = getattr(auth_store, "register_agency_owner_exit_guard", None)
         if callable(register_owner_guard):
             register_owner_guard(self._assert_user_can_exit_owner_role)
+        register_access_rebuilder = getattr(auth_store, "register_agency_access_rebuilder", None)
+        if callable(register_access_rebuilder):
+            register_access_rebuilder(self._rebuild_user_agency_access)
 
     def _agency_or_404(self, agency_id: UUID) -> AgencyOut:
         agency = self.agencies.get(agency_id)
@@ -1130,13 +1184,17 @@ class InMemoryPlatformAdminStore:
             return
         # InMemoryAuthStore keeps grants in .access dict with UserClientAccessOut values.
         access_dict = getattr(self.auth_store, "access", {})
-        for key, value in list(access_dict.items()):
-            if value.user_id == user_id and value.role == "agency":
-                access_dict.pop(key, None)
-        active_agencies = {a.id for a in self.agencies.values() if a.status == "active"}
         user = self.auth_store.get_user(user_id)
-        if not user or user.status != "active" or user.role != "agency":
+        if not user:
             return
+        for key, value in list(access_dict.items()):
+            if value.user_id != user_id:
+                continue
+            if user.role in {"agency", "admin"} or value.role == "agency":
+                access_dict.pop(key, None)
+        if user.role != "agency" or user.status != "active":
+            return
+        active_agencies = {a.id for a in self.agencies.values() if a.status == "active"}
         for member in self.members.values():
             if member.user_id != user_id or member.status != "active" or member.agency_id not in active_agencies:
                 continue
@@ -1277,10 +1335,7 @@ class InMemoryPlatformAdminStore:
                 )
             self.members[key] = rec
 
-            if payload.status == "active":
-                self._sync_member_client_access(agency_id, payload.user_id)
-            else:
-                self._rebuild_user_agency_access(payload.user_id)
+            self._rebuild_user_agency_access(payload.user_id)
             return rec
 
     def list_members(self, agency_id: UUID) -> List[AgencyMemberOut]:
@@ -1306,7 +1361,11 @@ class InMemoryPlatformAdminStore:
                 updated_at=now,
             )
         self.clients[key] = rec
-        self._sync_client_members_access(agency_id, payload.client_id)
+        affected_user_ids = {
+            member.user_id for member in self.members.values() if member.agency_id == agency_id
+        }
+        for user_id in affected_user_ids:
+            self._rebuild_user_agency_access(user_id)
         return rec
 
     def list_clients(self, agency_id: UUID) -> List[AgencyClientAccessOut]:

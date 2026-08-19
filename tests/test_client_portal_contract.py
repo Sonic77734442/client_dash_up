@@ -222,14 +222,22 @@ def test_multitenant_contract_agency_and_client_data_isolation():
         "/auth/internal/users",
         json={"email": "agency-multi@test.local", "name": "Agency User", "role": "agency", "status": "active"},
     ).json()
+    agency = client.post(
+        "/platform/agencies",
+        json={"name": "Multi-tenant contract agency", "status": "active", "plan": "starter"},
+        headers=admin_headers,
+    ).json()
     assert client.post(
-        "/auth/internal/access",
-        json={"user_id": agency_user["id"], "client_id": c1["id"], "role": "agency"},
+        f"/platform/agencies/{agency['id']}/members",
+        json={"user_id": agency_user["id"], "role": "member", "status": "active"},
+        headers=admin_headers,
     ).status_code == 200
-    assert client.post(
-        "/auth/internal/access",
-        json={"user_id": agency_user["id"], "client_id": c2["id"], "role": "agency"},
-    ).status_code == 200
+    for tenant in (c1, c2):
+        assert client.post(
+            f"/platform/agencies/{agency['id']}/clients",
+            json={"client_id": tenant["id"]},
+            headers=admin_headers,
+        ).status_code == 200
     agency_token = client.post(
         "/auth/internal/sessions/issue",
         json={"user_id": agency_user["id"], "ttl_minutes": 60},

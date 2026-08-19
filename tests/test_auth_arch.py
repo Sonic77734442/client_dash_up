@@ -117,12 +117,12 @@ def test_provider_config_upsert_and_list():
 
 def test_user_client_access_assignment():
     reset_state()
-    u = mk_user("access@example.com", role="agency")
+    u = mk_user("access@example.com", role="client")
     c = mk_client("Tenant")
 
     assigned = client.post(
         "/auth/internal/access",
-        json={"user_id": u["id"], "client_id": c["id"], "role": "agency"},
+        json={"user_id": u["id"], "client_id": c["id"], "role": "client"},
     )
     assert assigned.status_code == 200
 
@@ -132,10 +132,10 @@ def test_user_client_access_assignment():
 
     reassigned = client.post(
         "/auth/internal/access",
-        json={"user_id": u["id"], "client_id": c["id"], "role": "client"},
+        json={"user_id": u["id"], "client_id": c["id"], "role": "agency"},
     )
-    assert reassigned.status_code == 200
-    assert reassigned.json()["role"] == "client"
+    assert reassigned.status_code == 409
+    assert reassigned.json()["error"]["code"] == "access_role_mismatch"
 
     listed2 = client.get(f"/auth/internal/access?user_id={u['id']}").json()
     assert listed2["count"] == 1
@@ -245,10 +245,18 @@ def test_auth_facade_session_context_role_and_tenant_resolution():
     admin = mk_user("admin@example.com", role="admin")
     agency = mk_user("agency@example.com", role="agency")
 
-    client.post(
-        "/auth/internal/access",
-        json={"user_id": agency["id"], "client_id": c1["id"], "role": "agency"},
-    )
+    agency_workspace = client.post(
+        "/platform/agencies",
+        json={"name": "Auth facade agency", "status": "active", "plan": "starter"},
+    ).json()
+    assert client.post(
+        f"/platform/agencies/{agency_workspace['id']}/members",
+        json={"user_id": agency["id"], "role": "member", "status": "active"},
+    ).status_code == 200
+    assert client.post(
+        f"/platform/agencies/{agency_workspace['id']}/clients",
+        json={"client_id": c1["id"]},
+    ).status_code == 200
 
     # Admin context: global access (all clients)
     admin_session = client.post("/auth/internal/sessions/issue", json={"user_id": admin["id"], "ttl_minutes": 60}).json()

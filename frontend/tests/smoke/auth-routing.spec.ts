@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { NextRequest } from "next/server";
 import {
   destinationForRole,
   isAppRole,
@@ -13,6 +14,9 @@ import {
   normalizeOverviewPayload,
 } from "../../lib/analyticsPayload";
 import { oauthErrorMessage } from "../../lib/oauthError";
+import { middleware } from "../../middleware";
+import { dataFreshnessMeta, diagnosticDataFreshness } from "../../lib/dataFreshness";
+import type { AdAccountSyncDiagnostic } from "../../lib/types";
 import {
   attachSession,
   createAdminSession,
@@ -142,7 +146,7 @@ test("OAuth errors are mapped to safe Russian messages", () => {
   expect(oauthErrorMessage("access_denied")).toBe("Вы отменили предоставление доступа.");
   expect(oauthErrorMessage("user_denied")).toBe("Вы отменили предоставление доступа.");
   expect(oauthErrorMessage("access_not_granted")).toBe(
-    "Не удалось автоматически создать клиентский кабинет. Попробуйте войти ещё раз или используйте другой способ входа.",
+    "Сервис не получил необходимые разрешения. Подключите платформу ещё раз и подтвердите доступ к рекламным аккаунтам.",
   );
   expect(oauthErrorMessage("access_pending")).toBe(
     "Доступ к этой учётной записи отключён или приостановлен. Обратитесь к администратору платформы.",
@@ -153,6 +157,9 @@ test("OAuth errors are mapped to safe Russian messages", () => {
   expect(oauthErrorMessage("facebook_auth_not_configured")).toBe(
     "Вход через Facebook сейчас недоступен. Используйте другой способ входа или обратитесь к администратору.",
   );
+  expect(oauthErrorMessage("facebook_migration_required")).toContain("Перенесите существующую привязку");
+  expect(oauthErrorMessage("facebook_migration_identity_not_found")).toContain("не найдена");
+  expect(oauthErrorMessage("facebook_identity_conflict")).toContain("другим пользователем");
   expect(oauthErrorMessage("provider secret text")).toBe(
     "Не удалось завершить вход через сервис. Попробуйте ещё раз.",
   );
@@ -185,6 +192,55 @@ test("Facebook button starts a platform login flow, not an ads connection", asyn
   expect(oauthUrl.searchParams.get("source")).toBe("m");
   expect(oauthUrl.searchParams.get("intent")).toBe("login");
   expect(oauthUrl.searchParams.get("next")).toBe("/");
+});
+
+test("legacy production host redirects to the canonical OAuth cookie domain", () => {
+  const redirected = middleware(
+    new NextRequest("https://client-dash-up.vercel.app/login?next=%2Fbudgets"),
+  );
+  expect(redirected.status).toBe(308);
+  expect(redirected.headers.get("location")).toBe(
+    "https://dash.envidicy.kz/login?next=%2Fbudgets",
+  );
+
+  const canonical = middleware(new NextRequest("https://dash.envidicy.kz/login"));
+  expect(canonical.status).toBe(200);
+  expect(canonical.headers.get("location")).toBeNull();
+});
+
+test("successful empty sync is a warning, not a provider error", () => {
+  const diagnostic = {
+    sync_state: "no_data",
+    last_job_status: "success",
+  } as AdAccountSyncDiagnostic;
+
+  expect(diagnosticDataFreshness(diagnostic)).toBe("no_data");
+  expect(dataFreshnessMeta("no_data")).toEqual({
+    label: "Нет активности за период",
+    description: "Платформа ответила успешно, но за выбранный период не вернула строк с рекламной активностью.",
+    tone: "warn",
+  });
+});
+
+test("legacy Facebook identity gets a safe migration action instead of a new workspace", async ({ page }) => {
+  await page.goto("/login?oauth_error=facebook_migration_required&next=%2Fbudgets");
+
+  await expect(page.getByText(/роль, клиенты и данные сохранятся/)).toBeVisible();
+  const migrate = page.getByRole("button", { name: "Перенести Facebook-вход" });
+  await expect(migrate).toBeVisible();
+
+  await page.route("**/api/connect/start?**", async (route) => {
+    await route.fulfill({ status: 200, contentType: "text/html", body: "ok" });
+  });
+  const requestPromise = page.waitForRequest((request) =>
+    request.url().includes("/api/connect/start?"),
+  );
+  await migrate.click();
+  const oauthUrl = new URL((await requestPromise).url());
+
+  expect(oauthUrl.searchParams.get("source")).toBe("m");
+  expect(oauthUrl.searchParams.get("intent")).toBe("migrate");
+  expect(oauthUrl.searchParams.get("next")).toBe("/budgets");
 });
 
 test("unauthenticated deep link is restored after an agency session appears", async ({ page, context, request }) => {
@@ -232,10 +288,12 @@ test("temporary auth outage keeps the requested page instead of logging the user
   await page.goto("/accounts");
 
   await expect(page).toHaveURL(/\/accounts$/);
-  await expect(page.getByRole("heading", { name: "Платформа обновляется" })).toBeVisible({
+  await expect(page.getByRole("heading", { name: "Не удалось связаться с платформой" })).toBeVisible({
     timeout: 10_000,
   });
-  await expect(page.getByRole("button", { name: "Повторить проверку" })).toBeVisible();
+  await page.getByRole("button", { name: "Повторить проверку" }).click();
+  await expect(page.getByRole("heading", { name: "Не удалось связаться с платформой" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Проверяем…" })).toBeDisabled();
 });
 
 test("admin settings renders provider config envelopes without crashing", async ({ page, context, request }) => {

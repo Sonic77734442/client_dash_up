@@ -50,17 +50,17 @@ The production backend must use:
 
 ```env
 APP_ENV=production
-FRONTEND_BASE_URL=https://client-dash-up.vercel.app
+FRONTEND_BASE_URL=https://dash.envidicy.kz
 AUTH_COOKIE_SECURE=true
 AUTH_COOKIE_SAMESITE=lax
-ALLOWED_ORIGINS=https://client-dash-up.vercel.app
+ALLOWED_ORIGINS=https://dash.envidicy.kz
 ```
 
 OAuth callback URLs registered both in the provider console and the backend
 provider configuration must point to the Vercel proxy:
 
-- Google: `https://client-dash-up.vercel.app/api/backend/auth/google/callback`
-- Facebook: `https://client-dash-up.vercel.app/api/backend/auth/facebook/callback`
+- Google: `https://dash.envidicy.kz/api/backend/auth/google/callback`
+- Facebook: `https://dash.envidicy.kz/api/backend/auth/facebook/callback`
 
 Facebook uses two intentionally separate OAuth configurations even though the
 callback path is the same:

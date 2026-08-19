@@ -1,9 +1,10 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.schemas import AgencyClientAccessCreate, AgencyCreate, AgencyMemberCreate
 
 
 client = TestClient(app)
@@ -35,6 +36,19 @@ def issue_token(user_id: str) -> str:
 
 
 def assign_access(user_id: str, client_id: str, role: str):
+    if role == "agency":
+        agency = app.state.platform_admin_store.create_agency(
+            AgencyCreate(name=f"Write boundary agency {uuid4()}", status="active")
+        )
+        app.state.platform_admin_store.upsert_member(
+            agency.id,
+            AgencyMemberCreate(user_id=UUID(user_id), role="member", status="active"),
+        )
+        app.state.platform_admin_store.assign_client(
+            agency.id,
+            AgencyClientAccessCreate(client_id=UUID(client_id)),
+        )
+        return
     response = client.post(
         "/auth/internal/access",
         json={"user_id": user_id, "client_id": client_id, "role": role},

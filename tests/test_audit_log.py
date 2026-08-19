@@ -75,13 +75,21 @@ def test_audit_logs_cover_access_budget_and_sync_actions():
     )
     assert b.status_code == 200
 
-    agency = mk_agency_user()
+    viewer = client.post(
+        "/auth/internal/users",
+        json={"email": "viewer-audit@test.local", "name": "Viewer", "role": "client", "status": "active"},
+    ).json()
     assigned = client.post(
         "/auth/internal/access",
-        json={"user_id": agency["id"], "client_id": c["id"], "role": "agency"},
+        json={"user_id": viewer["id"], "client_id": c["id"], "role": "client"},
         headers=auth_header(token),
     )
     assert assigned.status_code == 200
+    revoked = client.delete(
+        f"/auth/internal/access/{viewer['id']}/{c['id']}",
+        headers=auth_header(token),
+    )
+    assert revoked.status_code == 200
 
     sync = client.post(
         "/ad-accounts/sync/run",
@@ -95,6 +103,7 @@ def test_audit_logs_cover_access_budget_and_sync_actions():
     event_types = {x["event_type"] for x in logs.json()}
     assert "budget.created" in event_types
     assert "access.assigned" in event_types
+    assert "access.revoked" in event_types
     assert "sync.run" in event_types
 
 
