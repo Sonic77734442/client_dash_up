@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import UUID, uuid4
 
+from app.runtime_db import init_runtime_database, runtime_conn, table_exists
+
 
 class IntegrationCredentialConfigurationError(RuntimeError):
     """The credential scope identity is ambiguous and startup must stop.
@@ -922,10 +924,7 @@ def provider_budget_retention_summary(
     supplied = sum(value is not None for value in (actor_user_id, agency_id, credential_id))
     if supplied != 1:
         raise ValueError("exactly one provider budget retention identity is required")
-    exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_budget_commands'"
-    ).fetchone()
-    if not exists:
+    if not table_exists(conn, "provider_budget_commands"):
         return {"history_count": 0, "unresolved_count": 0}
     if actor_user_id is not None:
         where = """
@@ -971,7 +970,7 @@ class SqliteProviderBudgetCommandStore:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _target_key(request) -> tuple[str, str, str, str]:
@@ -1178,7 +1177,7 @@ class SqliteProviderBudgetCommandStore:
         normalized_key = validate_idempotency_key(idempotency_key)
         created_at = self._iso(now)
         command_id = uuid4()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT * FROM provider_budget_commands WHERE client_id=? AND idempotency_key=?",
@@ -1230,7 +1229,7 @@ class SqliteProviderBudgetCommandStore:
                   attempt_count, created_at, updated_at, completed_at
                 ) VALUES (
                   ?, 'meta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  'queued', ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, ?, NULL
+                  'queued', ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, FALSE, 0, ?, ?, NULL
                 )
                 """,
                 (
@@ -1265,12 +1264,12 @@ class SqliteProviderBudgetCommandStore:
         return CommandSubmission(command=command, replayed=False)
 
     def get(self, command_id: UUID):
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM provider_budget_commands WHERE id=?", (str(command_id),)).fetchone()
             return self._to_command(conn, row) if row else None
 
     def target_quarantine_command_id(self, request) -> Optional[UUID]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 """
                 SELECT command_id FROM provider_budget_target_quarantines
@@ -1300,7 +1299,7 @@ class SqliteProviderBudgetCommandStore:
         elif agency_id_is_null:
             where.append("agency_id IS NULL")
         params.append(max(1, min(int(limit), 200)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM provider_budget_commands WHERE {' AND '.join(where)} "
                 "ORDER BY created_at DESC LIMIT ?",
@@ -1312,7 +1311,7 @@ class SqliteProviderBudgetCommandStore:
         from app.services.provider_budget_commands import CommandNotExecutableError
 
         updated_at = self._iso(now)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
@@ -1341,7 +1340,7 @@ class SqliteProviderBudgetCommandStore:
             error.code if error else None,
             error.message if error else None,
             error.subcode if error else None,
-            1 if error and error.retryable else 0,
+            bool(error and error.retryable),
         )
 
     def _insert_attempt(self, conn: sqlite3.Connection, command_id: UUID, attempt) -> None:
@@ -1383,7 +1382,7 @@ class SqliteProviderBudgetCommandStore:
                 error_message,
                 error_subcode,
                 error_retryable,
-                1 if attempt.reconciliation else 0,
+                bool(attempt.reconciliation),
                 str(attempt.actor_user_id) if attempt.actor_user_id else None,
                 str(attempt.credential_id) if attempt.credential_id else None,
                 authorization_snapshot_json,
@@ -1419,7 +1418,7 @@ class SqliteProviderBudgetCommandStore:
         now_iso = self._iso(now)
         completed_at = None if status == BudgetCommandStatus.UNKNOWN else now_iso
         error_code, error_message, error_subcode, error_retryable = self._error_values(error)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM provider_budget_commands WHERE id=?", (str(command_id),)).fetchone()
             if not row or row["status"] != "in_progress":
@@ -1476,7 +1475,7 @@ class SqliteProviderBudgetCommandStore:
         now_iso = self._iso(now)
         completed_at = None if status == BudgetCommandStatus.UNKNOWN else now_iso
         error_code, error_message, error_subcode, error_retryable = self._error_values(error)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM provider_budget_commands WHERE id=?", (str(command_id),)).fetchone()
             if not row or row["status"] != "unknown":
@@ -1542,7 +1541,7 @@ class SqliteProviderBudgetCommandStore:
         lease_token = uuid4().hex
         request = command.request
         key = ("meta", request.target_type.value, request.provider_target_id, request.field.value)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             quarantine = conn.execute(
                 """
@@ -1581,9 +1580,13 @@ class SqliteProviderBudgetCommandStore:
                 """,
                 key,
             ).fetchone()
-            if row and datetime.fromisoformat(row["lease_until"]).timestamp() > now.timestamp():
-                conn.rollback()
-                return None
+            if row:
+                stored_lease_until = datetime.fromisoformat(row["lease_until"])
+                if stored_lease_until.tzinfo is None:
+                    stored_lease_until = stored_lease_until.replace(tzinfo=timezone.utc)
+                if stored_lease_until.astimezone(timezone.utc) > now.astimezone(timezone.utc):
+                    conn.rollback()
+                    return None
             if row and row["command_status"] == "in_progress":
                 # Defensive duplicate of the target-wide check above for old
                 # databases and unexpected rows: never steal from a write with
@@ -1614,7 +1617,7 @@ class SqliteProviderBudgetCommandStore:
 
     def release_target_lock(self, command, lease_token: str) -> None:
         request = command.request
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -1641,7 +1644,7 @@ class SqliteProviderBudgetCommandStore:
         """Fence the provider POST by renewing only the exact live lease owner."""
         now = datetime.now(timezone.utc)
         request = command.request
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
@@ -1689,7 +1692,7 @@ class SqliteProviderBudgetCommandStore:
 
     def count_interrupted_in_progress(self) -> int:
         """Count unresolved writes without changing runtime state."""
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS count FROM provider_budget_commands WHERE status='in_progress'"
             ).fetchone()
@@ -1715,7 +1718,7 @@ class SqliteProviderBudgetCommandStore:
             checked_at = checked_at.replace(tzinfo=timezone.utc)
         checked_at = checked_at.astimezone(timezone.utc)
         recovered = 0
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
@@ -1741,7 +1744,7 @@ class SqliteProviderBudgetCommandStore:
                       observed_before_minor, confirmed_after_minor, provider_trace_id,
                       error_code, error_message, error_subcode, error_retryable, reconciliation,
                       actor_user_id, credential_id, authorization_snapshot_json, credential_snapshot_json
-                    ) VALUES (?, ?, ?, ?, 'unknown', NULL, NULL, NULL, ?, ?, NULL, 0, 0, NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, 'unknown', NULL, NULL, NULL, ?, ?, NULL, FALSE, FALSE, NULL, NULL, ?, ?)
                     """,
                     (
                         row["id"],
@@ -1759,7 +1762,7 @@ class SqliteProviderBudgetCommandStore:
                     UPDATE provider_budget_commands
                     SET status='unknown', attempt_count=?,
                         error_code='provider_execution_interrupted',
-                        error_message=?, error_subcode=NULL, error_retryable=0,
+                        error_message=?, error_subcode=NULL, error_retryable=FALSE,
                         updated_at=?, completed_at=NULL
                     WHERE id=? AND status='in_progress'
                     """,

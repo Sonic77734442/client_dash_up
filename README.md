@@ -293,7 +293,12 @@ Prerequisites:
   - `grafana` (`:3001`)
 - Run:
   - `cp .env.prod.example .env.prod`
+  - set `GRAFANA_ADMIN_PASSWORD` and the other required secrets in `.env.prod`
   - `./scripts/deploy_prod.sh`
+- Compose ports bind to `127.0.0.1` by default. Set the relevant
+  `*_BIND_HOST=0.0.0.0` only for a service that must be exposed directly.
+- Deploy scripts load `.env.prod` explicitly for Compose interpolation; set
+  `PROD_ENV_FILE=/absolute/path/to/env.prod` to use a deployment-managed file.
 - Rollback baseline:
   - `SQLITE_BACKUP_FILE=backups/<file>.db ./scripts/rollback_prod.sh`
 - Systemd template:
@@ -336,22 +341,18 @@ Prerequisites:
 - SQLite local runtime schema is auto-initialized by `init_sqlite`.
 - Migration sanity checker: `python scripts/check_migrations.py`
 
-## PostgreSQL migrations
-- `0001_create_budgets.sql`
-- `0002_budget_scope_overlap_history.sql`
-- `0003_budget_overlap_exclusion_constraints.sql`
-- `0004_create_clients.sql`
-- `0005_create_ad_accounts.sql`
-- `0006_create_ad_stats.sql`
-- `0007_create_ad_stats_ingest_idempotency.sql`
-- `0008_create_auth_architecture_tables.sql`
-- `0009_create_budget_transfers.sql`
-- `0010_create_ad_account_sync_jobs.sql`
-- `0011_create_platform_admin_agencies.sql`
-- `0012_create_oauth_states.sql`
-- `0013_alter_oauth_states_add_nonce.sql`
-- `0014_create_agency_invites.sql`
-- `0015_alter_ad_account_sync_jobs_retry_fields.sql`
+## Database runtime and PostgreSQL migrations
+- `DATABASE_BACKEND=sqlite` is the default even when `DATABASE_URL` exists.
+- `DATABASE_BACKEND=postgresql` requires `DATABASE_URL` and fails closed when
+  the schema ledger/checksums are not current.
+- Apply the 21 ordered migrations with `python scripts/migrate_postgres.py`.
+  Production web processes should use `DATABASE_AUTO_MIGRATE=false` and run
+  migrations in Render's pre-deploy step.
+- The staged Render cutover, backup, canary, and rollback sequence is in
+  `docs/release_runbook.md`. Do not switch an existing dataset without an
+  explicit stopped-writes transfer and row/decryptability validation.
+- Stored provider credentials and OAuth client secrets require the deployment
+  keyring documented in `docs/credential-encryption.md`.
 
 ## Deferred for later stage
 - Full auth implementation (middleware/policies/token lifecycle)
@@ -362,8 +363,8 @@ Prerequisites:
 - Enforced checks:
   - Python and npm dependency vulnerability audits
   - migration sanity check
-  - sqlite schema init check
-  - `pytest -q`
+  - SQLite schema init and PostgreSQL fresh/idempotent migration checks
+  - `pytest -q` including PostgreSQL runtime and concurrency contracts
   - `frontend npm run lint`
   - `frontend npm run typecheck`
   - `frontend npm run build`
@@ -374,7 +375,9 @@ Prerequisites:
   - `./scripts/backup_sqlite.sh`
   - `./scripts/restore_sqlite.sh <backup_file.db>`
   - `./scripts/backup_postgres.sh` (requires `DATABASE_URL`)
-  - `./scripts/restore_postgres.sh <backup_file.dump>` (requires `DATABASE_URL`)
+  - `./scripts/restore_postgres.sh <backup_file.dump> --confirm-replace-target`
+    (requires `DATABASE_URL`; use only a separate disposable restore-verification
+    database because the command cleans and replaces its target)
 
 ## Standard error envelope
 All application errors are returned as:

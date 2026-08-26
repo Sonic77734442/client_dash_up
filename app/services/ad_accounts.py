@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AdAccountCreate, AdAccountOut, AdAccountPatch
 from app.services.clients import ClientStore
 
@@ -87,7 +87,7 @@ class SqliteAdAccountStore:
     def __init__(self, db_path: str, client_store: ClientStore):
         self.db_path = db_path
         self.client_store = client_store
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_account(row) -> AdAccountOut:
@@ -141,7 +141,7 @@ class SqliteAdAccountStore:
         if exclude:
             where.append("id<>?")
             params.append(str(exclude))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM ad_accounts WHERE {' AND '.join(where)} ORDER BY created_at ASC",
                 params,
@@ -168,7 +168,7 @@ class SqliteAdAccountStore:
     ) -> None:
         normalized_platform = normalize_account_platform(platform)
         normalized_external = canonical_external_account_id(normalized_platform, external_account_id)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT * FROM ad_accounts WHERE client_id=? ORDER BY created_at ASC",
                 (str(client_id),),
@@ -220,7 +220,7 @@ class SqliteAdAccountStore:
             )
         now = _utcnow().isoformat()
         account_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             try:
                 conn.execute(
                     """
@@ -269,12 +269,12 @@ class SqliteAdAccountStore:
             where.append("status=?")
             params.append(effective_status)
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(f"SELECT * FROM ad_accounts WHERE {' AND '.join(where)} ORDER BY updated_at DESC", params).fetchall()
         return [self._to_account(r) for r in rows]
 
     def get(self, account_id: UUID) -> Optional[AdAccountOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM ad_accounts WHERE id=?", (str(account_id),)).fetchone()
         return self._to_account(row) if row else None
 
@@ -318,7 +318,7 @@ class SqliteAdAccountStore:
             )
 
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             try:
                 conn.execute(
                     """
@@ -361,7 +361,7 @@ class SqliteAdAccountStore:
         if not existing:
             raise HTTPException(status_code=404, detail="Ad account not found")
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("UPDATE ad_accounts SET status='archived', updated_at=? WHERE id=?", (now, str(account_id)))
             conn.commit()
             row = conn.execute("SELECT * FROM ad_accounts WHERE id=?", (str(account_id),)).fetchone()

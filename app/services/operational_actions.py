@@ -9,7 +9,7 @@ def _utcnow() -> datetime:
 from typing import List, Optional, Protocol
 from uuid import UUID, uuid4
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import OperationalActionExecuteRequest, OperationalActionOut
 
 
@@ -28,7 +28,7 @@ class OperationalActionStore(Protocol):
 class SqliteOperationalActionStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_row(row) -> OperationalActionOut:
@@ -50,7 +50,7 @@ class SqliteOperationalActionStore:
     def create(self, payload: OperationalActionExecuteRequest, *, created_by: Optional[UUID] = None) -> OperationalActionOut:
         rec_id = str(uuid4())
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO operational_actions
@@ -97,7 +97,7 @@ class SqliteOperationalActionStore:
         if status:
             where.append("status=?")
             params.append(status)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM operational_actions WHERE {' AND '.join(where)} ORDER BY created_at DESC",
                 params,

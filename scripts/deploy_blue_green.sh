@@ -3,13 +3,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.prod.yml}"
+PROD_ENV_FILE="${PROD_ENV_FILE:-$ROOT_DIR/.env.prod}"
 STATE_FILE="${STATE_FILE:-$ROOT_DIR/storage/active_slot.txt}"
 ACTIVE_API_PORT="${ACTIVE_API_PORT:-8000}"
 ACTIVE_WEB_PORT="${ACTIVE_WEB_PORT:-5173}"
 CANDIDATE_API_PORT="${CANDIDATE_API_PORT:-18000}"
 CANDIDATE_WEB_PORT="${CANDIDATE_WEB_PORT:-15173}"
-
 cmd="${1:-deploy}"
+
+if [[ "$cmd" != "status" && ! -f "$PROD_ENV_FILE" ]]; then
+  echo "[bg] Compose env file not found: $PROD_ENV_FILE"
+  echo "[bg] copy .env.prod.example to .env.prod and set production secrets"
+  exit 1
+fi
+
 mkdir -p "$ROOT_DIR/storage"
 active_slot="blue"
 if [[ -f "$STATE_FILE" ]]; then
@@ -32,9 +39,10 @@ case "$cmd" in
     echo "[bg] deploy candidate slot: $candidate_slot"
     (
       cd "$ROOT_DIR"
+      PROD_ENV_FILE="$PROD_ENV_FILE" \
       API_BIND_PORT="$CANDIDATE_API_PORT" WEB_BIND_PORT="$CANDIDATE_WEB_PORT" \
       PROM_BIND_PORT=0 GRAFANA_BIND_PORT=0 ALERTMGR_BIND_PORT=0 \
-      docker compose -f "$COMPOSE_FILE" -p "$candidate_project" up -d --build api frontend
+      docker compose --env-file "$PROD_ENV_FILE" -f "$COMPOSE_FILE" -p "$candidate_project" up -d --build api frontend
     )
 
     echo "[bg] wait candidate ready"
@@ -61,12 +69,13 @@ case "$cmd" in
 
     (
       cd "$ROOT_DIR"
-      docker compose -f "$COMPOSE_FILE" -p "$active_project" stop api frontend || true
-      docker compose -f "$COMPOSE_FILE" -p "$active_project" rm -f api frontend || true
+      PROD_ENV_FILE="$PROD_ENV_FILE" docker compose --env-file "$PROD_ENV_FILE" -f "$COMPOSE_FILE" -p "$active_project" stop api frontend || true
+      PROD_ENV_FILE="$PROD_ENV_FILE" docker compose --env-file "$PROD_ENV_FILE" -f "$COMPOSE_FILE" -p "$active_project" rm -f api frontend || true
 
+      PROD_ENV_FILE="$PROD_ENV_FILE" \
       API_BIND_PORT="$ACTIVE_API_PORT" WEB_BIND_PORT="$ACTIVE_WEB_PORT" \
       PROM_BIND_PORT=0 GRAFANA_BIND_PORT=0 ALERTMGR_BIND_PORT=0 \
-      docker compose -f "$COMPOSE_FILE" -p "$candidate_project" up -d --build api frontend
+      docker compose --env-file "$PROD_ENV_FILE" -f "$COMPOSE_FILE" -p "$candidate_project" up -d --build api frontend
     )
 
     echo "$candidate_slot" > "$STATE_FILE"

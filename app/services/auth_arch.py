@@ -12,7 +12,10 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, provider_budget_retention_summary, sqlite_conn
+from app.db import provider_budget_retention_summary
+from app.runtime_db import init_runtime_database, runtime_conn
+from app.services.auth_secret_crypto import AuthProviderSecretCipher
+from app.services.credential_crypto import CredentialCryptoError, CredentialKeyring
 from app.schemas import (
     AuthIdentityLink,
     AuthIdentityOut,
@@ -126,9 +129,12 @@ def _raise_last_active_agency_owner(agency_id: Optional[str] = None) -> None:
 
 
 class SqliteAuthStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, keyring: Optional[CredentialKeyring] = None):
         self.db_path = db_path
-        init_sqlite(db_path)
+        self.secret_cipher = AuthProviderSecretCipher(
+            keyring if keyring is not None else CredentialKeyring.from_env()
+        )
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_user(row) -> UserOut:
@@ -168,12 +174,39 @@ class SqliteAuthStore:
         )
 
     @staticmethod
-    def _to_provider_config(row) -> AuthProviderConfigOut:
+    def _provider_secret_error(code: str, message: str) -> HTTPException:
+        return HTTPException(status_code=503, detail={"code": code, "message": message})
+
+    def _serialize_provider_secret(self, secret: str, *, config_id: object, provider: object) -> str:
+        try:
+            return self.secret_cipher.encrypt(
+                secret,
+                config_id=config_id,
+                provider=provider,
+            )
+        except CredentialCryptoError as exc:
+            raise self._provider_secret_error(
+                "auth_provider_secret_encryption_unavailable",
+                "Auth provider secret encryption is unavailable. Configure the keyring before saving OAuth settings.",
+            ) from exc
+
+    def _to_provider_config(self, row) -> AuthProviderConfigOut:
+        try:
+            client_secret = self.secret_cipher.decrypt(
+                row["client_secret"],
+                config_id=row["id"],
+                provider=row["provider"],
+            )
+        except CredentialCryptoError as exc:
+            raise self._provider_secret_error(
+                "auth_provider_secret_unavailable",
+                "Stored auth provider settings are unavailable. Restore the encryption key or rotate the provider secret.",
+            ) from exc
         return AuthProviderConfigOut(
             id=UUID(row["id"]),
             provider=row["provider"],
             client_id=row["client_id"],
-            client_secret=row["client_secret"],
+            client_secret=client_secret,
             redirect_uri=row["redirect_uri"],
             enabled=bool(row["enabled"]),
             created_at=datetime.fromisoformat(row["created_at"]),
@@ -183,7 +216,7 @@ class SqliteAuthStore:
     def create_user(self, payload: UserCreate) -> UserOut:
         now = _utcnow().isoformat()
         user_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             try:
                 conn.execute(
                     """
@@ -199,17 +232,17 @@ class SqliteAuthStore:
         return self._to_user(row)
 
     def get_user(self, user_id: UUID) -> Optional[UserOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
         return self._to_user(row) if row else None
 
     def find_user_by_email(self, email: str) -> Optional[UserOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (email,)).fetchone()
         return self._to_user(row) if row else None
 
     def list_users(self) -> List[UserOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute("SELECT * FROM users ORDER BY updated_at DESC").fetchall()
         return [self._to_user(r) for r in rows]
 
@@ -271,7 +304,7 @@ class SqliteAuthStore:
 
     def patch_user(self, user_id: UUID, payload: UserPatch) -> UserOut:
         patch = payload.model_dump(exclude_unset=True)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Serialize admin role/status transitions. Without a write lock, two
             # concurrent requests could each observe the other active admin and
             # leave the platform without an administrator.
@@ -363,7 +396,7 @@ class SqliteAuthStore:
         return self._to_user(updated)
 
     def delete_user(self, user_id: UUID) -> None:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Serialize last-admin and last-agency-owner checks with deletion.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM users WHERE id=?", (str(user_id),)).fetchone()
@@ -408,7 +441,7 @@ class SqliteAuthStore:
 
     def set_password(self, user_id: UUID, password: str) -> None:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT id FROM users WHERE id=?", (str(user_id),)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -422,7 +455,7 @@ class SqliteAuthStore:
         norm_email = (email or "").strip().lower()
         if not norm_email:
             return None
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (norm_email,)).fetchone()
         if not row:
             return None
@@ -435,7 +468,7 @@ class SqliteAuthStore:
         return user
 
     def find_identity(self, provider: str, provider_user_id: str) -> Optional[AuthIdentityOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM auth_identities WHERE provider=? AND provider_user_id=?",
                 (provider, provider_user_id),
@@ -448,7 +481,7 @@ class SqliteAuthStore:
 
         now = _utcnow().isoformat()
         identity_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute(
                 "SELECT * FROM auth_identities WHERE provider=? AND provider_user_id=?",
                 (payload.provider, payload.provider_user_id),
@@ -465,7 +498,7 @@ class SqliteAuthStore:
                     """,
                     (
                         payload.email,
-                        int(payload.email_verified) if payload.email_verified is not None else None,
+                        bool(payload.email_verified) if payload.email_verified is not None else None,
                         json.dumps(payload.raw_profile, separators=(",", ":"), ensure_ascii=True) if payload.raw_profile else None,
                         now,
                         existing["id"],
@@ -488,7 +521,7 @@ class SqliteAuthStore:
                         payload.provider,
                         payload.provider_user_id,
                         payload.email,
-                        int(payload.email_verified) if payload.email_verified is not None else None,
+                        bool(payload.email_verified) if payload.email_verified is not None else None,
                         json.dumps(payload.raw_profile, separators=(",", ":"), ensure_ascii=True) if payload.raw_profile else None,
                         now,
                         now,
@@ -501,7 +534,7 @@ class SqliteAuthStore:
         return self._to_identity(row)
 
     def list_identities(self, user_id: Optional[UUID] = None) -> List[AuthIdentityOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             if user_id:
                 rows = conn.execute("SELECT * FROM auth_identities WHERE user_id=? ORDER BY updated_at DESC", (str(user_id),)).fetchall()
             else:
@@ -511,7 +544,7 @@ class SqliteAuthStore:
     def assign_client_access(self, payload: UserClientAccessCreate) -> UserClientAccessOut:
         now = _utcnow().isoformat()
         access_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             user = conn.execute("SELECT role, status FROM users WHERE id=?", (str(payload.user_id),)).fetchone()
             if not user:
@@ -601,7 +634,7 @@ class SqliteAuthStore:
         return self._to_access(row)
 
     def list_client_access(self, user_id: Optional[UUID] = None) -> List[UserClientAccessOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             if user_id:
                 rows = conn.execute("SELECT * FROM user_client_access WHERE user_id=? ORDER BY updated_at DESC", (str(user_id),)).fetchall()
             else:
@@ -609,7 +642,7 @@ class SqliteAuthStore:
         return [self._to_access(r) for r in rows]
 
     def remove_client_access(self, user_id: UUID, client_id: UUID) -> None:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 "DELETE FROM user_client_access WHERE user_id=? AND client_id=?",
                 (str(user_id), str(client_id)),
@@ -625,7 +658,7 @@ class SqliteAuthStore:
         expires_at = now + timedelta(minutes=payload.ttl_minutes)
         token = secrets.token_urlsafe(36)
         session_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (id, user_id, token_hash, expires_at, revoked_at, metadata, created_at, updated_at)
@@ -651,7 +684,7 @@ class SqliteAuthStore:
 
     def validate_session(self, token: str) -> SessionValidationResponse:
         now = _utcnow()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE token_hash=?",
                 (_token_hash(token),),
@@ -682,7 +715,7 @@ class SqliteAuthStore:
 
     def revoke_session(self, token: str) -> Dict[str, object]:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT id FROM sessions WHERE token_hash=?", (_token_hash(token),)).fetchone()
             if not row:
                 return {"status": "not_found"}
@@ -696,7 +729,7 @@ class SqliteAuthStore:
             return current
         now = _utcnow()
         new_exp = now + timedelta(minutes=ttl_minutes)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 "UPDATE sessions SET expires_at=?, updated_at=? WHERE id=?",
                 (new_exp.isoformat(), now.isoformat(), str(current.session_id)),
@@ -713,9 +746,14 @@ class SqliteAuthStore:
 
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM auth_provider_configs WHERE provider=?", (payload.provider,)).fetchone()
             if existing:
+                encrypted_secret = self._serialize_provider_secret(
+                    payload.client_secret,
+                    config_id=existing["id"],
+                    provider=existing["provider"],
+                )
                 conn.execute(
                     """
                     UPDATE auth_provider_configs
@@ -724,9 +762,9 @@ class SqliteAuthStore:
                     """,
                     (
                         payload.client_id,
-                        payload.client_secret,
+                        encrypted_secret,
                         payload.redirect_uri,
-                        int(payload.enabled),
+                        bool(payload.enabled),
                         now,
                         existing["id"],
                     ),
@@ -736,6 +774,11 @@ class SqliteAuthStore:
                 return self._to_provider_config(row)
 
             cfg_id = str(uuid4())
+            encrypted_secret = self._serialize_provider_secret(
+                payload.client_secret,
+                config_id=cfg_id,
+                provider=payload.provider,
+            )
             conn.execute(
                 """
                 INSERT INTO auth_provider_configs (id, provider, client_id, client_secret, redirect_uri, enabled, created_at, updated_at)
@@ -745,9 +788,9 @@ class SqliteAuthStore:
                     cfg_id,
                     payload.provider,
                     payload.client_id,
-                    payload.client_secret,
+                    encrypted_secret,
                     payload.redirect_uri,
-                    int(payload.enabled),
+                    bool(payload.enabled),
                     now,
                     now,
                 ),
@@ -757,7 +800,7 @@ class SqliteAuthStore:
             return self._to_provider_config(row)
 
     def list_provider_configs(self) -> List[AuthProviderConfigOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute("SELECT * FROM auth_provider_configs ORDER BY provider ASC").fetchall()
         return [self._to_provider_config(r) for r in rows]
 

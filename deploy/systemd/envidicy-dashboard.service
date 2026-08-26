@@ -8,8 +8,9 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/envidicy-dashboard
-ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up -d --build
-ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
+Environment=PROD_ENV_FILE=/opt/envidicy-dashboard/.env.prod
+ExecStart=/usr/bin/docker compose --env-file /opt/envidicy-dashboard/.env.prod -f docker-compose.prod.yml up -d --build
+ExecStop=/usr/bin/docker compose --env-file /opt/envidicy-dashboard/.env.prod -f docker-compose.prod.yml down
 TimeoutStartSec=0
 
 [Install]

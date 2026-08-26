@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AdAccountOut, AdAccountPatch, AdAccountSyncJobOut, AdStatWrite, AdStatsIngestRequest
 from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
 from app.services.date_utils import meta_safe_date_from
@@ -41,7 +41,7 @@ class AdAccountSyncJobStore(Protocol):
 class SqliteAdAccountSyncJobStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_job(row) -> AdAccountSyncJobOut:
@@ -67,7 +67,7 @@ class SqliteAdAccountSyncJobStore:
         )
 
     def create(self, job: AdAccountSyncJobOut) -> AdAccountSyncJobOut:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO ad_account_sync_jobs
@@ -85,7 +85,7 @@ class SqliteAdAccountSyncJobStore:
                     job.error_message,
                     job.error_code,
                     job.error_category,
-                    int(job.retryable),
+                    bool(job.retryable),
                     job.attempt,
                     job.next_retry_at.isoformat() if job.next_retry_at else None,
                     json.dumps(job.request_meta, separators=(",", ":"), ensure_ascii=True) if job.request_meta else None,
@@ -107,7 +107,7 @@ class SqliteAdAccountSyncJobStore:
             where.append("status=?")
             params.append(status)
         params.append(max(1, min(limit, 500)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM ad_account_sync_jobs WHERE {' AND '.join(where)} ORDER BY started_at DESC LIMIT ?",
                 params,
@@ -118,7 +118,7 @@ class SqliteAdAccountSyncJobStore:
         if not account_ids:
             return {}
         out: Dict[UUID, AdAccountSyncJobOut] = {}
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             for account_id in account_ids:
                 row = conn.execute(
                     "SELECT * FROM ad_account_sync_jobs WHERE ad_account_id=? ORDER BY started_at DESC LIMIT 1",
@@ -131,7 +131,7 @@ class SqliteAdAccountSyncJobStore:
     def acquire_lease(self, *, lease_key: str, now: datetime, ttl_seconds: int) -> Optional[str]:
         lease_token = str(uuid4())
         lease_until = now + timedelta(seconds=max(30, int(ttl_seconds)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT lease_until FROM ad_account_sync_leases WHERE lease_key=?",
@@ -160,7 +160,7 @@ class SqliteAdAccountSyncJobStore:
         return lease_token
 
     def release_lease(self, *, lease_key: str, lease_token: str) -> None:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 "DELETE FROM ad_account_sync_leases WHERE lease_key=? AND lease_token=?",
                 (lease_key, lease_token),
@@ -169,7 +169,7 @@ class SqliteAdAccountSyncJobStore:
 
     def renew_lease(self, *, lease_key: str, lease_token: str, now: datetime, ttl_seconds: int) -> bool:
         lease_until = now + timedelta(seconds=max(30, int(ttl_seconds)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             cursor = conn.execute(
                 """
                 UPDATE ad_account_sync_leases

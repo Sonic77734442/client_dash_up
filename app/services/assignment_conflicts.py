@@ -10,7 +10,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
-from app.db import sqlite_conn
+from app.runtime_db import runtime_conn
 from app.schemas import (
     AssignmentConflictCandidateOut,
     AssignmentConflictGroupOut,
@@ -509,7 +509,7 @@ class AssignmentConflictService:
         agency_id: Optional[UUID] = None,
     ) -> AssignmentConflictListResponse:
         if isinstance(self.account_store, SqliteAdAccountStore):
-            with sqlite_conn(self.account_store.db_path) as conn:
+            with runtime_conn(self.account_store.db_path) as conn:
                 allowed = self._sqlite_allowed_client_ids(
                     conn,
                     actor_user_id=actor_user_id,
@@ -621,7 +621,7 @@ class AssignmentConflictService:
         ):
             raise _error(500, "assignment_conflict_store_mismatch", "SQLite resolver stores are inconsistent")
         resolved_at = _utcnow()
-        with sqlite_conn(self.account_store.db_path) as conn:
+        with runtime_conn(self.account_store.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             accounts = self._sqlite_accounts(conn)
             identity, identity_rows = self._identity_rows_for_group(accounts, group_id)

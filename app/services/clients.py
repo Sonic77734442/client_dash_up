@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import ClientCreate, ClientOut, ClientPatch
 
 
@@ -25,7 +25,7 @@ class ClientStore(Protocol):
 class SqliteClientStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_client(row) -> ClientOut:
@@ -44,7 +44,7 @@ class SqliteClientStore:
     def create(self, payload: ClientCreate) -> ClientOut:
         now = _utcnow().isoformat()
         client_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO clients (id, name, legal_name, status, default_currency, timezone, notes, created_at, updated_at)
@@ -70,12 +70,12 @@ class SqliteClientStore:
         effective_status = status or "active"
         where = "WHERE status=?" if effective_status != "all" else ""
         params = (effective_status,) if effective_status != "all" else ()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(f"SELECT * FROM clients {where} ORDER BY updated_at DESC", params).fetchall()
         return [self._to_client(r) for r in rows]
 
     def get(self, client_id: UUID) -> Optional[ClientOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM clients WHERE id=?", (str(client_id),)).fetchone()
         return self._to_client(row) if row else None
 
@@ -88,7 +88,7 @@ class SqliteClientStore:
             return existing
         data = {**existing.model_dump(), **patch}
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             try:
                 conn.execute(
                     """
@@ -126,7 +126,7 @@ class SqliteClientStore:
         if not existing:
             raise HTTPException(status_code=404, detail="Client not found")
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("UPDATE clients SET status='archived', updated_at=? WHERE id=?", (now, str(client_id)))
             conn.commit()
             row = conn.execute("SELECT * FROM clients WHERE id=?", (str(client_id),)).fetchone()

@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, is_postgres_runtime, runtime_conn
 from app.schemas import IntegrationCredentialCreate, IntegrationCredentialOut, IntegrationCredentialPatch
 from app.services.ad_accounts import canonical_external_account_id, normalize_account_platform
 from app.services.credential_crypto import (
@@ -266,13 +266,16 @@ class SqliteIntegrationCredentialStore:
     def __init__(self, db_path: str, *, keyring: Optional[CredentialKeyring] = None):
         self.db_path = db_path
         self.keyring = keyring if keyring is not None else CredentialKeyring.from_env()
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
         self._ensure_binding_schema()
 
     def _ensure_binding_schema(self) -> None:
+        if is_postgres_runtime():
+            # PostgreSQL schema changes are owned by versioned migrations.
+            return
         # Kept here instead of app.db so this security feature can be deployed
         # independently and older SQLite databases gain the table idempotently.
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS provider_account_credential_bindings (
@@ -429,7 +432,7 @@ class SqliteIntegrationCredentialStore:
             raise HTTPException(status_code=400, detail="scope_id must be null for global scope")
         if payload.scope_type in {"agency", "client"} and scope_id is None:
             raise HTTPException(status_code=400, detail="scope_id is required for agency/client scope")
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Serialize the read-then-write identity decision. The partial
             # unique indexes remain the final invariant, while this lock makes
             # concurrent reconnects deterministic upserts instead of exposing
@@ -537,7 +540,7 @@ class SqliteIntegrationCredentialStore:
         if scope_id:
             where.append("scope_id=?")
             params.append(str(scope_id))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM integration_credentials WHERE {' AND '.join(where)} ORDER BY updated_at DESC",
                 params,
@@ -546,7 +549,7 @@ class SqliteIntegrationCredentialStore:
 
     def patch(self, credential_id: UUID, payload: IntegrationCredentialPatch) -> IntegrationCredentialOut:
         patch = payload.model_dump(exclude_unset=True)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM integration_credentials WHERE id=?", (str(credential_id),)).fetchone()
             if not existing:
                 raise HTTPException(status_code=404, detail="Integration credential not found")
@@ -623,7 +626,7 @@ class SqliteIntegrationCredentialStore:
         return self._to_out(row)
 
     def archive(self, credential_id: UUID) -> IntegrationCredentialOut:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM integration_credentials WHERE id=?", (str(credential_id),)).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Integration credential not found")
@@ -670,7 +673,7 @@ class SqliteIntegrationCredentialStore:
             seen_ids.add(rid)
             out.append(self._to_out(row))
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # 1) client-scoped credential.
             client_rows = conn.execute(
                 """
@@ -812,7 +815,7 @@ class SqliteIntegrationCredentialStore:
         )
 
     def get_security_status(self, credential_id: UUID) -> Optional[CredentialStorageSecurity]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM integration_credentials WHERE id=?",
                 (str(credential_id),),
@@ -822,7 +825,7 @@ class SqliteIntegrationCredentialStore:
     def get_encryption_summary(self) -> CredentialEncryptionSummary:
         """Return aggregate readiness only; never credential ids or payload values."""
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute("SELECT * FROM integration_credentials").fetchall()
         statuses = [self._security_status_for_row(row) for row in rows]
         return CredentialEncryptionSummary(
@@ -852,7 +855,7 @@ class SqliteIntegrationCredentialStore:
                 "credential_encryption_unavailable",
                 "Credential storage encryption is not configured.",
             )
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT * FROM integration_credentials ORDER BY created_at ASC, id ASC"
             ).fetchall()
@@ -1018,7 +1021,7 @@ class SqliteIntegrationCredentialStore:
                 "Advertising account identity is invalid.",
                 status_code=400,
             )
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             account = conn.execute(
                 """
                 SELECT aa.*
@@ -1131,7 +1134,7 @@ class SqliteIntegrationCredentialStore:
         normalized_external_id = canonical_external_account_id(
             normalized_provider, external_account_id
         )
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 """
                 SELECT
@@ -1204,7 +1207,7 @@ class SqliteIntegrationCredentialStore:
         )
 
     def remove_provider_account_binding(self, *, ad_account_id: UUID, provider: str) -> bool:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             cursor = conn.execute(
                 """
                 DELETE FROM provider_account_credential_bindings

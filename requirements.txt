@@ -4,3 +4,4 @@ httpx==0.28.1
 python-dotenv==1.2.2
 cryptography==50.0.0
 google-ads==31.2.0
+psycopg[binary]==3.3.4

@@ -1034,7 +1034,7 @@ class AuthProviderConfigOut(BaseModel):
     id: UUID
     provider: str
     client_id: str
-    client_secret: str
+    client_secret: str = Field(repr=False, exclude=True)
     redirect_uri: str
     enabled: bool
     created_at: datetime

@@ -149,6 +149,7 @@ from app.services.integration_credentials import (
     SqliteIntegrationCredentialStore,
     public_credential_diagnostics,
 )
+from app.services.credential_crypto import CredentialKeyring
 from app.services.meta_connection import (
     MetaConnectionValidationError,
     MetaCredentialReconnectRequiredError,
@@ -216,7 +217,8 @@ from app.services.oauth import (
     SqliteOAuthStateStore,
 )
 from app.settings import get_settings, load_accounts
-from app.db import SqliteProviderBudgetCommandStore, sqlite_conn
+from app.db import SqliteProviderBudgetCommandStore
+from app.runtime_db import database_backend, runtime_conn
 
 
 logger = logging.getLogger(__name__)
@@ -310,10 +312,18 @@ app.add_middleware(
 )
 
 
-# Default production stores (sqlite runtime)
+# One immutable keyring instance serves two independently derived/AAD-bound
+# encryption domains: integration credentials and auth provider client secrets.
+credential_keyring = CredentialKeyring.from_env()
+
+# Default persistent stores. DATABASE_BACKEND selects SQLite or PostgreSQL;
+# class names remain stable for API and test compatibility.
 client_store: ClientStore = SqliteClientStore(settings.budgets_db_path)
 ad_account_store: AdAccountStore = SqliteAdAccountStore(settings.budgets_db_path, client_store)
-integration_credential_store: IntegrationCredentialStore = SqliteIntegrationCredentialStore(settings.budgets_db_path)
+integration_credential_store: IntegrationCredentialStore = SqliteIntegrationCredentialStore(
+    settings.budgets_db_path,
+    keyring=credential_keyring,
+)
 ad_account_sync_job_store = SqliteAdAccountSyncJobStore(settings.budgets_db_path)
 ad_stats_store: AdStatsStore = SqliteAdStatsStore(settings.budgets_db_path, ad_account_store)
 
@@ -406,7 +416,7 @@ ad_account_discovery_service = AdAccountDiscoveryService(
 )
 budget_store: BudgetStore = SqliteBudgetStore(settings.budgets_db_path)
 provider_budget_command_store = SqliteProviderBudgetCommandStore(settings.budgets_db_path)
-auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path)
+auth_store: AuthStore = SqliteAuthStore(settings.budgets_db_path, keyring=credential_keyring)
 platform_admin_store: PlatformAdminStore = SqlitePlatformAdminStore(settings.budgets_db_path, auth_store)
 audit_log_store: AuditLogStore = SqliteAuditLogStore(settings.budgets_db_path)
 assignment_conflict_service = AssignmentConflictService(
@@ -2021,7 +2031,7 @@ def _issue_client_invite(
     if not norm_email:
         raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email is required"})
 
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         row_client = conn.execute("SELECT id, status FROM clients WHERE id=?", (str(client_id),)).fetchone()
         if not row_client:
             raise HTTPException(status_code=404, detail="Client not found")
@@ -2065,7 +2075,7 @@ def _issue_client_invite(
 
 def _list_client_invites(*, client_id: UUID, status: str = "all") -> List[ClientInviteOut]:
     now_iso = _utcnow().isoformat()
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         conn.execute(
             """
             UPDATE client_invites
@@ -2089,7 +2099,7 @@ def _list_client_invites(*, client_id: UUID, status: str = "all") -> List[Client
 
 def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOut:
     now_iso = _utcnow().isoformat()
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         row = conn.execute(
             "SELECT * FROM client_invites WHERE id=? AND client_id=?",
             (str(invite_id), str(client_id)),
@@ -2111,7 +2121,7 @@ def _revoke_client_invite(*, client_id: UUID, invite_id: UUID) -> ClientInviteOu
 
 def _revoke_pending_client_invites(*, client_id: UUID) -> int:
     now_iso = _utcnow().isoformat()
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         cursor = conn.execute(
             """
             UPDATE client_invites
@@ -2131,7 +2141,7 @@ def _accept_client_invite(
 ) -> ClientInviteAcceptResponse:
     now = _utcnow()
     token_hash = _invite_token_hash(payload.token.strip())
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         row = conn.execute(
             "SELECT * FROM client_invites WHERE token_hash=?",
             (token_hash,),
@@ -2217,7 +2227,7 @@ def _accept_client_invite(
     # instead of being overwritten after provisioning.
     claim_error: Optional[HTTPException] = None
     updated = None
-    with sqlite_conn(settings.budgets_db_path) as conn:
+    with runtime_conn(settings.budgets_db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         locked = conn.execute("SELECT * FROM client_invites WHERE id=?", (row["id"],)).fetchone()
         if not locked or locked["status"] != "pending":
@@ -2275,7 +2285,7 @@ def _accept_client_invite(
     except Exception as exc:
         if not had_client_access:
             _auth_store().remove_client_access(user.id, target_client_id)
-        with sqlite_conn(settings.budgets_db_path) as conn:
+        with runtime_conn(settings.budgets_db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -2671,7 +2681,7 @@ def _ensure_solo_client_workspace(user: UserOut, *, provider: str) -> UUID:
     ):
         now = _utcnow().isoformat()
         created_client_id: Optional[UUID] = None
-        with sqlite_conn(auth.db_path) as conn:
+        with runtime_conn(auth.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             current_user = conn.execute(
                 "SELECT role, status FROM users WHERE id=?",
@@ -3967,12 +3977,15 @@ def readyz(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> di
     db_ok = True
     db_error = None
     try:
-        with sqlite_conn(settings.budgets_db_path) as conn:
+        with runtime_conn(settings.budgets_db_path) as conn:
             conn.execute("SELECT 1").fetchone()
     except Exception as exc:
         db_ok = False
         db_error = type(exc).__name__
-    checks["sqlite"] = db_ok
+    checks["database"] = db_ok
+    # Preserve the historical SQLite readiness key while exposing the selected
+    # backend explicitly during the staged PostgreSQL rollout.
+    checks[database_backend()] = db_ok
 
     if not all(checks.values()):
         if settings.observability_public:
@@ -3982,9 +3995,9 @@ def readyz(ctx: Optional[RequestContext] = Depends(optional_auth_context)) -> di
             return JSONResponse(status_code=503, content=payload)
         return JSONResponse(status_code=503, content={"status": "not_ready"})
     if settings.observability_public:
-        return {"status": "ready", "checks": checks}
+        return {"status": "ready", "database_backend": database_backend(), "checks": checks}
     if ctx and ctx.role == "admin":
-        return {"status": "ready", "checks": checks}
+        return {"status": "ready", "database_backend": database_backend(), "checks": checks}
     return {"status": "ready"}
 
 

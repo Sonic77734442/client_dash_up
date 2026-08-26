@@ -9,7 +9,7 @@ def _utcnow() -> datetime:
 from typing import Any, Dict, List, Optional, Protocol
 from uuid import UUID
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AuditLogOut
 
 
@@ -39,7 +39,7 @@ class AuditLogStore(Protocol):
 class SqliteAuditLogStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_row(row) -> AuditLogOut:
@@ -68,12 +68,13 @@ class SqliteAuditLogStore:
     ) -> AuditLogOut:
         now = _utcnow().isoformat()
         body = payload or {}
-        with sqlite_conn(self.db_path) as conn:
-            conn.execute(
+        with runtime_conn(self.db_path) as conn:
+            row = conn.execute(
                 """
                 INSERT INTO audit_logs
                 (event_type, resource_type, resource_id, actor_user_id, actor_role, tenant_client_id, payload, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
                 """,
                 (
                     event_type,
@@ -85,9 +86,8 @@ class SqliteAuditLogStore:
                     json.dumps(body, separators=(",", ":"), ensure_ascii=True),
                     now,
                 ),
-            )
+            ).fetchone()
             conn.commit()
-            row = conn.execute("SELECT * FROM audit_logs WHERE id = last_insert_rowid()").fetchone()
         return self._to_row(row)
 
     def list(
@@ -110,7 +110,7 @@ class SqliteAuditLogStore:
             where.append("tenant_client_id=?")
             params.append(str(tenant_client_id))
         params.append(max(1, min(limit, 500)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM audit_logs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
                 params,

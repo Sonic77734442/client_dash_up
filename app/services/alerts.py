@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AlertOut
 
 
@@ -48,7 +48,7 @@ class AlertStore(Protocol):
 class SqliteAlertStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_out(row) -> AlertOut:
@@ -74,7 +74,7 @@ class SqliteAlertStore:
 
     def raise_alert(self, signal: AlertSignal) -> AlertOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE fingerprint=?", (signal.fingerprint,)).fetchone()
             if existing:
                 conn.execute(
@@ -142,7 +142,7 @@ class SqliteAlertStore:
 
     def resolve_by_fingerprint(self, fingerprint: str) -> Optional[AlertOut]:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE fingerprint=?", (fingerprint,)).fetchone()
             if not existing:
                 return None
@@ -158,7 +158,7 @@ class SqliteAlertStore:
 
     def acknowledge(self, alert_id: UUID, *, by_user_id: Optional[UUID]) -> AlertOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = conn.execute("SELECT * FROM alerts WHERE id=?", (str(alert_id),)).fetchone()
             if not existing:
                 raise HTTPException(status_code=404, detail="Alert not found")
@@ -194,7 +194,7 @@ class SqliteAlertStore:
             where.append("client_id=?")
             params.append(str(client_id))
         params.append(max(1, min(limit, 500)))
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM alerts WHERE {' AND '.join(where)} ORDER BY last_seen_at DESC LIMIT ?",
                 params,
@@ -202,7 +202,7 @@ class SqliteAlertStore:
         return [self._to_out(x) for x in rows]
 
     def get(self, alert_id: UUID) -> Optional[AlertOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM alerts WHERE id=?", (str(alert_id),)).fetchone()
         return self._to_out(row) if row else None
 

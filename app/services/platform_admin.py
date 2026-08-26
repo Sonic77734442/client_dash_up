@@ -14,7 +14,8 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, provider_budget_retention_summary, sqlite_conn
+from app.db import provider_budget_retention_summary
+from app.runtime_db import init_runtime_database, runtime_conn, table_exists
 from app.schemas import (
     AgencyClientAccessCreate,
     AgencyClientAccessOut,
@@ -128,7 +129,7 @@ class SqlitePlatformAdminStore:
     def __init__(self, db_path: str, auth_store: AuthStore):
         self.db_path = db_path
         self.auth_store = auth_store
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_agency(row) -> AgencyOut:
@@ -390,7 +391,7 @@ class SqlitePlatformAdminStore:
         now = _utcnow().isoformat()
         agency_id = str(uuid4())
         slug = _slugify(payload.slug or payload.name)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             try:
                 conn.execute(
                     """
@@ -404,7 +405,7 @@ class SqlitePlatformAdminStore:
                         payload.status,
                         payload.plan,
                         payload.notes,
-                        1 if payload.allow_client_invites else 0,
+                        bool(payload.allow_client_invites),
                         now,
                         now,
                     ),
@@ -418,18 +419,18 @@ class SqlitePlatformAdminStore:
     def list_agencies(self, *, status: str = "all") -> List[AgencyOut]:
         where = "WHERE status=?" if status != "all" else ""
         params = (status,) if status != "all" else ()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(f"SELECT * FROM agencies {where} ORDER BY updated_at DESC", params).fetchall()
         return [self._to_agency(r) for r in rows]
 
     def get_agency(self, agency_id: UUID) -> Optional[AgencyOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM agencies WHERE id=?", (str(agency_id),)).fetchone()
         return self._to_agency(row) if row else None
 
     def patch_agency(self, agency_id: UUID, payload: AgencyPatch) -> AgencyOut:
         patch = payload.model_dump(exclude_unset=True)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             existing = self._agency_or_404(conn, agency_id)
             if not patch:
                 return self._to_agency(existing)
@@ -441,7 +442,7 @@ class SqlitePlatformAdminStore:
                 "plan": patch.get("plan", existing["plan"]),
                 "notes": patch.get("notes", existing["notes"]),
                 "allow_client_invites": (
-                    (1 if patch["allow_client_invites"] else 0)
+                    bool(patch["allow_client_invites"])
                     if "allow_client_invites" in patch
                     else existing["allow_client_invites"]
                 ),
@@ -494,7 +495,7 @@ class SqlitePlatformAdminStore:
 
     def delete_agency(self, agency_id: UUID) -> None:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Keep the immutable-ledger retention check, binding cleanup and
             # agency deletion in one serialized write transaction. Otherwise a
             # new command could be queued after the check and turn the final
@@ -523,13 +524,7 @@ class SqlitePlatformAdminStore:
             conn.execute("DELETE FROM agency_invites WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_client_access WHERE agency_id=?", (str(agency_id),))
             conn.execute("DELETE FROM agency_members WHERE agency_id=?", (str(agency_id),))
-            binding_table = conn.execute(
-                """
-                SELECT 1 FROM sqlite_master
-                WHERE type='table' AND name='provider_account_credential_bindings'
-                """
-            ).fetchone()
-            if binding_table:
+            if table_exists(conn, "provider_account_credential_bindings"):
                 conn.execute(
                     """
                     DELETE FROM provider_account_credential_bindings
@@ -566,7 +561,7 @@ class SqlitePlatformAdminStore:
         actor_is_platform_admin: bool = False,
     ) -> AgencyMemberOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Serialize the owner-count check with the mutation. Without an
             # immediate write lock, two requests could both observe two owners
             # and remove/demote one each.
@@ -619,7 +614,7 @@ class SqlitePlatformAdminStore:
         return self._to_member(row)
 
     def list_members(self, agency_id: UUID) -> List[AgencyMemberOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             rows = conn.execute(
                 "SELECT * FROM agency_members WHERE agency_id=? ORDER BY updated_at DESC",
@@ -629,7 +624,7 @@ class SqlitePlatformAdminStore:
 
     def assign_client(self, agency_id: UUID, payload: AgencyClientAccessCreate) -> AgencyClientAccessOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             client = conn.execute("SELECT id FROM clients WHERE id=?", (str(payload.client_id),)).fetchone()
             if not client:
@@ -663,7 +658,7 @@ class SqlitePlatformAdminStore:
         return self._to_client_access(row)
 
     def list_clients(self, agency_id: UUID) -> List[AgencyClientAccessOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             rows = conn.execute(
                 "SELECT * FROM agency_client_access WHERE agency_id=? ORDER BY updated_at DESC",
@@ -680,7 +675,7 @@ class SqlitePlatformAdminStore:
         token = secrets.token_urlsafe(32)
         token_hash = _token_hash(token)
         email = payload.email.strip().lower()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             conn.execute(
                 """
@@ -720,7 +715,7 @@ class SqlitePlatformAdminStore:
         if status != "all":
             where += " AND status=?"
             params.append(status)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             rows = conn.execute(
                 f"SELECT * FROM agency_invites {where} ORDER BY updated_at DESC",
@@ -730,7 +725,7 @@ class SqlitePlatformAdminStore:
 
     def revoke_invite(self, agency_id: UUID, invite_id: UUID) -> AgencyInviteOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
                 "SELECT * FROM agency_invites WHERE id=? AND agency_id=?",
@@ -759,7 +754,7 @@ class SqlitePlatformAdminStore:
         invited_by: Optional[UUID],
         frontend_base_url: str,
     ) -> AgencyInviteIssueResponse:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
                 "SELECT * FROM agency_invites WHERE id=? AND agency_id=?",
@@ -793,7 +788,7 @@ class SqlitePlatformAdminStore:
         actor_is_platform_admin: bool = False,
     ) -> AgencyMemberOut:
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
@@ -829,7 +824,7 @@ class SqlitePlatformAdminStore:
         actor_user_id: UUID,
         actor_is_platform_admin: bool = False,
     ) -> None:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
@@ -854,7 +849,7 @@ class SqlitePlatformAdminStore:
             conn.commit()
 
     def revoke_client(self, agency_id: UUID, access_id: UUID) -> None:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             self._agency_or_404(conn, agency_id)
             row = conn.execute(
                 "SELECT * FROM agency_client_access WHERE id=? AND agency_id=?",
@@ -881,7 +876,7 @@ class SqlitePlatformAdminStore:
         now = _utcnow()
         token_hash = _token_hash(payload.token.strip())
         created_user = False
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT * FROM agency_invites WHERE token_hash=?",
                 (token_hash,),
@@ -999,7 +994,7 @@ class SqlitePlatformAdminStore:
                 SessionIssueRequest(user_id=user.id, ttl_minutes=session_ttl_minutes)
             )
         except Exception as exc:
-            with sqlite_conn(self.db_path) as conn:
+            with runtime_conn(self.db_path) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     """

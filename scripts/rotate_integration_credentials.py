@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from fastapi import HTTPException
 
+from app.runtime_db import assert_postgres_schema_current, database_backend
 from app.services.credential_crypto import (
     CredentialCryptoError,
     CredentialEncryptionConfigurationError,
@@ -120,28 +121,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    raw_path = str(args.db_path or "").strip()
-    if not raw_path:
-        _safe_error("credential_rotation_db_missing", "An existing database path is required.")
-        return 2
-    db_path = Path(raw_path).expanduser()
-    try:
-        resolved = db_path.resolve(strict=True)
-    except OSError:
-        _safe_error("credential_rotation_db_missing", "The selected database does not exist.")
-        return 2
-    if not resolved.is_file():
-        _safe_error("credential_rotation_db_invalid", "The selected database path is not a file.")
-        return 2
+    backend = database_backend()
+    resolved: Optional[Path] = None
+    if backend == "sqlite":
+        raw_path = str(args.db_path or "").strip()
+        if not raw_path:
+            _safe_error("credential_rotation_db_missing", "An existing database path is required.")
+            return 2
+        db_path = Path(raw_path).expanduser()
+        try:
+            resolved = db_path.resolve(strict=True)
+        except OSError:
+            _safe_error("credential_rotation_db_missing", "The selected database does not exist.")
+            return 2
+        if not resolved.is_file():
+            _safe_error("credential_rotation_db_invalid", "The selected database path is not a file.")
+            return 2
 
     try:
         keyring = CredentialKeyring.from_env()
-        if args.apply:
+        if backend == "postgresql":
+            # Never let a typoed or unmigrated DATABASE_URL look like a
+            # successful zero-row rotation. Dry-run and apply must inspect the
+            # same database through the same runtime store.
+            assert_postgres_schema_current()
+            store = SqliteIntegrationCredentialStore(str(args.db_path or ""), keyring=keyring)
+            result = store.rotate_credentials(dry_run=not args.apply)
+        elif args.apply:
             # Applying may initialize the current SQLite schema, so it remains
             # strictly separated from the default read-only audit path.
+            assert resolved is not None
             store = SqliteIntegrationCredentialStore(str(resolved), keyring=keyring)
             result = store.rotate_credentials(dry_run=False)
         else:
+            assert resolved is not None
             result = _read_only_rotation_plan(resolved, keyring=keyring)
     except CredentialEncryptionConfigurationError:
         _safe_error(

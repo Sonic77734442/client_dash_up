@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.services.meta_version import meta_graph_api_version
 
 
@@ -73,7 +73,7 @@ class OAuthProviderAdapter(Protocol):
 class SqliteOAuthStateStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     def create_state(
         self,
@@ -86,7 +86,7 @@ class SqliteOAuthStateStore:
         now = _utcnow()
         state = secrets.token_urlsafe(32)
         expires_at = now + timedelta(minutes=ttl_minutes)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO oauth_states
@@ -115,7 +115,7 @@ class SqliteOAuthStateStore:
 
     def consume_state(self, provider: str, state: str, nonce: str) -> OAuthState:
         now = _utcnow()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # Claim the state under a write lock. A plain SELECT followed by an
             # unconditional UPDATE lets two concurrent callbacks both observe
             # used_at=NULL and replay the same OAuth state.

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.db import SqliteProviderBudgetCommandStore
+from app.runtime_db import assert_postgres_schema_current, database_backend
 
 
 CONFIRMATION_PHRASE = "ALL API INSTANCES ARE STOPPED"
@@ -51,7 +52,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--db-path",
         default=os.getenv("BUDGETS_DB_PATH", ""),
-        help="Existing SQLite database path (defaults to BUDGETS_DB_PATH)",
+        help="Existing SQLite path; ignored when DATABASE_BACKEND=postgresql",
     )
     parser.add_argument(
         "--apply",
@@ -66,18 +67,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    raw_path = str(args.db_path or "").strip()
-    if not raw_path:
-        _result(ok=False, code="provider_budget_recovery_db_missing", message="An existing database path is required.")
-        return 2
-    try:
-        db_path = Path(raw_path).expanduser().resolve(strict=True)
-    except OSError:
-        _result(ok=False, code="provider_budget_recovery_db_missing", message="The selected database does not exist.")
-        return 2
-    if not db_path.is_file():
-        _result(ok=False, code="provider_budget_recovery_db_invalid", message="The selected database path is not a file.")
-        return 2
+    backend = database_backend()
+    db_path: Optional[Path] = None
+    if backend == "sqlite":
+        raw_path = str(args.db_path or "").strip()
+        if not raw_path:
+            _result(ok=False, code="provider_budget_recovery_db_missing", message="An existing database path is required.")
+            return 2
+        try:
+            db_path = Path(raw_path).expanduser().resolve(strict=True)
+        except OSError:
+            _result(ok=False, code="provider_budget_recovery_db_missing", message="The selected database does not exist.")
+            return 2
+        if not db_path.is_file():
+            _result(ok=False, code="provider_budget_recovery_db_invalid", message="The selected database path is not a file.")
+            return 2
     if args.apply and args.confirm_all_api_stopped != CONFIRMATION_PHRASE:
         _result(
             ok=False,
@@ -87,9 +91,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     try:
-        before = _read_only_in_progress_count(db_path)
+        if backend == "postgresql":
+            # A wrong or unmigrated DATABASE_URL must never be reported as a
+            # successful zero-row recovery audit.
+            assert_postgres_schema_current()
+            store = SqliteProviderBudgetCommandStore(str(args.db_path or ""))
+            before = store.count_interrupted_in_progress()
+        else:
+            assert db_path is not None
+            before = _read_only_in_progress_count(db_path)
+            store = None
         if args.apply:
-            store = SqliteProviderBudgetCommandStore(str(db_path))
+            if store is None:
+                assert db_path is not None
+                store = SqliteProviderBudgetCommandStore(str(db_path))
             recovered = store.recover_interrupted_in_progress_offline(
                 all_api_instances_stopped=True
             )

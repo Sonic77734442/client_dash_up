@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import (
     BudgetCreate,
     BudgetHistoryOut,
@@ -98,7 +98,7 @@ def _date_overlap(start_a: date, end_a: date, start_b: date, end_b: date) -> boo
 class SqliteBudgetStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        init_sqlite(self.db_path)
+        init_runtime_database(self.db_path)
 
     def _to_budget(self, row) -> BudgetOut:
         return BudgetOut(
@@ -282,7 +282,7 @@ class SqliteBudgetStore:
 
         now = _utcnow().isoformat()
         budget_id = str(uuid4())
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._assert_no_overlap(
                 conn=conn,
@@ -358,19 +358,19 @@ class SqliteBudgetStore:
             params.append(date_to.isoformat())
 
         q = f"SELECT * FROM budgets WHERE {' AND '.join(where)} ORDER BY updated_at DESC"
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(q, params).fetchall()
         return [self._to_budget(r) for r in rows]
 
     def get(self, budget_id: UUID) -> Optional[BudgetOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(budget_id),)).fetchone()
         return self._to_budget(row) if row else None
 
     def patch(self, budget_id: UUID, payload: BudgetPatch) -> BudgetOut:
         patch = payload.model_dump(exclude_unset=True)
         changed_by = patch.pop("changed_by", None)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             # The read, merge, validation, write, version bump, and history row
             # are one serialized operation. Reading before this lock allows two
             # concurrent partial patches to overwrite each other with the same
@@ -503,7 +503,7 @@ class SqliteBudgetStore:
             raise HTTPException(status_code=404, detail="Budget not found")
 
         now = _utcnow().isoformat()
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute(
                 "UPDATE budgets SET status='archived', updated_at=? WHERE id=?",
                 (now, str(budget_id)),
@@ -517,7 +517,7 @@ class SqliteBudgetStore:
         if transfer_amount <= 0:
             raise HTTPException(status_code=400, detail="Transfer amount must be positive")
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             source_row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(source_budget_id),)).fetchone()
             if not source_row:
@@ -767,7 +767,7 @@ class SqliteBudgetStore:
             )
 
     def history(self, budget_id: UUID) -> List[BudgetHistoryOut]:
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT * FROM budget_history WHERE budget_id=? ORDER BY changed_at DESC, id DESC",
                 (str(budget_id),),
@@ -793,7 +793,7 @@ class SqliteBudgetStore:
         else:
             where_sql = "(source_budget_id=? OR target_budget_id=?)"
             params = [str(budget_id), str(budget_id)]
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -819,7 +819,7 @@ class SqliteBudgetStore:
         if not client_id:
             return None
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             if account_id:
                 row = conn.execute(
                     """

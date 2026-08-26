@@ -4,10 +4,15 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env.prod
+      - ${PROD_ENV_FILE:-.env.prod}
+    environment:
+      # This value is needed only for Compose interpolation and Grafana. Keep
+      # the Grafana credential out of the API container even though both use
+      # the same operator-managed env file.
+      GRAFANA_ADMIN_PASSWORD: ""
     restart: unless-stopped
     ports:
-      - "${API_BIND_PORT:-8000}:8000"
+      - "${API_BIND_HOST:-127.0.0.1}:${API_BIND_PORT:-8000}:8000"
     volumes:
       - ./storage:/var/data
       - ./accounts.json:/app/accounts.json:ro
@@ -28,7 +33,7 @@ services:
       API_UPSTREAM_BASE: http://api:8000
     restart: unless-stopped
     ports:
-      - "${WEB_BIND_PORT:-5173}:5173"
+      - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_BIND_PORT:-5173}:5173"
     depends_on:
       api:
         condition: service_healthy
@@ -37,7 +42,7 @@ services:
     image: prom/prometheus:v2.54.1
     restart: unless-stopped
     ports:
-      - "${PROM_BIND_PORT:-9090}:9090"
+      - "${PROM_BIND_HOST:-127.0.0.1}:${PROM_BIND_PORT:-9090}:9090"
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -51,7 +56,7 @@ services:
     image: prom/alertmanager:v0.27.0
     restart: unless-stopped
     ports:
-      - "${ALERTMGR_BIND_PORT:-9093}:9093"
+      - "${ALERTMGR_BIND_HOST:-127.0.0.1}:${ALERTMGR_BIND_PORT:-9093}:9093"
     volumes:
       - ./deploy/prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
 
@@ -59,10 +64,10 @@ services:
     image: grafana/grafana:11.2.0
     restart: unless-stopped
     ports:
-      - "${GRAFANA_BIND_PORT:-3001}:3000"
+      - "${GRAFANA_BIND_HOST:-127.0.0.1}:${GRAFANA_BIND_PORT:-3001}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in the Compose env file}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana_data:/var/lib/grafana

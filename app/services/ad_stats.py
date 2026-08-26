@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from app.db import init_sqlite, sqlite_conn
+from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AdAccountOut, AdStatOut, AdStatsIngestRequest, AdStatWrite
 from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
 
@@ -206,7 +206,7 @@ class SqliteAdStatsStore:
     def __init__(self, db_path: str, ad_account_store: AdAccountStore):
         self.db_path = db_path
         self.ad_account_store = ad_account_store
-        init_sqlite(db_path)
+        init_runtime_database(db_path)
 
     @staticmethod
     def _to_stat(row) -> AdStatOut:
@@ -237,7 +237,7 @@ class SqliteAdStatsStore:
         updated = 0
         now = _utcnow().isoformat()
         request_hash = self._payload_hash(payload)
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             if idempotency_key:
                 prev = conn.execute(
@@ -357,7 +357,7 @@ class SqliteAdStatsStore:
             where.append("s.date<=?")
             params.append(date_to.isoformat())
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             rows = conn.execute(
                 f"""
                 SELECT s.*
@@ -404,7 +404,7 @@ class SqliteAdStatsStore:
         by_client: Dict[str, Dict[str, object]] = {}
         by_account: Dict[str, Dict[str, object]] = {}
 
-        with sqlite_conn(self.db_path) as conn:
+        with runtime_conn(self.db_path) as conn:
             acc_rows = conn.execute("SELECT id, client_id, name FROM ad_accounts").fetchall()
             acc_map = {r["id"]: {"client_id": r["client_id"], "name": r["name"]} for r in acc_rows}
 

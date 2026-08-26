@@ -1,9 +1,12 @@
-.venv
+.venv*
 .pytest_cache
 __pycache__
 *.pyc
+.env
+.env.*
+!.env.example
+accounts.json
 storage
 backups
-frontend/node_modules
-frontend/.next
+frontend
 .git
