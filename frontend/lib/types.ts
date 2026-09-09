@@ -20,6 +20,7 @@ export type AccountBreakdown = {
   client_id: string;
   name: string;
   platform: string;
+  currency?: string | null;
   spend: number;
   impressions: number;
   clicks: number;
@@ -31,22 +32,26 @@ export type AccountBreakdown = {
 
 export type PlatformBreakdown = {
   platform: string;
-  spend: number;
+  currency?: string | null;
+  spend: number | null;
   impressions: number;
   clicks: number;
   conversions: number;
   ctr: number;
-  cpc: number;
-  cpm: number;
+  cpc: number | null;
+  cpm: number | null;
 };
 
 export type Overview = {
   range: { date_from: string; date_to: string; as_of_date: string; timezone_policy: string };
   scope: { client_id: string | null; account_id: string | null };
-  spend_summary: { spend: number; impressions: number; clicks: number; conversions: number; ctr: number; cpc: number; cpm: number };
+  spend_summary: { spend: number | null; currency?: string | null; impressions: number; clicks: number; conversions: number; ctr: number; cpc: number | null; cpm: number | null };
+  totals_by_currency?: Array<{ currency: string; spend: number }>;
   budget_summary: {
+    currency?: string | null;
+    unavailable_reason?: "currency_mismatch" | "mixed_currencies" | null;
     budget: number | null;
-    spend: number;
+    spend: number | null;
     remaining: number | null;
     usage_percent: number | null;
     expected_spend_to_date: number | null;
@@ -468,19 +473,20 @@ export type OperationalAction = {
 };
 
 export type AgencyOverview = {
-  totals?: { spend: number };
-  per_client: Array<{ client_id: string; spend: number }>;
-  per_account?: Array<{ account_id: string; client_id: string; spend: number }>;
+  totals?: { spend: number | null; currency?: string | null };
+  totals_by_currency?: Array<{ currency: string; spend: number }>;
+  per_client: Array<{ client_id: string; spend: number | null; currency?: string | null }>;
+  per_account?: Array<{ account_id: string; client_id: string; spend: number; currency?: string | null }>;
 };
 
 export type ClientOpsRow = {
   id: string;
   name: string;
   currency: string;
-  spend: number;
+  spend: number | null;
   budget: number;
   usage: number | null;
-  pace: "critical" | "warning" | "stable" | "no_budget";
+  pace: "critical" | "warning" | "stable" | "no_budget" | "unavailable";
   riskScore: number;
   hasAlerts: boolean;
   owner: string;

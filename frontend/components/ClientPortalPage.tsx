@@ -7,10 +7,12 @@ import { ProviderBudgetControl } from "./ProviderBudgetControl";
 import { TimelineChart } from "./TimelineChart";
 import { ToastHost } from "./ToastHost";
 import { useSession } from "../hooks/useSession";
+import { useScopeRequestGuard } from "../hooks/useScopeRequestGuard";
 import { useToast } from "../hooks/useToast";
-import { fetchJson, getQuery } from "../lib/api";
+import { ApiRequestError, fetchJson, getQuery } from "../lib/api";
 import { accountDataFreshness, aggregateAccountFreshness, dataFreshnessMeta, overviewDataFreshness } from "../lib/dataFreshness";
 import { normalizeOverviewPayload } from "../lib/analyticsPayload";
+import { budgetComparisonNote, formatCurrency } from "../lib/currency";
 import {
   hasOptionalStringFields,
   hasStringFields,
@@ -96,17 +98,8 @@ function isInsightItem(value: unknown): value is OperationalInsight {
   return hasStringFields(value, ["scope", "scope_id", "title", "reason", "action", "priority"]);
 }
 
-function fmtMoney(value: number | null | undefined, currency = "USD") {
-  const safeCurrency = /^[A-Z]{3}$/.test(currency) ? currency : "USD";
-  try {
-    return new Intl.NumberFormat("ru-RU", {
-      style: "currency",
-      currency: safeCurrency,
-      maximumFractionDigits: 0,
-    }).format(Number(value || 0));
-  } catch {
-    return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(Number(value || 0));
-  }
+function fmtMoney(value: number | null | undefined, currency: string | null = "USD") {
+  return formatCurrency(value, currency);
 }
 
 function fmtNum(value: number | null | undefined) {
@@ -183,7 +176,7 @@ function priorityMeta(priority: string) {
   return { label: "Наблюдение", tone: "good" as Tone, rank: 1 };
 }
 
-function insightCopy(insight: OperationalInsight, currency: string) {
+function insightCopy(insight: OperationalInsight, currency: string | null) {
   const metric = (key: string) => Number(insight.metrics?.[key] || 0);
   const platform = String(insight.metrics?.platform || "").toUpperCase();
 
@@ -296,6 +289,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   const [actions, setActions] = useState<OperationalAction[]>([]);
   const [stats, setStats] = useState<AdStat[]>([]);
   const [insights, setInsights] = useState<OperationalInsight[]>([]);
+  const beginScopedRequest = useScopeRequestGuard(
+    `${session.apiBase}:${session.token}:${selectedClientId}:${periodDays}`,
+  );
 
   const req = useCallback(
     <T,>(path: string, init?: RequestInit) => fetchJson<T>(session.apiBase, path, session.token, init),
@@ -308,9 +304,11 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   }, [session.apiBase, session.token]);
 
   const loadData = useCallback(async () => {
+    const isCurrentRequest = beginScopedRequest();
     setLoading(true);
     try {
       const context = await loadContext();
+      if (!isCurrentRequest()) return;
       if (!context?.valid) {
         setWarning("Сессия недействительна или истекла. Войдите снова.");
         return;
@@ -338,6 +336,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       setSoloClientMode(context.role === "solo_client");
 
       const clientPayload = await req<unknown>("/clients?status=active");
+      if (!isCurrentRequest()) return;
       const availableClients = normalizeListPayload(
         clientPayload,
         isClientItem,
@@ -382,6 +381,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       const nextStats = normalizeListPayload(statPayload, isAdStatItem, "статистики");
       const nextInsights = normalizeListPayload(insightPayload, isInsightItem, "рекомендаций");
 
+      if (!isCurrentRequest()) return;
       setOverview(nextOverview);
       setAccounts(nextAccounts);
       setBudgets(nextBudgets);
@@ -389,22 +389,32 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
       setStats(nextStats);
       setInsights(nextInsights);
       setWarning("");
-    } finally {
-      setLoading(false);
-    }
-  }, [loadContext, periodDays, req, selectedClientId]);
-
-  useEffect(() => {
-    if (!ready) return;
-    void loadData().catch((error) => {
-      const message = error instanceof Error ? error.message : "Не удалось загрузить кабинет.";
-      if (/unauthorized|401/i.test(message)) {
+    } catch (error) {
+      if (!isCurrentRequest()) return;
+      if (error instanceof ApiRequestError && error.status === 401) {
         setWarning("Сессия истекла. Перенаправляем на страницу входа…");
         window.location.replace("/login");
         return;
       }
-      setWarning(message);
-    });
+      setWarning(error instanceof Error ? error.message : "Не удалось загрузить кабинет.");
+    } finally {
+      if (isCurrentRequest()) setLoading(false);
+    }
+  }, [beginScopedRequest, loadContext, periodDays, req, selectedClientId]);
+
+  useEffect(() => {
+    setOverview(null);
+    setAccounts([]);
+    setBudgets([]);
+    setActions([]);
+    setStats([]);
+    setInsights([]);
+    setWarning("");
+  }, [selectedClientId, periodDays, session.apiBase, session.token]);
+
+  useEffect(() => {
+    if (!ready) return;
+    void loadData();
   }, [ready, loadData]);
 
   useEffect(() => {
@@ -423,7 +433,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     [clients, selectedClientId]
   );
   const currency =
-    selectedClient?.default_currency ||
+    overview?.spend_summary.currency === null ? null : overview?.spend_summary.currency || selectedClient?.default_currency ||
     budgets.find((budget) => budget.currency)?.currency ||
     accounts.find((account) => account.currency)?.currency ||
     "USD";
@@ -480,22 +490,26 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
   );
 
   const conversionsByPlatform = useMemo(() => {
-    const rows = new Map<string, { spend: number; conversions: number }>();
+    const rows = new Map<string, { spend: number; conversions: number; currencies: Set<string> }>();
     for (const stat of stats) {
-      const current = rows.get(stat.platform) || { spend: 0, conversions: 0 };
+      const current = rows.get(stat.platform) || { spend: 0, conversions: 0, currencies: new Set<string>() };
       current.spend += Number(stat.spend || 0);
       current.conversions += Number(stat.conversions || 0);
+      const accountCurrency = accounts.find((account) => account.id === stat.ad_account_id)?.currency || currency;
+      current.currencies.add(accountCurrency || "");
       rows.set(stat.platform, current);
     }
     return [...rows.entries()]
       .map(([platform, values]) => ({
         platform,
-        ...values,
-        cpl: values.conversions > 0 ? values.spend / values.conversions : null,
+        conversions: values.conversions,
+        currency: values.currencies.size === 1 ? [...values.currencies][0] || null : null,
+        spend: values.currencies.size === 1 && !values.currencies.has("") ? values.spend : null,
+        cpl: values.currencies.size === 1 && !values.currencies.has("") && values.conversions > 0 ? values.spend / values.conversions : null,
       }))
       .filter((row) => row.conversions > 0)
       .sort((a, b) => b.conversions - a.conversions);
-  }, [stats]);
+  }, [accounts, currency, stats]);
 
   const platformRows = overview?.breakdowns?.platforms || [];
   const accountRows = overview?.breakdowns?.accounts || [];
@@ -506,7 +520,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     accountRows.find((row) => row.account_id === selectedAccountId && row.platform === activePlatform) || null;
   const advertisingScope = selectedAccountRow || activePlatformRow;
   const advertisingCpl =
-    advertisingScope && advertisingScope.conversions > 0
+    advertisingScope && advertisingScope.spend != null && advertisingScope.conversions > 0
       ? advertisingScope.spend / advertisingScope.conversions
       : null;
 
@@ -533,13 +547,14 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     actions.find((action) => actionStatus(action.status).tone === "warn") || actions[0] || null;
   const dataState = overviewDataFreshness(overview);
   const dataMeta = dataFreshnessMeta(dataState);
+  const budgetNote = budgetComparisonNote(overview?.budget_summary.unavailable_reason);
   const rawPace = paceMeta(overview?.budget_summary?.pace_status);
-  const pace = dataState === "current"
+  const pace = budgetNote ? { label: "Сравнение недоступно", description: budgetNote, tone: "" as Tone } : dataState === "current"
     ? rawPace
     : { label: dataMeta.label, description: dataMeta.description, tone: dataMeta.tone as Tone };
-  const totalSpend = Number(overview?.spend_summary?.spend || 0);
+  const totalSpend = overview?.spend_summary?.spend ?? null;
   const totalLeads = Number(overview?.spend_summary?.conversions || 0);
-  const totalCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
+  const totalCpl = totalSpend != null && totalLeads > 0 ? totalSpend / totalLeads : null;
   const rawBudgetUsage = overview?.budget_summary?.usage_percent;
   const budgetUsage =
     rawBudgetUsage == null || !Number.isFinite(Number(rawBudgetUsage))
@@ -549,7 +564,8 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
     ? `${fmtShortDate(overview.range.date_from)} — ${fmtShortDate(overview.range.date_to)}`
     : `${periodDays} дней`;
 
-  const summaryText = dataState !== "current"
+  const summaryText = totalSpend == null && overview ? budgetNote || "Общая сумма расхода недоступна для выбранных валют."
+    : dataState !== "current"
     ? dataMeta.description
     : totalSpend
     ? `За ${periodLabel} рекламные площадки зафиксировали ${fmtNum(totalLeads)} конверсий при расходе ${fmtMoney(
@@ -681,6 +697,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
           </section>
 
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
+          {budgetNote ? <div className="warning">{budgetNote}</div> : null}
           {overview && dataState !== "current" ? (
             <div className="warning">{dataMeta.description}</div>
           ) : null}
@@ -693,7 +710,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   value={fmtMoney(totalSpend, currency)}
                   note={
                     budgetUsage == null
-                      ? "Бюджетный план не задан"
+                      ? budgetNote || "Бюджетный план не задан"
                       : `${budgetUsage.toFixed(1).replace(".", ",")}% доступного бюджета`
                   }
                   tone={pace.tone}
@@ -732,6 +749,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   <div className="chart">
                     <TimelineChart
                       points={timelinePoints}
+                      currency={currency}
                       budgetCap={overview?.budget_summary?.budget}
                       asOfDate={overview?.range?.as_of_date}
                       actions={timelineActions}
@@ -780,7 +798,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                             <div className="panel-subtitle">
                               {!relatedAccounts.length
                                 ? "Не подключено"
-                                : `${platformDataMeta.label} · ${relatedAccounts.length} аккаунт(а) · ${fmtMoney(row?.spend || 0, currency)} · ${fmtNum(
+                                : `${platformDataMeta.label} · ${relatedAccounts.length} аккаунт(а) · ${fmtMoney(row?.spend, row?.currency === undefined ? currency : row.currency)} · ${fmtNum(
                                     row?.conversions || 0
                                   )} конверсий`}
                             </div>
@@ -894,7 +912,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
               <section className="kpi-grid">
                 <MetricCard
                   title="Расход"
-                  value={fmtMoney(advertisingScope?.spend || 0, currency)}
+                  value={fmtMoney(advertisingScope?.spend, advertisingScope?.currency === undefined ? currency : advertisingScope.currency)}
                   note={selectedAccountRow ? "Выбранный рекламный аккаунт" : platformLabel(activePlatform)}
                 />
                 <MetricCard
@@ -941,15 +959,15 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                         {platformAccounts.map((account) => {
                           const metric = accountRows.find((row) => row.account_id === account.id);
                           const status = accountStatus(account);
-                          const cpl = metric && metric.conversions > 0 ? metric.spend / metric.conversions : null;
+                          const cpl = metric && metric.spend != null && metric.conversions > 0 ? metric.spend / metric.conversions : null;
                           const selected = selectedAccountId === account.id;
                           return (
                             <tr key={account.id}>
                               <td>{account.name || account.external_account_id}</td>
                               <td><span className={`badge ${status.tone}`}>{status.label}</span></td>
-                              <td>{metric ? fmtMoney(metric.spend, currency) : "Нет данных"}</td>
+                              <td>{metric ? fmtMoney(metric.spend, metric.currency || account.currency || currency) : "Нет данных"}</td>
                               <td>{metric ? fmtNum(metric.conversions) : "Нет данных"}</td>
-                              <td>{cpl == null ? "Нет данных" : fmtMoney(cpl, currency)}</td>
+                              <td>{cpl == null ? "Нет данных" : fmtMoney(cpl, metric?.currency || account.currency || currency)}</td>
                               <td>{metric ? fmtRate(metric.ctr) : "Нет данных"}</td>
                               <td>
                                 <button
@@ -1046,9 +1064,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                       {conversionsByPlatform.map((row) => (
                         <tr key={row.platform}>
                           <td>{platformLabel(row.platform)}</td>
-                          <td>{fmtMoney(row.spend, currency)}</td>
+                          <td>{fmtMoney(row.spend, row.currency)}</td>
                           <td>{fmtNum(row.conversions)}</td>
-                          <td>{row.cpl == null ? "Нет данных" : fmtMoney(row.cpl, currency)}</td>
+                          <td>{row.cpl == null ? "Нет данных" : fmtMoney(row.cpl, row.currency)}</td>
                           <td>Нет данных</td>
                         </tr>
                       ))}
@@ -1235,9 +1253,9 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                             <tr key={account.account_id}>
                               <td>{account.name}</td>
                               <td>{platformLabel(account.platform)}</td>
-                              <td>{fmtMoney(account.spend, currency)}</td>
+                              <td>{fmtMoney(account.spend, account.currency || accounts.find((item) => item.id === account.account_id)?.currency || currency)}</td>
                               <td>{fmtNum(account.conversions)}</td>
-                              <td>{cpl == null ? "Нет данных" : fmtMoney(cpl, currency)}</td>
+                              <td>{cpl == null ? "Нет данных" : fmtMoney(cpl, account.currency || accounts.find((item) => item.id === account.account_id)?.currency || currency)}</td>
                               <td>{fmtRate(account.ctr)}</td>
                             </tr>
                           );
@@ -1284,7 +1302,7 @@ export function ClientPortalPage({ activeTab }: { activeTab: ClientPortalTab }) 
                   }
                   note="Доступный бюджет выбранного периода"
                 />
-                <MetricCard title="Расход" value={fmtMoney(overview?.budget_summary?.spend || 0, currency)} note={pace.label} tone={pace.tone} />
+                <MetricCard title="Расход" value={fmtMoney(overview?.budget_summary?.spend, currency)} note={budgetNote || pace.label} tone={pace.tone} />
                 <MetricCard
                   title="Остаток"
                   value={

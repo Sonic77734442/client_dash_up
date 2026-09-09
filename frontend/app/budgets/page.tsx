@@ -10,6 +10,7 @@ import { useSession } from "../../hooks/useSession";
 import { useScopeRequestGuard } from "../../hooks/useScopeRequestGuard";
 import { useToast } from "../../hooks/useToast";
 import { fetchJson, getQuery } from "../../lib/api";
+import { budgetPace } from "../../lib/budgetPacing";
 import { AdAccount, AdStat, Budget, Client } from "../../lib/types";
 
 type StatusFilter = "active" | "archived" | "all";
@@ -94,10 +95,10 @@ function rangeFromPreset(preset: RangePreset) {
   const to = new Date();
   const from = new Date(to);
   if (preset === "qtd") {
-    const quarterStartMonth = Math.floor(to.getMonth() / 3) * 3;
-    from.setMonth(quarterStartMonth, 1);
+    const quarterStartMonth = Math.floor(to.getUTCMonth() / 3) * 3;
+    from.setUTCMonth(quarterStartMonth, 1);
   } else {
-    from.setDate(from.getDate() - (Number(preset) - 1));
+    from.setUTCDate(from.getUTCDate() - (Number(preset) - 1));
   }
   const fmt = (d: Date) => d.toISOString().slice(0, 10);
   return { date_from: fmt(from), date_to: fmt(to) };
@@ -232,7 +233,7 @@ export default function BudgetsPage() {
     });
     const [c, a, b, statPayload] = await Promise.all([
       req<{ items: Client[] }>("/clients?status=active"),
-      req<{ items: AdAccount[] }>("/ad-accounts?status=active"),
+      req<{ items: AdAccount[] }>("/ad-accounts?status=all"),
       req<{ items: Budget[] }>(`/budgets${budgetQuery}`),
       req<{ items: AdStat[] }>(`/ad-stats${statsQuery}`),
     ]);
@@ -307,13 +308,15 @@ export default function BudgetsPage() {
         const account = accountMap.get(statAccountId);
         if (!account || account.client_id !== b.client_id) return sum;
         if (b.scope === "account" && statAccountId !== String(b.account_id || "")) return sum;
-        if (stat.date < effectiveFrom || stat.date > effectiveTo) return sum;
+        if (stat.date < effectiveFrom || stat.date > effectiveTo || stat.date > todayIso()) return sum;
         return sum + Number(stat.spend || 0);
       }, 0);
       const budget = Number(b.amount || 0);
       const usagePercent = budget > 0 ? (spend / budget) * 100 : null;
-      const pace: BudgetRow["pace"] =
-        usagePercent == null ? "unknown" : usagePercent >= 100 ? "overspending" : usagePercent < 45 ? "underspending" : "on_track";
+      const pace = budgetPace({
+        spend, amount: budget, start: b.start_date, end: b.end_date,
+        rangeFrom: selectedRange.date_from, rangeTo: selectedRange.date_to, asOf: todayIso(),
+      });
       return {
         ...b,
         resolvedClientName: clientMap.get(b.client_id) || b.client_id,
@@ -676,7 +679,7 @@ export default function BudgetsPage() {
   }
 
   const accountsForClient = useMemo(
-    () => accounts.filter((a) => a.client_id === createForm.client_id),
+    () => accounts.filter((a) => a.client_id === createForm.client_id && a.status === "active"),
     [accounts, createForm.client_id]
   );
   const transferAccountOptions = useMemo(() => {

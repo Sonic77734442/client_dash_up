@@ -26,6 +26,7 @@ const paceLabels: Record<ClientOpsRow["pace"], string> = {
   warning: "Требует внимания",
   stable: "В норме",
   no_budget: "Нет бюджета",
+  unavailable: "Сравнение недоступно",
 };
 
 function actionLabel(value: string | null | undefined) {
@@ -93,7 +94,7 @@ export function ClientOperationsView({
   const paceDelta = usageRows.reduce((s, x) => s + (Number(x.usage || 0) - 80), 0) / Math.max(1, usageRows.length);
   const rowCurrencies = new Set(rows.map((row) => row.currency));
   const totalSpendValue =
-    rowCurrencies.size === 1
+    rows.some((row) => row.spend == null) ? "Разные валюты" : rowCurrencies.size === 1
       ? fmtMoney(totalSpend, [...rowCurrencies][0])
       : rowCurrencies.size > 1
       ? "Разные валюты"
@@ -205,14 +206,14 @@ export function ClientOperationsView({
                         <div className="client-id">Код: {r.id.slice(0, 8)}</div>
                       </div>
                     </td>
-                    <td>{fmtMoney(r.spend, r.currency)}</td>
+                    <td>{r.spend == null ? "Разные валюты" : fmtMoney(r.spend, r.currency)}</td>
                     <td>{r.budget ? fmtMoney(r.budget, r.currency) : "—"}</td>
                     <td>
                       <div className={`usage-bar ${usageTone}`}><div style={{ width: `${usage == null ? 0 : Math.min(100, usage)}%` }}></div></div>
                       {usage == null ? "—" : `${usage.toFixed(1)}%`}
                     </td>
-                    <td><span className={`badge ${r.pace === "critical" ? "bad" : r.pace === "warning" || r.pace === "no_budget" ? "warn" : "good"}`}>{paceLabels[r.pace]}</span></td>
-                    <td><span className={`risk-score ${riskTone}`}>{String(r.riskScore).padStart(2, "0")}</span></td>
+                    <td><span className={`badge ${r.pace === "critical" ? "bad" : r.pace === "warning" || r.pace === "no_budget" ? "warn" : r.pace === "unavailable" ? "" : "good"}`}>{paceLabels[r.pace]}</span></td>
+                    <td><span className={`risk-score ${riskTone}`}>{r.spend == null ? "—" : String(r.riskScore).padStart(2, "0")}</span></td>
                     <td>{lastActionText}</td>
                     <td><span className="owner-pill">{r.owner}</span></td>
                     <td><button className="mini-btn open-client-btn" onClick={() => onOpenClient(r.id)}>Открыть</button></td>

@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AdAccountOut, AdStatOut, AdStatsIngestRequest, AdStatWrite
 from app.services.ad_accounts import AdAccountStore, active_assignment_conflict_ids
+from app.services.metric_aggregation import aggregate_metric_rows
 
 
 getcontext().prec = 28
@@ -176,6 +177,22 @@ def _accounts_for_scope(
 
     conflict_ids = active_assignment_conflict_ids(ad_account_store)
     return [account for account in accounts if account.id not in conflict_ids]
+
+
+def _empty_scope_currency(
+    ad_account_store: AdAccountStore,
+    scope_accounts: List[AdAccountOut],
+    client_id: Optional[UUID],
+) -> Optional[str]:
+    currencies = {account.currency for account in scope_accounts}
+    if len(currencies) == 1:
+        return next(iter(currencies))
+    if not scope_accounts and client_id:
+        client_store = getattr(ad_account_store, "client_store", None)
+        client = client_store.get(client_id) if client_store is not None else None
+        if client is not None:
+            return client.default_currency
+    return None
 
 
 class AdStatsStore(Protocol):
@@ -395,112 +412,32 @@ class SqliteAdStatsStore:
             platform=platform,
         )
 
-        total_spend = Decimal("0")
-        total_impr = 0
-        total_clicks = 0
-        total_conv = Decimal("0")
-
-        by_platform: Dict[str, Dict[str, object]] = {}
-        by_client: Dict[str, Dict[str, object]] = {}
-        by_account: Dict[str, Dict[str, object]] = {}
-
-        with runtime_conn(self.db_path) as conn:
-            acc_rows = conn.execute("SELECT id, client_id, name FROM ad_accounts").fetchall()
-            acc_map = {r["id"]: {"client_id": r["client_id"], "name": r["name"]} for r in acc_rows}
-
-        for r in rows:
-            spend = _q(_to_decimal(r.spend))
-            conv = _q(_to_decimal(r.conversions or 0))
-            total_spend += spend
-            total_impr += int(r.impressions)
-            total_clicks += int(r.clicks)
-            total_conv += conv
-
-            p = r.platform
-            pb = by_platform.setdefault(p, {"platform": p, "spend": Decimal("0"), "impressions": 0, "clicks": 0, "conversions": Decimal("0")})
-            pb["spend"] += spend
-            pb["impressions"] += int(r.impressions)
-            pb["clicks"] += int(r.clicks)
-            pb["conversions"] += conv
-
-            a_id = str(r.ad_account_id)
-            acc_info = acc_map.get(a_id, {})
-            cb_key = str(acc_info.get("client_id") or "")
-            ab = by_account.setdefault(
-                a_id,
-                {
-                    "account_id": a_id,
-                    "client_id": cb_key or None,
-                    "name": acc_info.get("name"),
-                    "platform": r.platform,
-                    "spend": Decimal("0"),
-                    "impressions": 0,
-                    "clicks": 0,
-                    "conversions": Decimal("0"),
-                },
-            )
-            ab["spend"] += spend
-            ab["impressions"] += int(r.impressions)
-            ab["clicks"] += int(r.clicks)
-            ab["conversions"] += conv
-
-            if cb_key:
-                cb = by_client.setdefault(
-                    cb_key,
-                    {"client_id": cb_key, "spend": Decimal("0"), "impressions": 0, "clicks": 0, "conversions": Decimal("0")},
-                )
-                cb["spend"] += spend
-                cb["impressions"] += int(r.impressions)
-                cb["clicks"] += int(r.clicks)
-                cb["conversions"] += conv
-
-        def _ratio(n: Decimal, d: Decimal) -> Decimal:
-            return _q((n / d) if d > 0 else Decimal("0"))
-
-        ctr = _ratio(Decimal(total_clicks), Decimal(total_impr))
-        cpc = _ratio(total_spend, Decimal(total_clicks))
-        cpm = _ratio(total_spend * Decimal("1000"), Decimal(total_impr))
-
-        def _pack(bucket: Dict[str, object]) -> Dict[str, object]:
-            s = _q(_to_decimal(bucket["spend"]))
-            imp = int(bucket["impressions"])
-            clk = int(bucket["clicks"])
-            conv = _q(_to_decimal(bucket["conversions"]))
-            return {
-                **{k: v for k, v in bucket.items() if k not in {"spend", "impressions", "clicks", "conversions"}},
-                "spend": float(s),
-                "impressions": imp,
-                "clicks": clk,
-                "conversions": float(conv),
-                "ctr": float(_ratio(Decimal(clk), Decimal(imp))),
-                "cpc": float(_ratio(s, Decimal(clk))),
-                "cpm": float(_ratio(s * Decimal("1000"), Decimal(imp))),
-            }
-
+        account_map = {account.id: account for account in self.ad_account_store.list(status="all")}
+        metric_rows = []
+        for row in rows:
+            account = account_map.get(row.ad_account_id)
+            metric_rows.append({
+                "account_id": str(row.ad_account_id),
+                "client_id": str(account.client_id) if account else None,
+                "name": account.name if account else None,
+                "platform": row.platform,
+                "currency": account.currency if account else None,
+                "spend": row.spend,
+                "impressions": row.impressions,
+                "clicks": row.clicks,
+                "conversions": row.conversions,
+            })
+        result = aggregate_metric_rows(
+            metric_rows,
+            empty_currency=_empty_scope_currency(self.ad_account_store, scope_accounts, client_id),
+        )
         return {
             "data_quality": _data_quality(
                 rows=rows,
                 scope_account_ids={x.id for x in scope_accounts},
                 as_of_date=as_of_date,
             ),
-            "totals": {
-                "spend": _q(total_spend),
-                "impressions": total_impr,
-                "clicks": total_clicks,
-                "conversions": _q(total_conv),
-                "ctr": ctr,
-                "cpc": cpc,
-                "cpm": cpm,
-            },
-            "per_platform": [
-                _pack(by_platform[k]) for k in sorted(by_platform.keys())
-            ],
-            "per_client": [
-                _pack(by_client[k]) for k in sorted(by_client.keys())
-            ],
-            "per_account": [
-                _pack(by_account[k]) for k in sorted(by_account.keys())
-            ],
+            **result,
         }
 
 
@@ -624,97 +561,31 @@ class InMemoryAdStatsStore:
             platform=platform,
         )
 
-        total_spend = Decimal("0")
-        total_impr = 0
-        total_clicks = 0
-        total_conv = Decimal("0")
-
-        by_platform: Dict[str, Dict[str, object]] = {}
-        by_client: Dict[str, Dict[str, object]] = {}
-        by_account: Dict[str, Dict[str, object]] = {}
-
-        for r in rows:
-            acc = self.ad_account_store.get(r.ad_account_id)
-            client_key = str(acc.client_id) if acc else ""
-            spend = _q(_to_decimal(r.spend))
-            conv = _q(_to_decimal(r.conversions or 0))
-            total_spend += spend
-            total_impr += int(r.impressions)
-            total_clicks += int(r.clicks)
-            total_conv += conv
-
-            p = r.platform
-            pb = by_platform.setdefault(p, {"platform": p, "spend": Decimal("0"), "impressions": 0, "clicks": 0, "conversions": Decimal("0")})
-            pb["spend"] += spend
-            pb["impressions"] += int(r.impressions)
-            pb["clicks"] += int(r.clicks)
-            pb["conversions"] += conv
-
-            a_id = str(r.ad_account_id)
-            ab = by_account.setdefault(
-                a_id,
-                {
-                    "account_id": a_id,
-                    "client_id": client_key or None,
-                    "name": acc.name if acc else None,
-                    "platform": r.platform,
-                    "spend": Decimal("0"),
-                    "impressions": 0,
-                    "clicks": 0,
-                    "conversions": Decimal("0"),
-                },
-            )
-            ab["spend"] += spend
-            ab["impressions"] += int(r.impressions)
-            ab["clicks"] += int(r.clicks)
-            ab["conversions"] += conv
-
-            if client_key:
-                cb = by_client.setdefault(
-                    client_key,
-                    {"client_id": client_key, "spend": Decimal("0"), "impressions": 0, "clicks": 0, "conversions": Decimal("0")},
-                )
-                cb["spend"] += spend
-                cb["impressions"] += int(r.impressions)
-                cb["clicks"] += int(r.clicks)
-                cb["conversions"] += conv
-
-        def _ratio(n: Decimal, d: Decimal) -> Decimal:
-            return _q((n / d) if d > 0 else Decimal("0"))
-
-        def _pack(bucket: Dict[str, object]) -> Dict[str, object]:
-            s = _q(_to_decimal(bucket["spend"]))
-            imp = int(bucket["impressions"])
-            clk = int(bucket["clicks"])
-            conv = _q(_to_decimal(bucket["conversions"]))
-            return {
-                **{k: v for k, v in bucket.items() if k not in {"spend", "impressions", "clicks", "conversions"}},
-                "spend": float(s),
-                "impressions": imp,
-                "clicks": clk,
-                "conversions": float(conv),
-                "ctr": float(_ratio(Decimal(clk), Decimal(imp))),
-                "cpc": float(_ratio(s, Decimal(clk))),
-                "cpm": float(_ratio(s * Decimal("1000"), Decimal(imp))),
-            }
-
+        account_map = {account.id: account for account in self.ad_account_store.list(status="all")}
+        metric_rows = []
+        for row in rows:
+            account = account_map.get(row.ad_account_id)
+            metric_rows.append({
+                "account_id": str(row.ad_account_id),
+                "client_id": str(account.client_id) if account else None,
+                "name": account.name if account else None,
+                "platform": row.platform,
+                "currency": account.currency if account else None,
+                "spend": row.spend,
+                "impressions": row.impressions,
+                "clicks": row.clicks,
+                "conversions": row.conversions,
+            })
+        result = aggregate_metric_rows(
+            metric_rows,
+            empty_currency=_empty_scope_currency(self.ad_account_store, scope_accounts, client_id),
+        )
         return {
             "data_quality": _data_quality(
                 rows=rows,
                 scope_account_ids={x.id for x in scope_accounts},
                 as_of_date=as_of_date,
             ),
-            "totals": {
-                "spend": _q(total_spend),
-                "impressions": total_impr,
-                "clicks": total_clicks,
-                "conversions": _q(total_conv),
-                "ctr": _ratio(Decimal(total_clicks), Decimal(total_impr)),
-                "cpc": _ratio(_q(total_spend), Decimal(total_clicks)),
-                "cpm": _ratio(_q(total_spend) * Decimal("1000"), Decimal(total_impr)),
-            },
-            "per_platform": [_pack(by_platform[k]) for k in sorted(by_platform.keys())],
-            "per_client": [_pack(by_client[k]) for k in sorted(by_client.keys())],
-            "per_account": [_pack(by_account[k]) for k in sorted(by_account.keys())],
+            **result,
         }
 

@@ -9,6 +9,7 @@ from uuid import UUID
 from app.services.ad_accounts import AdAccountStore
 from app.services.ad_stats import AdStatsStore
 from app.services.budgets import BudgetStore, calculate_financial_metrics, utc_today_date
+from app.services.metric_aggregation import aggregate_metric_rows, public_metrics
 
 
 @dataclass
@@ -40,7 +41,8 @@ class OverviewService:
             as_of_date=effective_as_of_date,
         )
         totals = aggr["totals"]
-        spend = Decimal(str(totals["spend"]))
+        comparable_money = totals["spend"] is not None
+        spend = Decimal(str(totals["spend"])) if comparable_money else Decimal(0)
 
         budget = self.budget_store.resolve_effective(
             client_id=effective_client_id,
@@ -48,6 +50,15 @@ class OverviewService:
             period_start=date_from,
             period_end=date_to,
         )
+        budget_unavailable_reason = None
+        if not comparable_money:
+            budget_unavailable_reason = "mixed_currencies"
+        elif budget and totals["currency"] and budget.currency != totals["currency"]:
+            budget_unavailable_reason = "currency_mismatch"
+        if budget_unavailable_reason:
+            # Mixed or legacy mismatched currencies cannot be compared to a
+            # scalar budget even when only one account currently has stats.
+            budget = None
 
         metric = calculate_financial_metrics(
             spend=spend,
@@ -69,18 +80,13 @@ class OverviewService:
                 "account_id": str(account_id) if account_id else None,
             },
             "data_quality": aggr["data_quality"],
-            "spend_summary": {
-                "spend": float(totals["spend"]),
-                "impressions": int(totals["impressions"]),
-                "clicks": int(totals["clicks"]),
-                "conversions": float(totals["conversions"]),
-                "ctr": float(totals["ctr"]),
-                "cpc": float(totals["cpc"]),
-                "cpm": float(totals["cpm"]),
-            },
+            "spend_summary": public_metrics(totals),
+            "totals_by_currency": aggr["totals_by_currency"],
             "budget_summary": {
+                "currency": totals["currency"],
+                **({"unavailable_reason": budget_unavailable_reason} if budget_unavailable_reason else {}),
                 "budget": float(metric.budget) if metric.budget is not None else None,
-                "spend": float(metric.spend),
+                "spend": float(metric.spend) if comparable_money else None,
                 "remaining": float(metric.remaining) if metric.remaining is not None else None,
                 "usage_percent": float(metric.usage_percent) if metric.usage_percent is not None else None,
                 "expected_spend_to_date": float(metric.expected_spend_to_date) if metric.expected_spend_to_date is not None else None,
@@ -105,82 +111,16 @@ class OverviewService:
         allowed_client_ids: Optional[Set[UUID]] = None,
     ) -> Dict[str, object]:
         aggr = self.ad_stats_store.aggregate(date_from=date_from, date_to=date_to)
+        accounts = aggr["per_account"]
         if allowed_client_ids is not None:
             allowed = {str(x) for x in allowed_client_ids}
-            accounts = [x for x in aggr["per_account"] if x.get("client_id") in allowed]
-            by_platform: Dict[str, Dict[str, object]] = {}
-            by_client: Dict[str, Dict[str, object]] = {}
-            totals = {
-                "spend": Decimal("0"),
-                "impressions": 0,
-                "clicks": 0,
-                "conversions": Decimal("0"),
-            }
-
-            for row in accounts:
-                spend = Decimal(str(row["spend"]))
-                impressions = int(row["impressions"])
-                clicks = int(row["clicks"])
-                conversions = Decimal(str(row["conversions"]))
-                platform = str(row["platform"])
-                client_id = str(row["client_id"])
-                totals["spend"] += spend
-                totals["impressions"] += impressions
-                totals["clicks"] += clicks
-                totals["conversions"] += conversions
-
-                if platform not in by_platform:
-                    by_platform[platform] = {
-                        "platform": platform,
-                        "spend": 0.0,
-                        "impressions": 0,
-                        "clicks": 0,
-                        "conversions": 0.0,
-                    }
-                by_platform[platform]["spend"] += float(spend)
-                by_platform[platform]["impressions"] += impressions
-                by_platform[platform]["clicks"] += clicks
-                by_platform[platform]["conversions"] += float(conversions)
-
-                if client_id not in by_client:
-                    by_client[client_id] = {
-                        "client_id": client_id,
-                        "spend": 0.0,
-                        "impressions": 0,
-                        "clicks": 0,
-                        "conversions": 0.0,
-                    }
-                by_client[client_id]["spend"] += float(spend)
-                by_client[client_id]["impressions"] += impressions
-                by_client[client_id]["clicks"] += clicks
-                by_client[client_id]["conversions"] += float(conversions)
-
-            def _with_rates(bucket: Dict[str, object]) -> Dict[str, object]:
-                spend = Decimal(str(bucket["spend"]))
-                impressions = Decimal(str(bucket["impressions"]))
-                clicks = Decimal(str(bucket["clicks"]))
-                return {
-                    **bucket,
-                    "ctr": float((clicks / impressions) if impressions > 0 else Decimal("0")),
-                    "cpc": float((spend / clicks) if clicks > 0 else Decimal("0")),
-                    "cpm": float(((spend * Decimal("1000")) / impressions) if impressions > 0 else Decimal("0")),
-                }
-
-            totals["ctr"] = (Decimal(str(totals["clicks"])) / Decimal(str(totals["impressions"]))) if totals["impressions"] > 0 else Decimal("0")
-            totals["cpc"] = (Decimal(str(totals["spend"])) / Decimal(str(totals["clicks"]))) if totals["clicks"] > 0 else Decimal("0")
-            totals["cpm"] = (
-                (Decimal(str(totals["spend"])) * Decimal("1000")) / Decimal(str(totals["impressions"]))
-            ) if totals["impressions"] > 0 else Decimal("0")
-
-            per_platform = [_with_rates(x) for x in by_platform.values()]
-            per_client = [_with_rates(x) for x in by_client.values()]
-            per_account = accounts
-        else:
-            totals = aggr["totals"]
-            per_platform = aggr["per_platform"]
-            per_client = aggr["per_client"]
-            per_account = aggr["per_account"]
-
+            accounts = [row for row in accounts if row.get("client_id") in allowed]
+        # Reaggregate the filtered account rows, including currency groups, so
+        # other clients cannot affect either totals or the currency breakdown.
+        scoped = aggregate_metric_rows(
+            accounts,
+            empty_currency=aggr["totals"]["currency"] if allowed_client_ids is None else None,
+        )
         return {
             "range": {
                 "date_from": date_from.isoformat(),
@@ -188,16 +128,6 @@ class OverviewService:
                 "as_of_date": utc_today_date().isoformat(),
                 "timezone_policy": "UTC calendar dates, inclusive period day-count (start/end included).",
             },
-            "totals": {
-                "spend": float(totals["spend"]),
-                "impressions": int(totals["impressions"]),
-                "clicks": int(totals["clicks"]),
-                "conversions": float(totals["conversions"]),
-                "ctr": float(totals["ctr"]),
-                "cpc": float(totals["cpc"]),
-                "cpm": float(totals["cpm"]),
-            },
-            "per_platform": per_platform,
-            "per_client": per_client,
-            "per_account": per_account,
+            **scoped,
+            "totals": public_metrics(scoped["totals"]),
         }

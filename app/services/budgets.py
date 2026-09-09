@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
@@ -95,6 +96,21 @@ def _date_overlap(start_a: date, end_a: date, start_b: date, end_b: date) -> boo
     return start_a <= end_b and end_a >= start_b
 
 
+@contextmanager
+def _budget_write_conn(db_path: str):
+    try:
+        with runtime_conn(db_path) as conn:
+            yield conn
+    except Exception as exc:
+        # The database remains the final overlap guard, including writes from
+        # other processes. Only map our known constraints, not unrelated errors.
+        if getattr(exc, "sqlstate", None) == "23P01" and getattr(
+            getattr(exc, "diag", None), "constraint_name", None
+        ) in {"budgets_active_client_overlap_excl", "budgets_active_account_overlap_excl"}:
+            raise HTTPException(status_code=409, detail="Active budget overlap for this scope") from exc
+        raise
+
+
 class SqliteBudgetStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -151,7 +167,7 @@ class SqliteBudgetStore:
         end_date: date,
         exclude_budget_id: Optional[UUID] = None,
     ) -> None:
-        params: List[object] = [start_date.isoformat(), end_date.isoformat()]
+        params: List[object] = [end_date.isoformat(), start_date.isoformat()]
         exclude_sql = ""
         if exclude_budget_id:
             exclude_sql = " AND id<>?"
@@ -226,8 +242,10 @@ class SqliteBudgetStore:
                 )
             return
 
-        # Account budget(s) cannot exceed active client budget for overlapping period.
-        client_budget_row = conn.execute(
+        # A custom account period may cross several client periods. Its full
+        # allocation participates in every overlapping cap, just as it does
+        # when the client budget itself is created or edited above.
+        client_budget_rows = conn.execute(
             """
             SELECT id, amount, start_date, end_date
             FROM budgets
@@ -236,45 +254,42 @@ class SqliteBudgetStore:
               AND client_id=?
               AND start_date<=?
               AND end_date>=?
-            ORDER BY updated_at DESC
-            LIMIT 1
+            ORDER BY start_date, id
             """,
             (str(client_id), end_date.isoformat(), start_date.isoformat()),
-        ).fetchone()
-        if not client_budget_row:
-            return
-
-        client_budget_amount = _q_money(Decimal(str(client_budget_row["amount"])))
-        client_budget_id = str(client_budget_row["id"])
-        client_start = str(client_budget_row["start_date"])
-        client_end = str(client_budget_row["end_date"])
-
-        sum_rows = conn.execute(
-            """
-            SELECT amount
-            FROM budgets
-            WHERE status='active'
-              AND scope='account'
-              AND client_id=?
-              AND start_date<=?
-              AND end_date>=?
-            """
-            + exclude_sql,
-            [str(client_id), client_end, client_start, *exclude_params],
         ).fetchall()
-        account_total = _q_money(
-            sum((_q_money(Decimal(str(r["amount"]))) for r in sum_rows), Decimal("0"))
-        )
-        projected_total = account_total + _q_money(amount)
-        if projected_total > client_budget_amount:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Account budget allocation exceeds client budget cap "
-                    f"for period {client_start}..{client_end} "
-                    f"({projected_total} > {client_budget_amount}; client_budget_id={client_budget_id})."
-                ),
+        for client_budget_row in client_budget_rows:
+            client_budget_amount = _q_money(Decimal(str(client_budget_row["amount"])))
+            client_budget_id = str(client_budget_row["id"])
+            client_start = str(client_budget_row["start_date"])
+            client_end = str(client_budget_row["end_date"])
+
+            sum_rows = conn.execute(
+                """
+                SELECT amount
+                FROM budgets
+                WHERE status='active'
+                  AND scope='account'
+                  AND client_id=?
+                  AND start_date<=?
+                  AND end_date>=?
+                """
+                + exclude_sql,
+                [str(client_id), client_end, client_start, *exclude_params],
+            ).fetchall()
+            account_total = _q_money(
+                sum((_q_money(Decimal(str(r["amount"]))) for r in sum_rows), Decimal("0"))
             )
+            projected_total = account_total + _q_money(amount)
+            if projected_total > client_budget_amount:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Account budget allocation exceeds client budget cap "
+                        f"for period {client_start}..{client_end} "
+                        f"({projected_total} > {client_budget_amount}; client_budget_id={client_budget_id})."
+                    ),
+                )
 
     def create(self, payload: BudgetCreate) -> BudgetOut:
         _validate_period(payload.start_date, payload.end_date)
@@ -282,7 +297,7 @@ class SqliteBudgetStore:
 
         now = _utcnow().isoformat()
         budget_id = str(uuid4())
-        with runtime_conn(self.db_path) as conn:
+        with _budget_write_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._assert_no_overlap(
                 conn=conn,
@@ -370,7 +385,7 @@ class SqliteBudgetStore:
     def patch(self, budget_id: UUID, payload: BudgetPatch) -> BudgetOut:
         patch = payload.model_dump(exclude_unset=True)
         changed_by = patch.pop("changed_by", None)
-        with runtime_conn(self.db_path) as conn:
+        with _budget_write_conn(self.db_path) as conn:
             # The read, merge, validation, write, version bump, and history row
             # are one serialized operation. Reading before this lock allows two
             # concurrent partial patches to overwrite each other with the same
@@ -504,6 +519,9 @@ class SqliteBudgetStore:
 
         now = _utcnow().isoformat()
         with runtime_conn(self.db_path) as conn:
+            # Participate in the same serialization as patch/transfer on
+            # PostgreSQL, so a full budget patch cannot undo this archive.
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "UPDATE budgets SET status='archived', updated_at=? WHERE id=?",
                 (now, str(budget_id)),
@@ -517,7 +535,7 @@ class SqliteBudgetStore:
         if transfer_amount <= 0:
             raise HTTPException(status_code=400, detail="Transfer amount must be positive")
 
-        with runtime_conn(self.db_path) as conn:
+        with _budget_write_conn(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             source_row = conn.execute("SELECT * FROM budgets WHERE id=?", (str(source_budget_id),)).fetchone()
             if not source_row:
@@ -927,29 +945,27 @@ class InMemoryBudgetStore:
             for b in rows
             if b.scope == "client" and _date_overlap(start_date, end_date, b.start_date, b.end_date)
         ]
-        if not client_budgets:
-            return
-        client_budget = sorted(client_budgets, key=lambda x: x.updated_at, reverse=True)[0]
-        account_total = _q_money(
-            sum(
-                (
-                    _q_money(Decimal(str(b.amount)))
-                    for b in rows
-                    if b.scope == "account" and _date_overlap(client_budget.start_date, client_budget.end_date, b.start_date, b.end_date)
-                ),
-                Decimal("0"),
+        for client_budget in sorted(client_budgets, key=lambda x: (x.start_date, str(x.id))):
+            account_total = _q_money(
+                sum(
+                    (
+                        _q_money(Decimal(str(b.amount)))
+                        for b in rows
+                        if b.scope == "account" and _date_overlap(client_budget.start_date, client_budget.end_date, b.start_date, b.end_date)
+                    ),
+                    Decimal("0"),
+                )
             )
-        )
-        projected_total = account_total + _q_money(amount)
-        if projected_total > _q_money(Decimal(str(client_budget.amount))):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Account budget allocation exceeds client budget cap "
-                    f"for period {client_budget.start_date.isoformat()}..{client_budget.end_date.isoformat()} "
-                    f"({projected_total} > {_q_money(Decimal(str(client_budget.amount)))}; client_budget_id={client_budget.id})."
-                ),
-            )
+            projected_total = account_total + _q_money(amount)
+            if projected_total > _q_money(Decimal(str(client_budget.amount))):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Account budget allocation exceeds client budget cap "
+                        f"for period {client_budget.start_date.isoformat()}..{client_budget.end_date.isoformat()} "
+                        f"({projected_total} > {_q_money(Decimal(str(client_budget.amount)))}; client_budget_id={client_budget.id})."
+                    ),
+                )
 
     def create(self, payload: BudgetCreate) -> BudgetOut:
         _validate_period(payload.start_date, payload.end_date)
@@ -1122,6 +1138,8 @@ class InMemoryBudgetStore:
             raise HTTPException(status_code=400, detail="target_account_id must differ from source account_id")
 
         transfer_amount = _q_money(payload.amount)
+        if transfer_amount <= 0:
+            raise HTTPException(status_code=400, detail="Transfer amount must be positive")
         source_amount = _q_money(Decimal(str(source.amount)))
         if transfer_amount > source_amount:
             raise HTTPException(status_code=400, detail="Transfer amount exceeds source budget amount")
@@ -1135,18 +1153,6 @@ class InMemoryBudgetStore:
                 "note": payload.note if payload.note is not None else source.note,
             }
         )
-        self.items[source.id] = source_next
-        self.hist.setdefault(source.id, []).append(
-            BudgetHistoryOut(
-                id=len(self.hist.get(source.id, [])) + 1,
-                budget_id=source.id,
-                changed_at=now,
-                changed_by=payload.changed_by,
-                previous_values=source.model_dump(mode="json"),
-                new_values=source_next.model_dump(mode="json"),
-            )
-        )
-
         candidates = [
             b
             for b in self.items.values()
@@ -1156,8 +1162,11 @@ class InMemoryBudgetStore:
             and b.account_id == payload.target_account_id
             and _date_overlap(source.start_date, source.end_date, b.start_date, b.end_date)
         ]
+        target = None
         if candidates:
             target = sorted(candidates, key=lambda x: (x.version, x.updated_at), reverse=True)[0]
+            if target.currency.upper() != source.currency.upper():
+                raise HTTPException(status_code=400, detail="Target budget currency must match source budget currency")
             target_next = target.model_copy(
                 update={
                     "amount": _q_money(_q_money(Decimal(str(target.amount))) + transfer_amount),
@@ -1165,17 +1174,6 @@ class InMemoryBudgetStore:
                     "updated_at": now,
                     "note": payload.note if payload.note is not None else target.note,
                 }
-            )
-            self.items[target.id] = target_next
-            self.hist.setdefault(target.id, []).append(
-                BudgetHistoryOut(
-                    id=len(self.hist.get(target.id, [])) + 1,
-                    budget_id=target.id,
-                    changed_at=now,
-                    changed_by=payload.changed_by,
-                    previous_values=target.model_dump(mode="json"),
-                    new_values=target_next.model_dump(mode="json"),
-                )
             )
         else:
             target_next = BudgetOut(
@@ -1195,7 +1193,44 @@ class InMemoryBudgetStore:
                 created_at=now,
                 updated_at=now,
             )
-            self.items[target_next.id] = target_next
+
+        # Validate against the projected source balance without mutating live
+        # values or history; a rejected cross-period transfer must be atomic.
+        projected = InMemoryBudgetStore()
+        projected.items = {**self.items, source.id: source_next}
+        projected._assert_client_account_allocation_limit(
+            scope="account",
+            client_id=source.client_id,
+            account_id=target_next.account_id,
+            amount=target_next.amount,
+            start_date=target_next.start_date,
+            end_date=target_next.end_date,
+            status="active",
+            exclude_budget_id=target.id if target else None,
+        )
+        self.items[source.id] = source_next
+        self.items[target_next.id] = target_next
+        self.hist.setdefault(source.id, []).append(
+            BudgetHistoryOut(
+                id=len(self.hist.get(source.id, [])) + 1,
+                budget_id=source.id,
+                changed_at=now,
+                changed_by=payload.changed_by,
+                previous_values=source.model_dump(mode="json"),
+                new_values=source_next.model_dump(mode="json"),
+            )
+        )
+        if target:
+            self.hist.setdefault(target.id, []).append(
+                BudgetHistoryOut(
+                    id=len(self.hist.get(target.id, [])) + 1,
+                    budget_id=target.id,
+                    changed_at=now,
+                    changed_by=payload.changed_by,
+                    previous_values=target.model_dump(mode="json"),
+                    new_values=target_next.model_dump(mode="json"),
+                )
+            )
 
         self.transfers.append(
             BudgetTransferOut(

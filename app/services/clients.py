@@ -86,26 +86,15 @@ class SqliteClientStore:
         patch = payload.model_dump(exclude_unset=True)
         if not patch:
             return existing
-        data = {**existing.model_dump(), **patch}
         now = _utcnow().isoformat()
         with runtime_conn(self.db_path) as conn:
             try:
+                # Omitted fields must not be restored from the earlier read:
+                # an independent archive or edit may already have committed.
+                assignments = ", ".join(f"{field}=?" for field in patch)
                 conn.execute(
-                    """
-                    UPDATE clients
-                    SET name=?, legal_name=?, status=?, default_currency=?, timezone=?, notes=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        data["name"],
-                        data["legal_name"],
-                        data["status"],
-                        data["default_currency"],
-                        data["timezone"],
-                        data["notes"],
-                        now,
-                        str(client_id),
-                    ),
+                    f"UPDATE clients SET {assignments}, updated_at=? WHERE id=?",
+                    [*patch.values(), now, str(client_id)],
                 )
                 conn.commit()
             except Exception as exc:

@@ -318,26 +318,24 @@ class SqliteAdAccountStore:
             )
 
         now = _utcnow().isoformat()
+        # Update only requested fields; metadata-only sync writes must not
+        # restore an archived status or an old client/identity from this read.
+        changes = {field: data[field] for field in patch}
+        if "platform" in patch or "external_account_id" in patch:
+            changes["external_account_id"] = data["external_account_id"]
+        if "client_id" in changes:
+            changes["client_id"] = str(changes["client_id"])
+        if "metadata" in changes:
+            changes["metadata"] = (
+                json.dumps(changes["metadata"], separators=(",", ":"), ensure_ascii=True)
+                if changes["metadata"] else None
+            )
         with runtime_conn(self.db_path) as conn:
             try:
+                assignments = ", ".join(f"{field}=?" for field in changes)
                 conn.execute(
-                    """
-                    UPDATE ad_accounts
-                    SET client_id=?, platform=?, external_account_id=?, name=?, currency=?, timezone=?, status=?, metadata=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        str(data["client_id"]),
-                        data["platform"],
-                        data["external_account_id"],
-                        data["name"],
-                        data["currency"],
-                        data["timezone"],
-                        data["status"],
-                        json.dumps(data["metadata"], separators=(",", ":"), ensure_ascii=True) if data.get("metadata") else None,
-                        now,
-                        str(account_id),
-                    ),
+                    f"UPDATE ad_accounts SET {assignments}, updated_at=? WHERE id=?",
+                    [*changes.values(), now, str(account_id)],
                 )
                 conn.commit()
             except HTTPException:

@@ -629,10 +629,13 @@ def test_unified_overview_contract_and_budget_priority_and_pace_fields():
     assert res.status_code == 200
     body = res.json()
 
-    assert set(body.keys()) == {"range", "scope", "data_quality", "spend_summary", "budget_summary", "breakdowns"}
+    assert set(body.keys()) == {"range", "scope", "data_quality", "spend_summary", "budget_summary", "breakdowns", "totals_by_currency"}
     assert body["scope"]["client_id"] == c["id"]
     assert body["scope"]["account_id"] == a["id"]
     assert body["spend_summary"]["spend"] == 700.0
+    assert body["spend_summary"]["currency"] == "USD"
+    assert body["totals_by_currency"][0]["currency"] == "USD"
+    assert body["totals_by_currency"][0]["spend"] == 700.0
     assert body["budget_summary"]["budget"] == 1000.0  # account overrides client
     assert body["budget_summary"]["budget_source"] == "account"
     assert body["budget_summary"]["pace_status"] in {"on_track", "overspending", "underspending"}

@@ -854,7 +854,7 @@ def init_sqlite(db_path: str) -> None:
     path = Path(db_path)
     if path.parent and not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, factory=_ClosingSqliteConnection) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(DDL)
         _migrate_sqlite(conn)
@@ -906,8 +906,18 @@ def init_sqlite(db_path: str) -> None:
         conn.commit()
 
 
+class _ClosingSqliteConnection(sqlite3.Connection):
+    """Commit/rollback like SQLite's context manager, then release the handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def sqlite_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=_ClosingSqliteConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

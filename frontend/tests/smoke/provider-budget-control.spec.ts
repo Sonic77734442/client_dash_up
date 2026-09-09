@@ -216,7 +216,9 @@ test("provider budget controls stay hidden when backend does not expose the capa
     await route.fulfill({ status: 404, contentType: "application/json", body: "{}" });
   });
 
+  const historyResponse = page.waitForResponse((response) => response.url().includes("/provider-controls/meta/budget-changes"));
   await page.goto("/budgets");
+  expect((await historyResponse).status()).toBe(404);
   await expect(page.getByText("Плановые бюджеты", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Бюджеты Meta" })).toHaveCount(0);
 });
@@ -669,6 +671,7 @@ test("client sees live Meta values and conflict history without write controls",
 
 test("history remains available when the client has no active Meta account", async ({ page }) => {
   let readinessRequests = 0;
+  let historyFailure: number | null = null;
   const archivedCommand = {
     id: "99999999-9999-4999-8999-999999999999",
     status: "conflict",
@@ -700,6 +703,10 @@ test("history remains available when the client has no active Meta account", asy
       return;
     }
     if (path === "/provider-controls/meta/budget-changes") {
+      if (historyFailure) {
+        await route.fulfill({ status: historyFailure, contentType: "application/json", body: "{}" });
+        return;
+      }
       const url = new URL(route.request().url());
       expect(url.searchParams.get("client_id")).toBe(CLIENT_ID);
       expect(url.searchParams.has("ad_account_id")).toBe(false);
@@ -725,9 +732,15 @@ test("history remains available when the client has no active Meta account", asy
   await expect(page.getByLabel("Новая сумма бюджета Meta")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Подтвердить и отправить в Meta" })).toHaveCount(0);
   expect(readinessRequests).toBe(0);
+  for (const status of [404, 503]) {
+    historyFailure = status;
+    await page.getByLabel("Бюджеты Meta").getByRole("button", { name: "Обновить" }).click();
+    await expect(page.getByText(`Запрос завершился ошибкой (${status})`, { exact: true })).toBeVisible();
+    await expect(page.getByText("Архивная корректировка бюджета", { exact: true })).toBeVisible();
+  }
 });
 
-test("history loading error remains visible without readiness or an active Meta account", async ({ page }) => {
+test("503 history error remains visible without readiness or an active Meta account", async ({ page }) => {
   await installBaseApi(page, "client", async (route, path) => {
     if (path === "/provider-controls/meta/budget-changes") {
       await route.fulfill({

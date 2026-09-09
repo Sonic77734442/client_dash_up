@@ -703,13 +703,14 @@ class AdStatOut(BaseModel):
 
 
 class SpendAggregateOut(BaseModel):
-    spend: Decimal
+    currency: Optional[str] = None
+    spend: Optional[Decimal]
     impressions: int
     clicks: int
     conversions: Decimal
     ctr: Decimal
-    cpc: Decimal
-    cpm: Decimal
+    cpc: Optional[Decimal]
+    cpm: Optional[Decimal]
 
 
 class OverviewResponse(BaseModel):
@@ -717,6 +718,7 @@ class OverviewResponse(BaseModel):
     scope: Dict[str, Optional[str]]
     data_quality: Dict[str, object] = Field(default_factory=dict)
     spend_summary: Dict[str, object]
+    totals_by_currency: List[Dict[str, object]] = Field(default_factory=list)
     budget_summary: Dict[str, object]
     breakdowns: Dict[str, object]
 
@@ -724,6 +726,7 @@ class OverviewResponse(BaseModel):
 class AgencyOverviewResponse(BaseModel):
     range: Dict[str, object]
     totals: Dict[str, object]
+    totals_by_currency: List[Dict[str, object]] = Field(default_factory=list)
     per_platform: List[Dict[str, object]]
     per_client: List[Dict[str, object]]
     per_account: List[Dict[str, object]]

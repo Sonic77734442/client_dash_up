@@ -14,6 +14,7 @@ import { useScopeRequestGuard } from "../hooks/useScopeRequestGuard";
 import { useOperationalActions } from "../hooks/useOperationalActions";
 import { useToast } from "../hooks/useToast";
 import { fetchJson, getQuery } from "../lib/api";
+import { scopedCurrencyComponents, sumByCurrency } from "../lib/currency";
 import {
   normalizeAgencyOverviewPayload,
   normalizeOverviewPayload,
@@ -174,10 +175,13 @@ export default function HomePage() {
   }, [clients, budgets]);
 
   const dashboardCurrency = useMemo(() => {
+    const summary = platform === "all" ? overview?.spend_summary
+      : overview?.breakdowns.platforms.find((row) => row.platform === platform);
+    if (summary?.currency !== undefined) return summary.currency;
     if (clientId) return currencyByClient.get(clientId) || "USD";
     const unique = new Set(currencyByClient.values());
     return unique.size === 1 ? [...unique][0] : null;
-  }, [clientId, currencyByClient]);
+  }, [clientId, currencyByClient, overview, platform]);
 
   const fmtDashboardMoney = useCallback(
     (value: number | null | undefined) =>
@@ -191,11 +195,16 @@ export default function HomePage() {
       scope: "account" | "client" | "agency",
       scopeId: string,
     ) => {
+      const account = scope === "account"
+        ? overview?.breakdowns?.accounts?.find((row) => row.account_id === scopeId) : null;
+      if (account?.currency !== undefined) {
+        return account.currency ? fmtMoney(value, account.currency) : "Разные валюты";
+      }
       const scopedClientId =
         scope === "client"
           ? scopeId
           : scope === "account"
-            ? overview?.breakdowns?.accounts?.find((row) => row.account_id === scopeId)?.client_id
+            ? account?.client_id
             : null;
       const currency = scopedClientId ? currencyByClient.get(scopedClientId) : dashboardCurrency;
       return currency ? fmtMoney(value, currency) : "Разные валюты";
@@ -328,17 +337,22 @@ export default function HomePage() {
     const nextBudgets = normalizeListPayload(bgs, isBudgetItem, "бюджетов");
     if (!isCurrentRequest()) return;
     const allowedIds = agencyContext.role === "agency" ? new Set(agencyContext.clientIds) : null;
+    const scopedClientRows = nextAgencyOverview.per_client.filter((row) => !allowedIds || allowedIds.has(row.client_id));
+    const scopedAccountRows = (nextAgencyOverview.per_account || []).filter((row) => !allowedIds || allowedIds.has(row.client_id));
+    const scopedComponents = scopedCurrencyComponents(scopedClientRows, scopedAccountRows);
+    const scopedMoney = sumByCurrency(scopedComponents);
+    const completeCurrencyScope = scopedComponents.every((row) => Boolean(row.currency) && row.spend != null);
     const visibleAgencyOverview = allowedIds
       ? {
           ...nextAgencyOverview,
           totals: {
             ...nextAgencyOverview.totals,
-            spend: (nextAgencyOverview.per_client || [])
-              .filter((row) => allowedIds.has(row.client_id))
-              .reduce((sum, row) => sum + Number(row.spend || 0), 0),
+            spend: completeCurrencyScope && scopedMoney.size === 1 ? [...scopedMoney.values()][0] : null,
+            currency: completeCurrencyScope && scopedMoney.size === 1 ? [...scopedMoney.keys()][0] : null,
           },
-          per_client: (nextAgencyOverview.per_client || []).filter((row) => allowedIds.has(row.client_id)),
-          per_account: (nextAgencyOverview.per_account || []).filter((row) => allowedIds.has(row.client_id)),
+          totals_by_currency: [...scopedMoney.entries()].map(([currency, spend]) => ({ currency, spend })),
+          per_client: scopedClientRows,
+          per_account: scopedAccountRows,
         }
       : nextAgencyOverview;
     setAgencyOverview(visibleAgencyOverview);
@@ -426,7 +440,8 @@ export default function HomePage() {
     if (!overview || platform === "all") return overview;
 
     const rows = dailyRows.filter((row) => row.platform === platform);
-    const spend = rows.reduce((sum, row) => sum + Number(row.spend || 0), 0);
+    const platformSummary = overview.breakdowns.platforms.find((row) => row.platform === platform);
+    const spend = platformSummary ? platformSummary.spend : 0;
     const impressions = rows.reduce((sum, row) => sum + Number(row.impressions || 0), 0);
     const clicks = rows.reduce((sum, row) => sum + Number(row.clicks || 0), 0);
     const conversions = rows.reduce((sum, row) => sum + Number(row.conversions || 0), 0);
@@ -435,12 +450,13 @@ export default function HomePage() {
       ...overview,
       spend_summary: {
         spend,
+        currency: platformSummary?.currency,
         impressions,
         clicks,
         conversions,
         ctr: impressions > 0 ? clicks / impressions : 0,
-        cpc: clicks > 0 ? spend / clicks : 0,
-        cpm: impressions > 0 ? (spend * 1000) / impressions : 0,
+        cpc: spend == null ? null : clicks > 0 ? spend / clicks : 0,
+        cpm: spend == null ? null : impressions > 0 ? (spend * 1000) / impressions : 0,
       },
       budget_summary: {
         ...(overview.budget_summary || {}),
@@ -538,10 +554,16 @@ export default function HomePage() {
     () =>
       effectiveOverview
         ? [...(effectiveOverview.breakdowns?.accounts || [])]
-            .sort((a, b) => Number(b.cpc || 0) - Number(a.cpc || 0))
+            .sort((a, b) => {
+              const score = (accountId: string) => Math.max(0, ...visibleOperationalInsights
+                .filter((insight) => insight.scope === "account" && insight.scope_id === accountId && !insight.metrics?.fallback)
+                .map((insight) => insight.score));
+              return score(b.account_id) - score(a.account_id)
+                || String(a.name || a.account_id).localeCompare(String(b.name || b.account_id));
+            })
             .slice(0, 8)
         : [],
-    [effectiveOverview]
+    [effectiveOverview, visibleOperationalInsights]
   );
 
   const dashboardDataState = useMemo(
@@ -561,7 +583,7 @@ export default function HomePage() {
       if (!prev || new Date(b.updated_at) > new Date(prev.updated_at)) clientBudgetMap.set(b.client_id, b);
     }
 
-    const spendByClient = new Map<string, { spend: number }>();
+    const spendByClient = new Map<string, { spend: number | null }>();
     for (const row of agencyOverview.per_client || []) spendByClient.set(row.client_id, row);
     const maxSpend = Math.max(1, ...(agencyOverview.per_client || []).map((x) => Number(x.spend || 0)));
     const hasMixedClientCurrencies = new Set(
@@ -575,12 +597,13 @@ export default function HomePage() {
 
     return (clients || [])
       .map((c) => {
-        const spend = Number(spendByClient.get(c.id)?.spend || 0);
+        const spendRow = spendByClient.get(c.id);
+        const spend = spendRow?.spend === null ? null : Number(spendRow?.spend || 0);
         const budget = Number(clientBudgetMap.get(c.id)?.amount || 0);
         const currency = currencyByClient.get(c.id) || "USD";
-        const usage = budget > 0 ? (spend / budget) * 100 : null;
-        const pace: ClientOpsRow["pace"] = usage == null ? "no_budget" : usage >= 90 ? "critical" : usage >= 70 ? "warning" : "stable";
-        const riskScore = calculateClientRiskScore(usage, spend, maxSpend, !hasMixedClientCurrencies);
+        const usage = budget > 0 && spend != null ? (spend / budget) * 100 : null;
+        const pace: ClientOpsRow["pace"] = spend == null ? "unavailable" : usage == null ? "no_budget" : usage >= 90 ? "critical" : usage >= 70 ? "warning" : "stable";
+        const riskScore = calculateClientRiskScore(usage, spend ?? 0, maxSpend, spend != null && !hasMixedClientCurrencies);
         const owner = (c.name || "NA")
           .split(" ")
           .map((x) => x[0] || "")
@@ -889,12 +912,13 @@ export default function HomePage() {
           <div className={`warning ${warning ? "" : "hidden"}`}>{warning}</div>
           {!dashboardCurrency && view === "dashboard" ? (
             <div className="warning">
-              В выборке несколько валют. Выберите одного клиента, чтобы денежные KPI и темп бюджета были сопоставимы.
+              В выборке несколько валют. Общие денежные KPI и сравнение с бюджетом недоступны.
             </div>
           ) : null}
 
           {view === "dashboard" ? (
             <DashboardView
+              currency={dashboardCurrency}
               overview={effectiveOverview}
               dataState={dashboardDataState}
               dataNotice={dashboardDataMeta.description}

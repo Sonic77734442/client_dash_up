@@ -1,5 +1,6 @@
 import json
 import os
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
@@ -7,6 +8,7 @@ import httpx
 from fastapi import HTTPException
 
 from app.services.meta_version import meta_graph_api_version
+from app.services.provider_metrics import ProviderPayloadValidationError, provider_decimal
 
 META_INSIGHTS_MAX_PAGES = 100
 META_AUTH_ERROR_CODES = {102, 190}
@@ -194,11 +196,11 @@ def _validated_meta_page(response: object) -> tuple[List[Dict[str, object]], Opt
     return page_rows, _validated_paging_url(paging.get("next"))
 
 
-def _sum_actions_conversions(actions: object) -> Optional[float]:
+def _sum_actions_conversions(actions: object) -> Optional[Decimal]:
     if not isinstance(actions, list):
         return None
     wanted = _conversion_action_types()
-    total = 0.0
+    total = Decimal("0")
     matched = False
     for item in actions:
         if not isinstance(item, dict):
@@ -212,11 +214,12 @@ def _sum_actions_conversions(actions: object) -> Optional[float]:
             normalized = normalized[len("fb_pixel_") :]
         if action_type not in wanted and base_type not in wanted and normalized not in wanted:
             continue
-        try:
-            value = float(str(item.get("value") or 0))
-        except Exception:
-            value = 0.0
+        value = provider_decimal(item.get("value"), field="Meta conversion action value")
+        if value >= Decimal("1000000000000"):
+            raise ProviderPayloadValidationError("Provider Meta conversions exceed supported numeric(14,2) range")
         total += value
+        if total >= Decimal("1000000000000"):
+            raise ProviderPayloadValidationError("Provider Meta conversions exceed supported numeric(14,2) range")
         matched = True
     if not matched:
         return None

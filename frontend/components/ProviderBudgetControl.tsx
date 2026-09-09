@@ -271,6 +271,7 @@ export function ProviderBudgetControl({
   const [historyClientId, setHistoryClientId] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const [historyErrorStatus, setHistoryErrorStatus] = useState<number | null>(null);
   const [historyErrorClientId, setHistoryErrorClientId] = useState("");
   const [selectedCommandId, setSelectedCommandId] = useState("");
   const [checkingCommandId, setCheckingCommandId] = useState("");
@@ -402,6 +403,7 @@ export function ProviderBudgetControl({
     }
     setHistoryLoading(true);
     setHistoryError("");
+    setHistoryErrorStatus(null);
     setHistoryErrorClientId(requestedClientId);
     try {
       const payload = await req<MetaBudgetHistoryResponse>(
@@ -424,6 +426,7 @@ export function ProviderBudgetControl({
       // A refresh failure must not erase durable history already shown for
       // this client. Keep the last safe snapshot and surface the error.
       setHistoryError(error instanceof Error ? error.message : "Не удалось загрузить историю изменений.");
+      setHistoryErrorStatus(error instanceof ApiRequestError ? error.status : null);
     } finally {
       if (generation === historyRequestGeneration.current) {
         setHistoryLoading(false);
@@ -440,7 +443,10 @@ export function ProviderBudgetControl({
     () => (historyClientId === selectedClientId ? history : []),
     [history, historyClientId, selectedClientId],
   );
-  const visibleHistoryError = historyErrorClientId === selectedClientId ? historyError : "";
+  // An absent endpoint is not an exposed capability. Existing history and
+  // transient failures remain visible; authorization failures are unchanged.
+  const capabilityAbsent = historyErrorStatus === 404 && !readiness?.visible && !visibleHistory.length;
+  const visibleHistoryError = historyErrorClientId === selectedClientId && !capabilityAbsent ? historyError : "";
 
   const choices = useMemo<TargetChoice[]>(() => {
     const allowedTypes = new Set(readiness?.allowed?.target_types || []);

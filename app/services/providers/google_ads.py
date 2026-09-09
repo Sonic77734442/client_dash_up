@@ -1,10 +1,12 @@
 import os
 import re
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 from google.ads.googleads import client as google_ads_client_module
 from google.ads.googleads.client import GoogleAdsClient
+from app.services.provider_metrics import ProviderPayloadValidationError, provider_count, provider_decimal
 
 
 def normalize_customer_id(customer_id: str) -> str:
@@ -343,14 +345,17 @@ def fetch_daily(
                         "date": day,
                         "impressions": 0,
                         "clicks": 0,
-                        "spend": 0.0,
-                        "conversions": 0.0,
+                        "spend": Decimal("0"),
+                        "conversions": Decimal("0"),
                     },
                 )
-                bucket["impressions"] = int(bucket["impressions"]) + int(metrics.impressions or 0)
-                bucket["clicks"] = int(bucket["clicks"]) + int(metrics.clicks or 0)
-                bucket["spend"] = float(bucket["spend"]) + float(metrics.cost_micros or 0) / 1_000_000
-                bucket["conversions"] = float(bucket["conversions"]) + float(metrics.conversions or 0)
+                bucket["impressions"] += provider_count(metrics.impressions, field="Google impressions")
+                bucket["clicks"] += provider_count(metrics.clicks, field="Google clicks")
+                bucket["spend"] += Decimal(provider_count(metrics.cost_micros, field="Google cost_micros")) / Decimal("1000000")
+                conversions_value = provider_decimal(metrics.conversions, field="Google conversions")
+                if conversions_value >= Decimal("1000000000000"):
+                    raise ProviderPayloadValidationError("Provider Google conversions exceed supported numeric(14,2) range")
+                bucket["conversions"] += conversions_value
 
             daily: List[Dict[str, object]] = []
             for day in sorted(by_date):
@@ -372,6 +377,10 @@ def fetch_daily(
                     }
                 )
             return daily
+        except ProviderPayloadValidationError:
+            # Query fallback addresses provider query support, not malformed
+            # metric values. Never replace an invalid response with zero data.
+            raise
         except Exception as exc:
             last_error = exc
             continue

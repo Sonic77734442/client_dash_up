@@ -3,10 +3,12 @@
 import { StateMessage } from "../common/StateMessage";
 import { TimelineChart } from "../TimelineChart";
 import { DataFreshnessState, dataFreshnessMeta } from "../../lib/dataFreshness";
+import { budgetComparisonNote } from "../../lib/currency";
 import { AccountBreakdown, OperationalAction, OperationalInsight, Overview, PlatformBreakdown, TimelineAction, TimelinePoint } from "../../lib/types";
 
 type DashboardViewProps = {
   overview: Overview | null;
+  currency: string | null;
   dataState: DataFreshnessState;
   dataNotice: string;
   platform: "all" | "meta" | "google" | "tiktok";
@@ -78,6 +80,7 @@ function insightCopy(
 
 export function DashboardView({
   overview,
+  currency,
   dataState,
   dataNotice,
   platform,
@@ -95,10 +98,11 @@ export function DashboardView({
   onInsightAction,
   onRiskActionDraft,
 }: DashboardViewProps) {
-  const spend = Number(overview?.spend_summary?.spend || 0);
+  const spend = overview?.spend_summary?.spend ?? null;
   const conversions = Number(overview?.spend_summary?.conversions || 0);
-  const cpl = conversions > 0 ? spend / conversions : null;
+  const cpl = spend != null && conversions > 0 ? spend / conversions : null;
   const dataMeta = dataFreshnessMeta(dataState);
+  const budgetNote = budgetComparisonNote(overview?.budget_summary.unavailable_reason);
   const metricsUsable = dataState === "current" || dataState === "stale";
   const attentionCount = operationalInsights.filter((row) => row.priority === "high" || row.priority === "medium").length + (dataState === "current" ? 0 : 1);
   const leadInsight = operationalInsights[0] || null;
@@ -110,20 +114,25 @@ export function DashboardView({
           : fmtMoney(value),
       )
     : { title: dataMeta.label, reason: dataNotice };
-  const contributionTotal = platformRows.reduce((sum, row) => sum + Number(row.spend || 0), 0) || 1;
+  const contributionTotal = currency && platformRows.every((row) => row.spend != null)
+    ? platformRows.reduce((sum, row) => sum + Number(row.spend), 0)
+    : null;
 
   return (
     <>
+      {budgetNote ? <div className="warning" style={{ marginBottom: 12 }}>{budgetNote}</div> : null}
       {dataState !== "current" ? (
         <div className="warning" style={{ marginBottom: 12 }}>{dataNotice}</div>
       ) : null}
       <section className="kpi-grid">
         <article className={`kpi-card ${dataState === "stale" ? "warn" : ""}`}>
           <div className="kpi-title">Расход за период</div>
-          <div className="kpi-value">{metricsUsable ? fmtMoney(spend) : "—"}</div>
+          <div className="kpi-value">{metricsUsable
+            ? spend == null ? currency ? "—" : "Разные валюты" : fmtMoney(spend)
+            : "—"}</div>
           <div className="kpi-meta">
             {platform === "all"
-              ? `Бюджет: ${overview?.budget_summary?.budget == null ? "не задан" : fmtMoney(overview.budget_summary.budget)}`
+              ? budgetNote || `Бюджет: ${overview?.budget_summary?.budget == null ? "не задан" : fmtMoney(overview.budget_summary.budget)}`
               : "Без сравнения с общим бюджетом клиента"}
           </div>
         </article>
@@ -155,6 +164,7 @@ export function DashboardView({
           <div className="chart">
             <TimelineChart
               points={groupedTimeline}
+              currency={currency}
               budgetCap={overview?.budget_summary?.budget}
               asOfDate={overview?.range?.as_of_date}
               actions={timelineActions}
@@ -178,14 +188,15 @@ export function DashboardView({
           <div className="contribution">
             <div className="panel-subtitle">Вклад платформ в расход</div>
             {platformRows.map((row) => {
-              const share = (Number(row.spend || 0) / contributionTotal) * 100;
+              const share = contributionTotal && row.spend != null
+                ? (row.spend / contributionTotal) * 100 : null;
               return (
                 <div key={row.platform} className="contribution-item">
                   <div className="row">
                     <span>{row.platform.toUpperCase()}</span>
-                    <span>{share.toFixed(1)}%</span>
+                    <span>{share == null ? "—" : `${share.toFixed(1)}%`}</span>
                   </div>
-                  <div className="bar"><div style={{ width: `${share.toFixed(1)}%` }} /></div>
+                  <div className="bar"><div style={{ width: `${share?.toFixed(1) || 0}%` }} /></div>
                 </div>
               );
             })}
@@ -216,13 +227,22 @@ export function DashboardView({
             </thead>
             <tbody>
               {riskRows.map((r) => {
-                const rec = r.cpc > 3
-                  ? { label: "Создать задачу: ограничить −10%", cls: "cap" }
-                  : r.ctr < 0.03
-                    ? { label: "Создать задачу: проверить", cls: "pause" }
-                    : { label: "Создать задачу: масштабировать +10%", cls: "scale" };
-                const paceLabel = r.cpc > 3 ? "Высокая стоимость" : r.ctr < 0.03 ? "Низкий CTR" : "Можно масштабировать";
-                const status = r.cpc > 3 ? "overspending" : r.ctr < 0.03 ? "underspending" : "on_track";
+                const recommendation = operationalInsights
+                  .filter((insight) => insight.scope === "account" && insight.scope_id === r.account_id && !insight.metrics?.fallback)
+                  .sort((a, b) => b.score - a.score)[0];
+                const action = recommendation?.action || "review";
+                const rec = {
+                  cls: action,
+                  label: {
+                    cap: "Создать задачу: ограничить",
+                    scale: "Создать задачу: масштабировать",
+                    pause: "Создать задачу: приостановить",
+                    review: "Создать задачу: проверить",
+                  }[action],
+                };
+                const paceLabel = recommendation?.title || "Нет подтверждённого отклонения";
+                const status = recommendation?.priority === "high" ? "overspending"
+                  : recommendation?.priority === "medium" ? "underspending" : "on_track";
                 return (
                   <tr key={r.account_id}>
                     <td>
@@ -231,14 +251,16 @@ export function DashboardView({
                     <td>{r.platform.toUpperCase()}</td>
                     <td>{fmtScopedMoney(Number(r.spend || 0) / Math.max(1, periodDays), "account", r.account_id)}</td>
                     <td>
-                      <span className={`badge ${paceClass(status)}`}>
+                      <span className={`badge ${recommendation ? paceClass(status) : ""}`}>
                         {paceLabel}
                       </span>
                     </td>
                     <td>
                       <button
                         className={`action-btn ${rec.cls}`}
-                        onClick={() => void onRiskActionDraft(r.account_id, rec.label)}
+                        onClick={() => void (recommendation
+                          ? onInsightAction(recommendation)
+                          : onRiskActionDraft(r.account_id, rec.label))}
                         disabled={dataState !== "current"}
                         title={dataState !== "current" ? "Сначала обновите данные" : undefined}
                       >

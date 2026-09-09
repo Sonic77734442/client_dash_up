@@ -1,0 +1,2 @@
+# Shell entrypoints are executed by Linux in Docker and production.
+*.sh text eol=lf

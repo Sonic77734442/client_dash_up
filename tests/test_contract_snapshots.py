@@ -103,6 +103,11 @@ def test_snapshot_insights_overview_shape():
     assert res.status_code == 200
     snap = shape_of(res.json())
     assert snap == {
+        "totals_by_currency": [{
+            "currency": "str", "spend": "float", "impressions": "int",
+            "clicks": "int", "conversions": "float", "ctr": "float",
+            "cpc": "float", "cpm": "float",
+        }],
         "breakdowns": {
             "accounts": [
                 {
@@ -117,6 +122,7 @@ def test_snapshot_insights_overview_shape():
                     "name": "str",
                     "platform": "str",
                     "spend": "float",
+                    "currency": "str",
                 }
             ],
             "platforms": [
@@ -129,6 +135,7 @@ def test_snapshot_insights_overview_shape():
                     "impressions": "int",
                     "platform": "str",
                     "spend": "float",
+                    "currency": "str",
                 }
             ],
         },
@@ -143,6 +150,7 @@ def test_snapshot_insights_overview_shape():
             "pace_status": "str",
             "remaining": "float",
             "spend": "float",
+            "currency": "str",
             "usage_percent": "float",
         },
         "data_quality": {
@@ -173,6 +181,7 @@ def test_snapshot_insights_overview_shape():
             "ctr": "float",
             "impressions": "int",
             "spend": "float",
+            "currency": "str",
         },
     }
 
@@ -183,6 +192,11 @@ def test_snapshot_agency_overview_shape():
     assert res.status_code == 200
     snap = shape_of(res.json())
     assert snap == {
+        "totals_by_currency": [{
+            "currency": "str", "spend": "float", "impressions": "int",
+            "clicks": "int", "conversions": "float", "ctr": "float",
+            "cpc": "float", "cpm": "float",
+        }],
         "per_account": [
             {
                 "account_id": "str",
@@ -196,6 +210,7 @@ def test_snapshot_agency_overview_shape():
                 "name": "str",
                 "platform": "str",
                 "spend": "float",
+                "currency": "str",
             }
         ],
         "per_client": [
@@ -208,6 +223,7 @@ def test_snapshot_agency_overview_shape():
                 "ctr": "float",
                 "impressions": "int",
                 "spend": "float",
+                "currency": "str",
             }
         ],
         "per_platform": [
@@ -220,6 +236,7 @@ def test_snapshot_agency_overview_shape():
                 "impressions": "int",
                 "platform": "str",
                 "spend": "float",
+                "currency": "str",
             }
         ],
         "range": {
@@ -236,6 +253,7 @@ def test_snapshot_agency_overview_shape():
             "ctr": "float",
             "impressions": "int",
             "spend": "float",
+            "currency": "str",
         },
     }
 

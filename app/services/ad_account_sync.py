@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Protocol
 from uuid import UUID, uuid4
 
@@ -27,6 +27,7 @@ from app.services.meta_connection import (
 )
 from app.services.providers import google_ads, meta, tiktok
 from app.services.ad_stats import AdStatsStore
+from app.services.provider_metrics import ProviderPayloadValidationError, provider_count, provider_money
 
 
 class AdAccountSyncJobStore(Protocol):
@@ -259,10 +260,6 @@ class DueSyncRunResult:
     finished_at: datetime
 
 
-class ProviderPayloadValidationError(ValueError):
-    """Raised when provider metrics cannot be safely assigned to the requested window."""
-
-
 class MissingScopedCredentialsError(RuntimeError):
     """A tenant-scoped sync has no tenant-owned provider credentials."""
 
@@ -331,6 +328,7 @@ class AdAccountSyncService:
         *,
         requested_from: str,
         requested_to: str,
+        require_metrics: bool = False,
     ) -> List[Dict[str, object]]:
         """Validate every row before ingesting any of them.
 
@@ -388,30 +386,29 @@ class AdAccountSyncService:
 
             normalized = dict(row)
             normalized["date"] = row_date.isoformat()
+            for field in ("impressions", "clicks", "spend"):
+                if require_metrics and field not in row:
+                    raise ProviderPayloadValidationError(f"Provider payload row {index} is missing {field}")
+                # Custom fetchers historically allow missing metrics. An
+                # explicit null/invalid value is never equivalent to zero.
+                raw_value = row.get(field, 0)
+                parser = provider_money if field == "spend" else provider_count
+                normalized[field] = parser(raw_value, field=f"row {index} {field}")
+            normalized["conversions"] = (
+                provider_money(row["conversions"], field=f"row {index} conversions")
+                if row.get("conversions") is not None else None
+            )
             validated.append(normalized)
 
         return validated
 
     @staticmethod
     def _to_int(value: object) -> int:
-        try:
-            return int(float(str(value or 0)))
-        except Exception:
-            return 0
+        return provider_count(value, field="count")
 
     @staticmethod
-    def _to_float(value: object) -> float:
-        try:
-            return float(str(value or 0))
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _to_money_2(value: object) -> float:
-        try:
-            return float(Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        except Exception:
-            return 0.0
+    def _to_money_2(value: object) -> Decimal:
+        return provider_money(value, field="amount")
 
     def _ingest_provider_rows(
         self,
@@ -428,9 +425,9 @@ class AdAccountSyncService:
                     ad_account_id=account_id,
                     date=str(row["date"]),
                     platform=platform,
-                    impressions=self._to_int(row.get("impressions")),
-                    clicks=self._to_int(row.get("clicks")),
-                    spend=self._to_money_2(row.get("spend")),
+                    impressions=self._to_int(row.get("impressions", 0)),
+                    clicks=self._to_int(row.get("clicks", 0)),
+                    spend=self._to_money_2(row.get("spend", 0)),
                     conversions=self._to_money_2(row.get("conversions")) if row.get("conversions") is not None else None,
                 )
                 for row in rows
@@ -739,15 +736,18 @@ class AdAccountSyncService:
                         rows,
                         requested_from=from_str,
                         requested_to=to_str,
+                        require_metrics=fetcher in (
+                            self._fetch_meta_daily, self._fetch_google_daily, self._fetch_tiktok_daily
+                        ),
                     )
-                    if rows:
-                        latest_data_date = max(str(row["date"]) for row in rows)
                     status = "success"
                     records = self._ingest_provider_rows(
                         account_id=account.id,
                         platform=provider,
                         rows=rows,
                     )
+                    if rows:
+                        latest_data_date = max(str(row["date"]) for row in rows)
                     error_message = None
                     error_code = None
                     error_category = None

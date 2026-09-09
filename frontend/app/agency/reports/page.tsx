@@ -8,6 +8,7 @@ import { agencySelectionRequiredMessage, useAgencyContext } from "../../../hooks
 import { useSession } from "../../../hooks/useSession";
 import { useScopeRequestGuard } from "../../../hooks/useScopeRequestGuard";
 import { fetchJson, getQuery } from "../../../lib/api";
+import { formatCurrency, scopedCurrencyComponents, sumByCurrency } from "../../../lib/currency";
 import { AgencyOverview, Client } from "../../../lib/types";
 
 function dateRange(days: number) {
@@ -15,10 +16,6 @@ function dateRange(days: number) {
   const from = new Date(to);
   from.setDate(from.getDate() - (days - 1));
   return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) };
-}
-
-function money(value: number) {
-  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(value);
 }
 
 export default function AgencyReportsPage() {
@@ -59,14 +56,20 @@ export default function AgencyReportsPage() {
       const visiblePerClient = (overviewRows.per_client || []).filter(
         (row) => !allowedClientIds || allowedClientIds.has(row.client_id),
       );
+      const visiblePerAccount = (overviewRows.per_account || []).filter(
+        (row) => !allowedClientIds || allowedClientIds.has(row.client_id),
+      );
+      const scopedMoney = sumByCurrency(scopedCurrencyComponents(visiblePerClient, visiblePerAccount));
       setClients(visibleClients);
       setOverview({
         ...overviewRows,
-        totals: { ...overviewRows.totals, spend: visiblePerClient.reduce((sum, row) => sum + Number(row.spend || 0), 0) },
+        // Global components are valid only in the all-agency view.
+        totals: undefined,
+        totals_by_currency: !allowedClientIds && overviewRows.totals_by_currency
+          ? overviewRows.totals_by_currency
+          : [...scopedMoney].map(([currency, spend]) => ({ currency, spend })),
         per_client: visiblePerClient,
-        per_account: (overviewRows.per_account || []).filter(
-          (row) => !allowedClientIds || allowedClientIds.has(row.client_id),
-        ),
+        per_account: visiblePerAccount,
       });
       setWarning("");
     } catch (error) {
@@ -95,10 +98,17 @@ export default function AgencyReportsPage() {
 
   const clientNames = useMemo(() => new Map(clients.map((item) => [item.id, item.name])), [clients]);
   const rows = useMemo(
-    () => [...(overview?.per_client || [])].sort((a, b) => Number(b.spend || 0) - Number(a.spend || 0)),
+    () => [...(overview?.per_client || [])],
     [overview]
   );
-  const totalSpend = rows.reduce((sum, item) => sum + Number(item.spend || 0), 0);
+  const reportRows = rows.map((row) => ({
+    ...row,
+    currency: row.currency === null ? null : row.currency
+      || clients.find((client) => client.id === row.client_id)?.default_currency || null,
+  })).sort((a, b) => (a.currency || "").localeCompare(b.currency || "") || Number(b.spend || 0) - Number(a.spend || 0));
+  const totalsByCurrency = sumByCurrency(overview?.totals_by_currency ?? reportRows);
+  const totalSpendLabel = [...totalsByCurrency.entries()]
+    .map(([currency, spend]) => formatCurrency(spend, currency)).join(" · ") || "—";
 
   return (
     <div className="app-shell">
@@ -124,8 +134,8 @@ export default function AgencyReportsPage() {
 
         <section className="kpi-grid role-kpi-grid">
           <article className="kpi-card"><div className="kpi-title">Клиенты</div><div className="kpi-value">{clients.length}</div></article>
-          <article className="kpi-card"><div className="kpi-title">Общий расход</div><div className="kpi-value">{money(totalSpend)}</div></article>
-          <article className="kpi-card"><div className="kpi-title">С данными</div><div className="kpi-value">{rows.filter((item) => Number(item.spend || 0) > 0).length}</div></article>
+          <article className="kpi-card"><div className="kpi-title">Расход по валютам</div><div className="kpi-value">{totalSpendLabel}</div></article>
+          <article className="kpi-card"><div className="kpi-title">С данными</div><div className="kpi-value">{rows.filter((item) => item.spend == null || item.spend > 0).length}</div></article>
           <article className="kpi-card"><div className="kpi-title">Период</div><div className="kpi-value" style={{ fontSize: 24 }}>{periodDays} дней</div></article>
         </section>
 
@@ -142,20 +152,21 @@ export default function AgencyReportsPage() {
                 <tr>
                   <th>Клиент</th>
                   <th>Расход</th>
-                  <th>Доля портфеля</th>
+                  <th>Доля в своей валюте</th>
                   <th>Состояние данных</th>
                   <th />
                 </tr>
               </thead>
               <tbody>
-                {rows.map((item) => {
-                  const share = totalSpend > 0 ? (Number(item.spend || 0) / totalSpend) * 100 : 0;
+                {reportRows.map((item) => {
+                  const currencyTotal = item.currency ? totalsByCurrency.get(item.currency) || 0 : 0;
+                  const share = currencyTotal > 0 && item.spend != null ? (item.spend / currencyTotal) * 100 : null;
                   return (
                     <tr key={item.client_id}>
                       <td>{clientNames.get(item.client_id) || item.client_id}</td>
-                      <td>{money(Number(item.spend || 0))}</td>
-                      <td>{share.toFixed(1)}%</td>
-                      <td><span className={`badge ${Number(item.spend || 0) > 0 ? "good" : "warn"}`}>{Number(item.spend || 0) > 0 ? "Данные получены" : "Нет данных"}</span></td>
+                      <td>{formatCurrency(item.spend, item.currency)}</td>
+                      <td>{share == null ? "—" : `${share.toFixed(1)}%`}</td>
+                      <td><span className={`badge ${item.spend == null || item.spend > 0 ? "good" : "warn"}`}>{item.spend == null ? "Несколько валют" : item.spend > 0 ? "Данные получены" : "Нет данных"}</span></td>
                       <td><Link className="ghost-btn" href={`/client/${item.client_id}`}>Открыть дашборд</Link></td>
                     </tr>
                   );

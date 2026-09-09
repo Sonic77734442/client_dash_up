@@ -133,12 +133,20 @@ class OperationalInsightsService:
                 ],
             }
 
-        total_spend = sum(self._to_float(x.get("spend")) for x in rows) or 1.0
-        ctr_values = [self._to_float(x.get("ctr")) for x in rows if self._to_float(x.get("ctr")) > 0]
-        cpc_values = [self._to_float(x.get("cpc")) for x in rows if self._to_float(x.get("cpc")) > 0]
-
-        ctr_mid = median(ctr_values) if ctr_values else 0.0
-        cpc_mid = median(cpc_values) if cpc_values else 0.0
+        # Monetary comparisons and spend shares require a common currency.
+        # A high nominal KZT CPC must not be compared to a USD cohort.
+        cohorts: dict[object, list] = {}
+        for row in rows:
+            cohorts.setdefault(row.get("currency"), []).append(row)
+        benchmarks = {}
+        for currency, cohort in cohorts.items():
+            ctr_values = [self._to_float(x.get("ctr")) for x in cohort if self._to_float(x.get("ctr")) > 0]
+            cpc_values = [self._to_float(x.get("cpc")) for x in cohort if self._to_float(x.get("cpc")) > 0]
+            benchmarks[currency] = (
+                sum(self._to_float(x.get("spend")) for x in cohort) or 1.0,
+                median(ctr_values) if ctr_values else 0.0,
+                median(cpc_values) if cpc_values else 0.0,
+            )
 
         min_spend_share = self._to_float(self.rules.get("min_spend_share_for_action", 0.15))
         high_cpc_mul = self._to_float(self.rules.get("high_cpc_multiplier", 1.25))
@@ -153,6 +161,7 @@ class OperationalInsightsService:
 
         items: List[Dict[str, object]] = []
         for r in rows:
+            total_spend, ctr_mid, cpc_mid = benchmarks[r.get("currency")]
             account_id = str(r.get("account_id") or "")
             name = str(r.get("name") or account_id[:8])
             platform = str(r.get("platform") or "unknown")

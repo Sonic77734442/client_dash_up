@@ -1,28 +1,28 @@
 "use client";
 
 import ReactECharts from "echarts-for-react";
+import { formatCurrency } from "../lib/currency";
 
 type Point = { date: string; label: string; expected: number; actual: number | null };
 type ActionMarker = { date: string; action: string; title?: string };
 
-const formatKzt = (value: unknown) =>
-  new Intl.NumberFormat("ru-RU", {
-    style: "currency",
-    currency: "KZT",
-    maximumFractionDigits: 0,
-  }).format(Number(value || 0));
-
 export function TimelineChart({
   points,
+  currency,
   budgetCap,
   asOfDate,
   actions = [],
 }: {
   points: Point[];
+  currency: string | null;
   budgetCap?: number | null;
   asOfDate?: string | null;
   actions?: ActionMarker[];
 }) {
+  if (!currency) {
+    return <div className="chart-empty">Выберите клиента с одной валютой для графика расходов.</div>;
+  }
+  const formatMoney = (value: unknown) => formatCurrency(value, currency);
   if (!points.length) {
     return (
       <div className="chart-empty" style={{ color: "#77797d", fontWeight: 500 }}>
@@ -94,7 +94,7 @@ export function TimelineChart({
           borderWidth: 1,
           textStyle: { color: "#1a1c1f", fontSize: 12, fontWeight: 500 },
           extraCssText: "border-radius:12px;box-shadow:none;",
-          valueFormatter: formatKzt,
+          valueFormatter: formatMoney,
         },
         legend: {
           data: ["Плановый расход", "Фактический расход"],
@@ -121,7 +121,7 @@ export function TimelineChart({
             color: "#85878b",
             fontSize: 10,
             fontWeight: 500,
-            formatter: (v: number) => formatKzt(v),
+            formatter: (v: number) => formatMoney(v),
           },
         },
         series: [
@@ -201,7 +201,7 @@ export function TimelineChart({
             markPoint: {
               symbol: "roundRect",
               symbolSize: [96, 22],
-              label: { color: "#ffffff", fontSize: 10, fontWeight: 500, formatter: formatKzt(lastValue) },
+              label: { color: "#ffffff", fontSize: 10, fontWeight: 500, formatter: formatMoney(lastValue) },
               itemStyle: { color: "#1a1c1f" },
               data: [{ coord: [labels[lastActualIndex], lastValue], value: lastValue }],
             },
