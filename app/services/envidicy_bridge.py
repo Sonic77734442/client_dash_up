@@ -136,10 +136,10 @@ def validate_authority(payload: object, *, issuer: str, subject: str, request_id
         raise ValueError("Invalid authority revocation snapshot")
     if not isinstance(payload["authority_revision"], str) or not 1 <= len(payload["authority_revision"]) <= 128:
         raise ValueError("Invalid authority revision")
-    # A malformed allow is an unavailable dependency, not a confirmed denial.
-    # Finish validating its complete snapshot before offering a handoff to My.
+    # Validate the full snapshot even when its permissions are insufficient.
+    # Only an actual My deny may offer a handoff; an incomplete allow cannot.
     if not {PRODUCT, PRODUCT + ".read"}.issubset(permissions):
-        return {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
+        return {"access_state": "not_granted", "permissions": [], "redirect_to_my": False}
     return {"access_state": "ready", "permissions": permissions, "redirect_to_my": False, "organization_id": organization_id,
             "project_id": project_id, "organization_name": membership["organization_name"],
             "project_name": membership["project_name"], "valid_until": until.isoformat(),

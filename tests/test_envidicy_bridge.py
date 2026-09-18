@@ -335,11 +335,24 @@ def test_operator_dry_run_does_not_create_missing_sqlite_database(monkeypatch, t
 
 
 @pytest.mark.parametrize("permissions", [[], [PRODUCT], [PRODUCT + ".read"], [PRODUCT + ".manage"]])
-def test_validated_allow_without_required_permissions_is_a_confirmed_my_handoff(permissions):
+def test_validated_allow_without_required_permissions_is_not_a_confirmed_my_handoff(permissions):
     payload = decision()
     payload["permissions"] = permissions
     result = validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=payload["request_id"])
-    assert result == {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
+    assert result == {"access_state": "not_granted", "permissions": [], "redirect_to_my": False}
+
+
+def test_only_actual_my_deny_sets_handoff_marker_despite_same_local_access_state():
+    allow = decision()
+    allow["permissions"] = [PRODUCT]
+    deny = {key: allow[key] for key in ("contract_version", "request_id", "principal", "evaluated_at")}
+    deny.update(decision="deny", reason_code="permission_denied")
+    insufficient = validate_authority(allow, issuer=ISSUER, subject="id-subject", request_id=allow["request_id"])
+    confirmed = validate_authority(deny, issuer=ISSUER, subject="id-subject", request_id=deny["request_id"])
+    assert insufficient["access_state"] == confirmed["access_state"] == "not_granted"
+    assert insufficient["permissions"] == confirmed["permissions"] == []
+    assert insufficient["redirect_to_my"] is False
+    assert confirmed["redirect_to_my"] is True
 
 
 @pytest.mark.parametrize("mutate", [

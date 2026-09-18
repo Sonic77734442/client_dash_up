@@ -185,7 +185,7 @@ the response projects `user.role` and `session.role` as `client`,
 | `authority.product` | `dash.analytics` |
 | `authority.my_url` | Fixed My navigation URL |
 | `authority.access_state` | `ready`, `not_granted`, `project_unlinked`, or `context_unavailable` |
-| `authority.redirect_to_my` | True only for a validated My denial or fully validated insufficient Dash permissions; not for pilot exclusion, missing local binding or upstream failure |
+| `authority.redirect_to_my` | True only for a fully validated My `decision:deny`; not for an inconsistent allow, pilot exclusion, missing local binding or upstream failure |
 | `authority.organization_id`, `project_id` | Canonical context IDs when available; otherwise null |
 | `authority.permissions` | Validated permissions; empty when access is not ready |
 | `accessible_client_ids` | Only the active mapped client when ready; otherwise empty |
@@ -209,6 +209,10 @@ remains a setup state; unavailable or malformed authority remains a retry state.
 Those states preserve the authenticated ID session without granting data access
 or repeatedly sending the browser through ID. Every protected data request still
 checks current authority independently of the callback's routing decision.
+
+An otherwise valid allow snapshot without the required base and read permissions
+does not establish a My denial: Dash rejects access locally and does not hand the
+browser to My. The provider must issue an explicit deny for unavailable access.
 
 Base plus `.read` enables scoped reads. Additional `.manage` permits only local
 planned-budget operations through existing `/budgets`, `/budgets/{id}` and
