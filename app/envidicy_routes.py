@@ -1,15 +1,17 @@
 """Opt-in ID login on the existing same-origin Dash API BFF."""
 from __future__ import annotations
 
+import posixpath
 import re
 import secrets
 from urllib.parse import unquote, urlencode, urlsplit
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.services import envidicy_oidc as oidc
-from app.services.auth_cutover import id_only_enabled
+from app.services.auth_cutover import auto_login_enabled, id_only_enabled
 from app.services.envidicy_bridge import MY_URL
 from app.services.envidicy_pilot import (
     PilotConfigurationError, PilotSubjectDenied, load_pilot_subjects, require_pilot_subject,
@@ -31,12 +33,14 @@ def safe_next(value: str | None) -> str:
     if unquote(decoded) != decoded or "\\" in decoded or any(ord(c) < 32 or ord(c) == 127 for c in decoded) or decoded.startswith("//"):
         return "/portal"
     parsed = urlsplit(decoded)
-    if parsed.scheme or parsed.netloc or parsed.path.startswith(("/api/", "/auth/", "/login")):
+    normalized_path = posixpath.normpath(parsed.path)
+    if (parsed.scheme or parsed.netloc or normalized_path in {"/api", "/auth", "/register"}
+            or normalized_path.startswith(("/api/", "/auth/", "/login", "/register/"))):
         return "/portal"
     return value
 
 
-def register_envidicy_routes(app, *, get_bridge, get_auth, settings, set_csrf):
+def register_envidicy_routes(app, *, get_bridge, get_auth, get_context, settings, set_csrf):
     def config():
         cfg = oidc.EnvidicyOidcConfig.from_env()
         load_pilot_subjects(enabled=cfg.enabled)
@@ -66,13 +70,16 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, settings, set_csrf):
     def envidicy_public_config():
         # The cutover policy is independent from ID health. A bad ID secret must
         # never reopen a local password form after the ID-only switch.
-        local_auth_enabled = not id_only_enabled()
+        id_only = id_only_enabled()
+        auto_login = auto_login_enabled()
+        local_auth_enabled = not id_only
         # Misconfiguration is visible as a disabled entry, never a secret value.
         try:
             enabled = config().enabled
         except (oidc.EnvidicyOidcError, PilotConfigurationError):
             enabled = False
         return JSONResponse({"enabled": enabled, "local_auth_enabled": local_auth_enabled,
+                             "auto_login": enabled and (auto_login or id_only),
                              "login_url": "/api/backend/auth/envidicy/start", "my_url": MY_URL},
                             headers={"Cache-Control": "no-store"})
 
@@ -105,6 +112,7 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, settings, set_csrf):
         next_path = safe_next(transaction["next_path"])
         if request.query_params.get("error") or len(request.query_params.getlist("code")) != 1:
             return failed(next_path=next_path)
+        issued = None
         try:
             cfg = config()
             if not cfg.enabled:
@@ -119,11 +127,37 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, settings, set_csrf):
             # creates a separate projection; linking legacy accounts comes later.
             user = get_bridge().store.resolve_identity(identity.issuer, identity.subject, identity.name)
             issued = get_auth().issue_envidicy_session(user.id)
+            # My uses a bounded synchronous client. Resolve it off the event loop
+            # and keep the original 15-minute issuance deadline, including waits.
+            try:
+                context = await run_in_threadpool(get_context, issued.token)
+            except Exception:
+                # A failed local context must not orphan a usable fresh session
+                # or replace an existing login. Never expose exception contents.
+                get_auth().revoke_session(issued.token)
+                return failed(next_path=next_path)
+            cfg = config()
+            if not cfg.enabled:
+                raise ValueError("Envidicy ID is disabled")
+            require_pilot_subject(identity.issuer, identity.subject,
+                                  subjects=load_pilot_subjects(enabled=cfg.enabled))
+            if (not context.valid or context.user_id != user.id
+                    or context.auth_method != "envidicy_id" or context.auth_source != "envidicy_id"):
+                raise ValueError("Envidicy session is unavailable")
         except PilotSubjectDenied:
+            if issued is not None:
+                get_auth().revoke_session(issued.token)
             return failed("envidicy_pilot_only", next_path)
         except (oidc.EnvidicyOidcError, ValueError, HTTPException):
+            if issued is not None:
+                get_auth().revoke_session(issued.token)
             return failed(next_path=next_path)
-        response = finish(RedirectResponse(next_path, status_code=303))
+        authority = context.authority or {}
+        # Only a fully validated My decision may trigger an external handoff.
+        # Pilot exclusion, an unbound project and an outage remain local gates.
+        confirmed_denial = authority.get("access_state") == "not_granted" and authority.get("redirect_to_my") is True
+        destination = MY_URL if confirmed_denial else next_path
+        response = finish(RedirectResponse(destination, status_code=303))
         # Revoke the old browser session only after a complete successful exchange.
         old_token = request.cookies.get(settings.auth_cookie_name)
         if old_token:

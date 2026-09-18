@@ -4562,7 +4562,9 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
 
 from app.envidicy_routes import register_envidicy_routes
 
-register_envidicy_routes(app, get_bridge=_envidicy_bridge, get_auth=_auth_store, settings=settings, set_csrf=_set_csrf_cookie)
+register_envidicy_routes(app, get_bridge=_envidicy_bridge, get_auth=_auth_store,
+                        get_context=lambda token: _auth_facade().get_session_context(token),
+                        settings=settings, set_csrf=_set_csrf_cookie)
 
 
 @app.get(

@@ -8,7 +8,7 @@ import { useLocale } from "../hooks/useLocale";
 import { t } from "../lib/i18n";
 import { resolveApiBase } from "../lib/apiBase";
 import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
-import { canManageEnvidicyBudgets, ENVIDICY_MY_URL } from "../lib/envidicyAuth";
+import { canManageEnvidicyBudgets, ENVIDICY_MY_URL, suppressEnvidicyAutoLogin } from "../lib/envidicyAuth";
 
 export type SidebarSection =
   | "dashboard"
@@ -279,6 +279,7 @@ export function AppSidebar({
     } catch {
       // The local session must still be cleared when the backend is unavailable.
     } finally {
+      suppressEnvidicyAutoLogin();
       clearSessionToken();
       localStorage.removeItem("ops_api_base");
       window.dispatchEvent(new Event("ops-session-updated"));

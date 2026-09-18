@@ -5,6 +5,7 @@ from datetime import timedelta
 import importlib
 import json
 from types import SimpleNamespace
+import threading
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
@@ -14,13 +15,13 @@ import httpx
 import pytest
 
 from app.runtime_db import runtime_conn
-from app.schemas import ClientCreate, SessionIssueRequest, UserCreate
+from app.schemas import ClientCreate, SessionContextResponse, SessionIssueRequest, UserCreate
 from app.services import envidicy_oidc as oidc
 from app.services.auth_arch import SqliteAuthStore
 from app.services.auth_facade import AuthFacadeService
 from app.services.budgets import SqliteBudgetStore
 from app.services.clients import SqliteClientStore
-from app.services.envidicy_bridge import EnvidicyBridge, SqlEnvidicyStore, PRODUCT, utcnow
+from app.services.envidicy_bridge import EnvidicyBridge, MyAuthorityClient, SqlEnvidicyStore, MY_URL, PRODUCT, utcnow
 
 
 @pytest.fixture
@@ -35,7 +36,7 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setenv("ENVIDICY_ID_ENABLED", "true")
     monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", "false")
     monkeypatch.setenv("ENVIDICY_ID_CLIENT_SECRET", "test-only-id-secret-" + "x" * 32)
-    for key in ("DATABASE_URL", "ENVIDICY_ID_CLIENT_SECRET_FILE", "ENVIDICY_MY_AUTHORITY_TOKEN_FILE", "ENVIDICY_MY_AUTHORITY_TOKEN", "ENVIDICY_ID_PILOT_SUBJECTS"):
+    for key in ("DATABASE_URL", "ENVIDICY_ID_CLIENT_SECRET_FILE", "ENVIDICY_MY_AUTHORITY_TOKEN_FILE", "ENVIDICY_MY_AUTHORITY_TOKEN", "ENVIDICY_ID_PILOT_SUBJECTS", "ENVIDICY_ID_AUTO_LOGIN_ENABLED"):
         monkeypatch.delenv(key, raising=False)
 
     def no_network(*_args, **_kwargs):
@@ -212,6 +213,7 @@ def test_pilot_accepts_only_verified_allowed_subject_and_revokes_cohort_on_next_
     api.monkeypatch.setenv("ENVIDICY_ID_PILOT_SUBJECTS", '["another-test-subject"]')
     me = api.browser.get("/auth/me").json()
     assert me["session"]["authority"]["access_state"] == "not_granted"
+    assert me["session"]["authority"]["redirect_to_my"] is False
     assert me["session"]["accessible_client_ids"] == []
     assert len(api.authority_calls) == calls
     denied = api.browser.get("/clients")
@@ -264,7 +266,10 @@ def test_invalid_callbacks_issue_no_session(api, problem):
 
 
 @pytest.mark.parametrize("next_path", ["//evil.example", "/\\evil.example", "/%2f%2fevil.example", "/%252f%252fevil.example",
-                                       "/%250a/evil", "/auth/envidicy/start", "/api/backend/auth/envidicy/start", "/login"])
+                                       "/%250a/evil", "/auth/envidicy/start", "/api/backend/auth/envidicy/start", "/login",
+                                       "/api", "/auth", "/register", "/register/", "/register/complete?next=/portal",
+                                       "/%72egister", "/%2561uth", "/portal/../register", "/portal/%2e%2e/auth",
+                                       "/portal/%252e%252e/api", "/./login", "/x/../auth/envidicy"])
 def test_login_next_cannot_escape_origin_or_loop_into_auth(api, next_path):
     params, _browser = start(api, next_path)
     result = api.browser.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "id-code"})
@@ -287,8 +292,8 @@ def test_feature_off_keeps_legacy_login_me_and_refresh_working_without_my(api):
     assert not api.authority_calls
 
 
-def test_id_callback_preserves_safe_query_and_fragment(api):
-    destination = "/budgets?view=history#entries"
+@pytest.mark.parametrize("destination", ["/budgets?view=history#entries", "/reports/../portal/reports?view=history#entries"])
+def test_id_callback_preserves_safe_query_and_fragment(api, destination):
     response, _params, _browser = login(api, destination)
     assert response.headers["location"] == destination
 
@@ -529,3 +534,143 @@ def test_id_only_config_failure_does_not_reenable_local_login(api):
     response = api.browser.get("/auth/envidicy/config")
     assert response.status_code == 200
     assert response.json()["enabled"] is False and response.json()["local_auth_enabled"] is False
+
+
+@pytest.mark.parametrize("enabled,auto_flag,id_only,expected_auto", [
+    (True, None, False, False),
+    (True, False, False, False),
+    (True, True, False, True),
+    (True, False, True, True),
+    (True, True, True, True),
+    (False, None, False, False),
+    (False, True, False, False),
+    (False, True, True, False),
+])
+def test_auto_login_config_is_opt_in_and_never_changes_legacy_policy(api, enabled, auto_flag, id_only, expected_auto):
+    api.monkeypatch.setenv("ENVIDICY_ID_ENABLED", str(enabled).lower())
+    api.monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", str(id_only).lower())
+    if auto_flag is not None:
+        api.monkeypatch.setenv("ENVIDICY_ID_AUTO_LOGIN_ENABLED", str(auto_flag).lower())
+    response = api.browser.get("/auth/envidicy/config", params={"auto_login": "true", "legacy": "true"})
+    assert response.status_code == 200
+    assert response.json()["enabled"] is enabled
+    assert response.json()["auto_login"] is expected_auto
+    assert response.json()["local_auth_enabled"] is (not id_only)
+    assert response.headers["cache-control"] == "no-store"
+    assert not api.authority_calls
+
+
+@pytest.mark.parametrize("value", ["", "treu", "2"])
+def test_invalid_auto_login_policy_is_503_without_reopening_id_only_login(api, value):
+    api.monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", "true")
+    api.monkeypatch.setenv("ENVIDICY_ID_AUTO_LOGIN_ENABLED", value)
+    response = api.browser.get("/auth/envidicy/config")
+    assert response.status_code == 503
+    assert "envidicy_cutover_configuration_invalid" in response.text
+    assert api.browser.post("/auth/password/login", json={
+        "email": api.legacy.email, "password": "test-local-password-123!",
+    }).status_code == 410
+
+
+def test_callback_confirmed_my_denial_hands_off_to_fixed_my_url_with_short_id_session(api):
+    api.reply.update(access_state="not_granted", permissions=[], redirect_to_my=True)
+    params, _ = start(api, "/portal/reports?period=month#totals")
+    response = api.browser.get("/auth/envidicy/callback", params={
+        "state": params["state"][0], "code": "id-code", "my_url": "https://untrusted.example",
+    })
+    assert response.status_code == 303 and response.headers["location"] == MY_URL
+    assert len(api.authority_calls) == 1
+    checked = api.auth.validate_session(api.browser.cookies.get(api.main.settings.auth_cookie_name))
+    assert checked.valid and checked.auth_method == "envidicy_id"
+    assert checked.expires_at == checked.issued_at + timedelta(minutes=15)
+    assert api.browser.cookies.get(api.main.settings.csrf_cookie_name)
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert api.browser.get("/clients").status_code == 403
+
+
+@pytest.mark.parametrize("state", ["ready", "not_granted", "project_unlinked", "context_unavailable"])
+def test_callback_without_confirmed_my_denial_stays_in_dash_for_existing_access_gate(api, state):
+    if state == "project_unlinked":
+        api.monkeypatch.setattr(api.store, "binding", lambda *_args: None)
+    else:
+        api.reply.update(access_state=state)
+    response, _, _ = login(api, "/portal/reports?view=weekly#chart")
+    assert len(api.authority_calls) == 1
+    assert api.auth.validate_session(api.browser.cookies.get(api.main.settings.auth_cookie_name)).valid
+    me = api.browser.get("/auth/me").json()
+    assert me["session"]["authority"]["access_state"] == state
+    assert me["session"]["authority"]["redirect_to_my"] is False
+
+
+def test_callback_resolves_my_once_off_the_async_event_loop(api):
+    exchange_threads, authority_threads = [], []
+    async def exchange(*_args, **_kwargs):
+        exchange_threads.append(threading.get_ident())
+        return api.identity
+    original = api.main.app.state.envidicy_bridge.authority.resolve
+    def resolve(*args):
+        authority_threads.append(threading.get_ident())
+        return original(*args)
+    api.monkeypatch.setattr(oidc, "exchange_code", exchange)
+    api.monkeypatch.setattr(api.main.app.state.envidicy_bridge.authority, "resolve", resolve)
+    login(api)
+    assert len(exchange_threads) == len(authority_threads) == 1
+    assert exchange_threads[0] != authority_threads[0]
+
+
+@pytest.mark.parametrize("problem", [401, 403, 429, 503, "timeout", "malformed"])
+def test_callback_my_transport_failure_is_a_retryable_local_gate_not_a_denial(api, problem):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        if problem == "timeout":
+            raise httpx.ReadTimeout("Private transport diagnostic", request=request)
+        return httpx.Response(200 if problem == "malformed" else problem, json={})
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        api.monkeypatch.setattr(api.main.app.state.envidicy_bridge, "authority", MyAuthorityClient(client=client, token="test-only"))
+        response, _, _ = login(api, "/portal/reports?view=weekly#chart")
+        assert len(calls) == 1
+        token = api.browser.cookies.get(api.main.settings.auth_cookie_name)
+        assert api.auth.validate_session(token).valid
+        me = api.browser.get("/auth/me").json()
+        assert me["session"]["authority"]["access_state"] == "context_unavailable"
+        assert me["session"]["authority"]["redirect_to_my"] is False
+        assert api.browser.get("/clients").status_code == 503
+        assert "Private transport diagnostic" not in response.text and "Private transport diagnostic" not in str(me)
+
+
+@pytest.mark.parametrize("failure", ["invalid", "wrong_user", "legacy_origin", "exception", "pilot_removed", "pilot_malformed", "disabled"])
+def test_callback_unusable_new_session_is_revoked_and_preserves_previous_cookie(api, failure):
+    old = api.auth.issue_session(SessionIssueRequest(user_id=api.legacy.id, ttl_minutes=60))
+    api.browser.cookies.set(api.main.settings.auth_cookie_name, old.token, domain="dash.envidicy.kz", path="/")
+    original = api.main.app.state.auth_facade.get_session_context
+    issued_tokens = []
+    def resolve(token):
+        issued_tokens.append(token)
+        if failure == "exception":
+            raise RuntimeError("Untrusted private dependency diagnostic")
+        context = original(token)
+        if failure == "invalid":
+            return SessionContextResponse(valid=False, reason="revoked")
+        if failure == "wrong_user":
+            return context.model_copy(update={"user_id": api.legacy.id})
+        if failure == "legacy_origin":
+            return context.model_copy(update={"auth_method": None})
+        if failure == "pilot_removed":
+            api.monkeypatch.setenv("ENVIDICY_ID_PILOT_SUBJECTS", '["another-subject"]')
+        elif failure == "pilot_malformed":
+            api.monkeypatch.setenv("ENVIDICY_ID_PILOT_SUBJECTS", "[]")
+        else:
+            api.monkeypatch.setenv("ENVIDICY_ID_ENABLED", "false")
+        return context
+    api.monkeypatch.setattr(api.main.app.state.auth_facade, "get_session_context", resolve)
+    params, _ = start(api, "/portal/reports?view=weekly#chart")
+    response = api.browser.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "id-code"})
+    redirect = parse_qs(urlsplit(response.headers["location"]).query)
+    expected_error = "envidicy_pilot_only" if failure == "pilot_removed" else "envidicy_auth_failed"
+    assert redirect == {"oauth_error": [expected_error], "next": ["/portal/reports?view=weekly#chart"]}
+    assert len(issued_tokens) == 1 and not api.auth.validate_session(issued_tokens[0]).valid
+    assert api.auth.validate_session(old.token).valid
+    assert api.browser.cookies.get(api.main.settings.auth_cookie_name) == old.token
+    assert "Untrusted" not in response.text and "Untrusted" not in response.headers["location"]

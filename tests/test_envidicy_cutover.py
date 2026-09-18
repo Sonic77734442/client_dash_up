@@ -6,7 +6,7 @@ from fastapi import HTTPException
 import pytest
 
 from app.schemas import SessionIssueRequest
-from app.services.auth_cutover import id_only_enabled
+from app.services.auth_cutover import auto_login_enabled, id_only_enabled
 from test_envidicy_routes import api, csrf, login  # shared isolated API fixture
 
 
@@ -25,6 +25,20 @@ def test_explicit_true_policy(value):
 def test_invalid_policy_fails_closed(value):
     with pytest.raises(HTTPException) as error:
         id_only_enabled({"ENVIDICY_ID_ONLY_ENABLED": value})
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("value,expected", [("false", False), ("0", False), ("off", False), ("no", False),
+                                           ("true", True), ("1", True), ("on", True), ("yes", True), (" TRUE ", True)])
+def test_auto_login_policy_is_explicit_and_default_off(value, expected):
+    assert auto_login_enabled({}) is False
+    assert auto_login_enabled({"ENVIDICY_ID_AUTO_LOGIN_ENABLED": value}) is expected
+
+
+@pytest.mark.parametrize("value", ["", "treu", "enabled", "2"])
+def test_invalid_auto_login_policy_fails_closed(value):
+    with pytest.raises(HTTPException) as error:
+        auto_login_enabled({"ENVIDICY_ID_AUTO_LOGIN_ENABLED": value})
     assert error.value.status_code == 503
 
 

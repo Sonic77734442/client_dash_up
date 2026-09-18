@@ -12,9 +12,9 @@ from collections.abc import Mapping
 from fastapi import HTTPException
 
 
-def id_only_enabled(environment: Mapping[str, str] | None = None) -> bool:
+def _enabled(name: str, environment: Mapping[str, str] | None = None) -> bool:
     environment = os.environ if environment is None else environment
-    raw = str(environment.get("ENVIDICY_ID_ONLY_ENABLED", "false")).strip().lower()
+    raw = str(environment.get(name, "false")).strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
@@ -23,6 +23,15 @@ def id_only_enabled(environment: Mapping[str, str] | None = None) -> bool:
         "code": "envidicy_cutover_configuration_invalid",
         "message": "The login policy is unavailable; contact the service operator",
     })
+
+
+def id_only_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    return _enabled("ENVIDICY_ID_ONLY_ENABLED", environment)
+
+
+def auto_login_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    """Opt-in browser entry policy, independent from closing legacy login."""
+    return _enabled("ENVIDICY_ID_AUTO_LOGIN_ENABLED", environment)
 
 
 def require_legacy_auth_enabled() -> None:

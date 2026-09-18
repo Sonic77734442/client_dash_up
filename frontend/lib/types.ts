@@ -358,6 +358,7 @@ export type EnvidicyAuthority = {
   permissions: string[];
   product: "dash.analytics";
   my_url?: string;
+  redirect_to_my?: boolean;
 };
 
 export type SessionContext = {

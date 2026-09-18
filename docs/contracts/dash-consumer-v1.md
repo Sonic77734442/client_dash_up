@@ -50,7 +50,7 @@ below are backend paths; browser callers prefix them with `/api/backend`.
 | --- | --- |
 | `GET /auth/envidicy/config` | Non-secret login policy; `Cache-Control: no-store`. |
 | `GET /auth/envidicy/start` | Creates a browser-bound OIDC transaction, then redirects to ID. |
-| `GET /auth/envidicy/callback` | Consumes the transaction once, validates ID exchange and issues a Dash session. |
+| `GET /auth/envidicy/callback` | Consumes the transaction once, validates ID exchange, issues a Dash session and checks My before choosing the browser destination. |
 | `POST /auth/envidicy/logout` | Revokes the selected Dash session and returns `logout_url`; cookie authentication requires CSRF protection. |
 | `GET /auth/envidicy/logout/callback` | Consumes the logout transaction and redirects to `/login`. |
 | `GET /auth/me` | Existing user/session response with additive ID authority context. |
@@ -61,6 +61,7 @@ The configuration response has these fields:
 ```json
 {
   "enabled": false,
+  "auto_login": false,
   "local_auth_enabled": true,
   "login_url": "/api/backend/auth/envidicy/start",
   "my_url": "https://my.envidicy.com/products"
@@ -73,6 +74,26 @@ of ID health. On policy network errors, 5xx or malformed responses, the UI shows
 a retry state rather than promising a password fallback. Compatibility with an
 older backend is limited to the existing policy response without the additive
 field, or an absent configuration route returning 404.
+
+`auto_login` selects automatic browser entry, not permission to access data.
+It is true only when ID is configured and either
+`ENVIDICY_ID_AUTO_LOGIN_ENABLED=true` or ID-only mode is enabled. The automatic
+entry switch defaults off and does not close legacy authentication. A missing
+`auto_login` field on an older backend keeps manual entry; malformed policy does
+not trigger authentication or restore local login.
+
+For an unauthenticated browser, opening Dash preserves the requested local path,
+query and fragment and starts the existing ID authorization flow after both
+session and policy checks complete. Existing valid sessions are not restarted.
+Login and registration belong to ID; Dash does not create a separate password
+registration flow or grant access to newly registered identities.
+
+Any callback error, an explicit logout, or an automatic attempt that returns
+without a valid session stops automatic re-entry. A per-tab marker contains no
+tokens or identity data; unavailable browser storage falls back to an explicit
+ID link. Manual retry remains possible. During the dual-login pilot only,
+`/login?legacy=1` explicitly selects the still-enabled legacy form. This query
+cannot override the server's ID-only policy.
 
 ## Identity and sessions
 
@@ -164,6 +185,7 @@ the response projects `user.role` and `session.role` as `client`,
 | `authority.product` | `dash.analytics` |
 | `authority.my_url` | Fixed My navigation URL |
 | `authority.access_state` | `ready`, `not_granted`, `project_unlinked`, or `context_unavailable` |
+| `authority.redirect_to_my` | True only for a validated My denial or fully validated insufficient Dash permissions; not for pilot exclusion, missing local binding or upstream failure |
 | `authority.organization_id`, `project_id` | Canonical context IDs when available; otherwise null |
 | `authority.permissions` | Validated permissions; empty when access is not ready |
 | `accessible_client_ids` | Only the active mapped client when ready; otherwise empty |
@@ -177,6 +199,16 @@ ready, allowing a stable explanation and My navigation instead of a login loop.
 Protected data routes return `envidicy_access_required`: HTTP 403 for denied or
 unlinked access, HTTP 503 for unavailable authority. Missing or invalid Dash
 authentication remains an authentication error, not a My entitlement denial.
+
+The callback redirects confirmed My denials directly to the fixed My navigation
+URL. The frontend applies the same trusted decision to an existing ID session,
+including when access is revoked. Neither redirects to a URL supplied by a user
+or an authority payload, nor appends the Dash return path to My. A ready, mapped
+session returns to the validated Dash destination. Missing local project binding
+remains a setup state; unavailable or malformed authority remains a retry state.
+Those states preserve the authenticated ID session without granting data access
+or repeatedly sending the browser through ID. Every protected data request still
+checks current authority independently of the callback's routing decision.
 
 Base plus `.read` enables scoped reads. Additional `.manage` permits only local
 planned-budget operations through existing `/budgets`, `/budgets/{id}` and
@@ -194,7 +226,8 @@ Unsupported writes return HTTP 403 `envidicy_operation_not_available`.
 | true | true | Later ID-only cutover, only after migration and role/access acceptance. |
 | false | true | ID unavailable and local login still closed; no implicit fallback. |
 
-Both switches default off. Invalid ID-only policy configuration returns HTTP 503.
+All login switches default off. Invalid ID-only or automatic-entry policy
+configuration returns HTTP 503.
 When ID-only is on, local human login/mint/refresh and old human sessions cannot
 bypass it. Dedicated service authentication remains separate. No change to the
 15-minute ID-session policy is required for these states.

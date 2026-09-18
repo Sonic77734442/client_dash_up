@@ -126,6 +126,7 @@ def test_my_scope_replaces_all_local_grants_and_rechecks_every_request(stores):
                     "decision": "deny", "reason_code": "permission_denied", "evaluated_at": utcnow().isoformat()})
     revoked = bridge.project_session(local)
     assert revoked.accessible_client_ids == [] and revoked.authority["access_state"] == "not_granted"
+    assert revoked.authority["redirect_to_my"] is True
     assert len(calls) == 2
 
 
@@ -254,6 +255,7 @@ def test_id_session_with_future_issuance_is_rejected(stores):
     lambda p: p.update(permissions=[PRODUCT, PRODUCT + ".read", "platform.admin"]),
     lambda p: p.update(valid_until=(utcnow() - timedelta(seconds=1)).isoformat()),
     lambda p: p.update(extra="not allowed"),
+    lambda p: p.update(redirect_to_my=True),
 ])
 def test_authority_rejects_malformed_or_cross_tenant_decisions(mutate):
     payload = decision()
@@ -263,7 +265,7 @@ def test_authority_rejects_malformed_or_cross_tenant_decisions(mutate):
         validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=request_id)
 
 
-@pytest.mark.parametrize("status", [301, 302, 401, 403, 500, 503])
+@pytest.mark.parametrize("status", [301, 302, 401, 403, 429, 500, 503])
 def test_my_errors_are_not_allowed_decisions(status):
     client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status, json={})))
     with pytest.raises(ValueError):
@@ -330,3 +332,44 @@ def test_operator_dry_run_does_not_create_missing_sqlite_database(monkeypatch, t
     assert cli.main() == 2
     assert not path.exists()
     assert "no file was created" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("permissions", [[], [PRODUCT], [PRODUCT + ".read"], [PRODUCT + ".manage"]])
+def test_validated_allow_without_required_permissions_is_a_confirmed_my_handoff(permissions):
+    payload = decision()
+    payload["permissions"] = permissions
+    result = validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=payload["request_id"])
+    assert result == {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda p: p.update(revocation={}),
+    lambda p: p["membership"].update(version=True),
+    lambda p: p["entitlements"][0].update(version=0),
+    lambda p: p["revocation"].update(membership_generation=999),
+    lambda p: p["revocation"].update(checked_at="invalid"),
+    lambda p: p.update(authority_revision=""),
+])
+def test_insufficient_permissions_do_not_skip_full_snapshot_validation(mutate):
+    payload = decision()
+    payload["permissions"] = [PRODUCT]
+    mutate(payload)
+    with pytest.raises(ValueError):
+        validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=payload["request_id"])
+
+
+@pytest.mark.parametrize("reason", ["permission_denied", "context_missing", "context_ambiguous", "identity_unmapped"])
+def test_validated_my_denial_can_handoff_without_exposing_raw_reason(reason):
+    request_id = str(uuid4())
+    payload = {"contract_version": "envidicy.authority.v1", "request_id": request_id,
+               "principal": {"iss": ISSUER, "sub": "id-subject"}, "decision": "deny",
+               "reason_code": reason, "evaluated_at": utcnow().isoformat()}
+    result = validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=request_id)
+    assert result == {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
+    assert "reason_code" not in result
+
+
+def test_ready_authority_is_not_an_external_handoff():
+    payload = decision()
+    result = validate_authority(payload, issuer=ISSUER, subject="id-subject", request_id=payload["request_id"])
+    assert result["access_state"] == "ready" and result["redirect_to_my"] is False

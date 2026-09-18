@@ -97,7 +97,7 @@ def validate_authority(payload: object, *, issuer: str, subject: str, request_id
     if deny:
         if not isinstance(payload["reason_code"], str) or not 1 <= len(payload["reason_code"]) <= 100:
             raise ValueError("Invalid authority denial")
-        return {"access_state": "not_granted", "permissions": []}
+        return {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
     if payload["decision"] != "allow":
         raise ValueError("Unknown authority decision")
     until = _instant(payload["valid_until"])
@@ -128,8 +128,6 @@ def validate_authority(payload: object, *, issuer: str, subject: str, request_id
     permissions = payload["permissions"]
     if not isinstance(permissions, list) or any(not isinstance(p, str) or p not in PERMISSIONS for p in permissions) or len(set(permissions)) != len(permissions):
         raise ValueError("Invalid product permissions")
-    if not {PRODUCT, PRODUCT + ".read"}.issubset(permissions):
-        return {"access_state": "not_granted", "permissions": []}
     revocation = _keys(payload["revocation"], {"membership_generation", "entitlement_generation", "checked_at"})
     for version in (membership["version"], grant["version"], revocation["membership_generation"], revocation["entitlement_generation"]):
         if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= 2**53 - 1:
@@ -138,7 +136,11 @@ def validate_authority(payload: object, *, issuer: str, subject: str, request_id
         raise ValueError("Invalid authority revocation snapshot")
     if not isinstance(payload["authority_revision"], str) or not 1 <= len(payload["authority_revision"]) <= 128:
         raise ValueError("Invalid authority revision")
-    return {"access_state": "ready", "permissions": permissions, "organization_id": organization_id,
+    # A malformed allow is an unavailable dependency, not a confirmed denial.
+    # Finish validating its complete snapshot before offering a handoff to My.
+    if not {PRODUCT, PRODUCT + ".read"}.issubset(permissions):
+        return {"access_state": "not_granted", "permissions": [], "redirect_to_my": True}
+    return {"access_state": "ready", "permissions": permissions, "redirect_to_my": False, "organization_id": organization_id,
             "project_id": project_id, "organization_name": membership["organization_name"],
             "project_name": membership["project_name"], "valid_until": until.isoformat(),
             "authority_revision": payload["authority_revision"]}
@@ -332,7 +334,8 @@ class EnvidicyBridge:
             return context.model_copy(update={"valid": False, "reason": "envidicy_identity_unlinked",
                                               "role": "client", "global_access": False, "access_scope": "assigned",
                                               "accessible_client_ids": [], "auth_source": "envidicy_id", "authority": None})
-        authority = {"product": PRODUCT, "my_url": MY_URL, "access_state": "context_unavailable", "permissions": [], "organization_id": None, "project_id": None}
+        authority = {"product": PRODUCT, "my_url": MY_URL, "access_state": "context_unavailable", "redirect_to_my": False,
+                     "permissions": [], "organization_id": None, "project_id": None}
         clients = []
         if self.enabled():
             try:
@@ -347,10 +350,10 @@ class EnvidicyBridge:
                     if client and client.status == "active":
                         clients = [client_id]
                     else:
-                        authority.update(access_state="project_unlinked", permissions=[])
+                        authority.update(access_state="project_unlinked", permissions=[], redirect_to_my=False)
             except PilotSubjectDenied:
-                authority.update(access_state="not_granted", permissions=[])
+                authority.update(access_state="not_granted", permissions=[], redirect_to_my=False)
             except (ValueError, OSError, httpx.HTTPError, KeyError, TypeError):
-                authority.update(access_state="context_unavailable", permissions=[])
+                authority.update(access_state="context_unavailable", permissions=[], redirect_to_my=False)
         return context.model_copy(update={"role": "client", "global_access": False, "access_scope": "assigned",
                                          "accessible_client_ids": clients, "auth_source": "envidicy_id", "authority": authority})

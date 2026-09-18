@@ -1,11 +1,11 @@
 const USER_CANCELLED_ERRORS = new Set(["access_denied", "user_denied"]);
 const SAFE_OAUTH_ERROR_MESSAGES: Record<string, string> = {
   envidicy_auth_not_configured:
-    "Вход через Envidicy ID пока не включён. Используйте существующий способ входа в Dash.",
+    "Вход через Envidicy ID пока не включён. Повторите проверку входа или обратитесь к администратору.",
   envidicy_auth_disabled:
-    "Вход через Envidicy ID пока не включён. Используйте существующий способ входа в Dash.",
+    "Вход через Envidicy ID пока не включён. Повторите проверку входа или обратитесь к администратору.",
   envidicy_auth_failed:
-    "Не удалось завершить вход через Envidicy ID. Попробуйте ещё раз или используйте существующий вход в Dash.",
+    "Не удалось завершить вход через Envidicy ID. Повторите вход вручную или обратитесь к администратору.",
   envidicy_pilot_only:
     "Вход через Envidicy ID пока доступен только тестовой группе. Ваша прежняя учётная запись не изменена.",
   access_not_granted:

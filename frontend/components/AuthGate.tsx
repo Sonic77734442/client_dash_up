@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "../hooks/useAuth";
 import { EnvidicyAccessGate } from "./EnvidicyAccessGate";
-import { canManageEnvidicyBudgets, envidicyAccessIssue } from "../lib/envidicyAuth";
+import { canManageEnvidicyBudgets, clearEnvidicyAutoLogin, envidicyAccessIssue, ENVIDICY_MY_URL, shouldRedirectToMy } from "../lib/envidicyAuth";
 import {
   type AppRole,
   destinationForRole,
@@ -28,9 +28,18 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const roleAllowed = Boolean(currentRole && isPathAllowedForRole(currentRole, currentPath))
     || (canManageLocalBudgets && currentPath === "/budgets");
   const envidicyIssue = envidicyAccessIssue(me?.session);
+  const redirectToMy = shouldRedirectToMy(me?.session);
+
+  useEffect(() => {
+    if (ready && authenticated && !error) clearEnvidicyAutoLogin();
+  }, [ready, authenticated, error]);
 
   useEffect(() => {
     if (!ready) return;
+    if (!error && redirectToMy) {
+      window.location.replace(ENVIDICY_MY_URL);
+      return;
+    }
     if (envidicyIssue && !isPublic) return;
 
     if (error) {
@@ -62,7 +71,11 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     if (!roleAllowed) {
       router.replace(destinationForRole(currentRole));
     }
-  }, [ready, authenticated, canManageLocalBudgets, currentPath, currentRole, envidicyIssue, error, isPublic, roleAllowed, router]);
+  }, [ready, authenticated, canManageLocalBudgets, currentPath, currentRole, envidicyIssue, error, isPublic, redirectToMy, roleAllowed, router]);
+
+  if (ready && redirectToMy && !error) {
+    return <main className="auth-outage-shell" role="status">Открываем My для настройки доступа…</main>;
+  }
 
   if (ready && envidicyIssue && !isPublic) {
     return <EnvidicyAccessGate issue={envidicyIssue} refresh={refresh} logout={logout} />;
