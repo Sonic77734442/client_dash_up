@@ -84,7 +84,7 @@ def test_sync_run_updates_account_sync_fields_and_job_log():
     by_id = {x["id"]: x for x in listed.json()["items"]}
     assert by_id[ok_acc["id"]]["sync_status"] == "success"
     assert by_id[bad_acc["id"]]["sync_status"] == "error"
-    assert by_id[bad_acc["id"]]["sync_error"] == "provider down"
+    assert by_id[bad_acc["id"]]["sync_error"] == "The provider is temporarily unavailable. Synchronization will retry after the scheduled delay."
     assert by_id[bad_acc["id"]]["sync_error_category"] == "provider"
     assert by_id[bad_acc["id"]]["sync_retryable"] is True
     assert by_id[bad_acc["id"]]["sync_next_retry_at"] is not None

@@ -13,6 +13,8 @@ class RequestContext:
     role: str
     global_access: bool
     accessible_client_ids: Set[UUID]
+    auth_source: Optional[str] = None
+    permissions: frozenset[str] = frozenset()
 
 
 
@@ -22,6 +24,12 @@ def ensure_admin(ctx: RequestContext) -> None:
 
 
 def ensure_tenant_write_access(ctx: RequestContext) -> None:
+    # ID requests additionally pass the closed budget-only route gate in main.
+    # This does not promote an ID user to agency/admin or grant provider writes.
+    if ctx.auth_source == "envidicy_id":
+        if "dash.analytics.manage" not in ctx.permissions:
+            raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "My budget-management permission required"})
+        return
     if ctx.role not in {"admin", "agency"}:
         raise HTTPException(
             status_code=403,

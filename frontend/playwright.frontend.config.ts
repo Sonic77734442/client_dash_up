@@ -4,7 +4,7 @@ import { defineConfig } from "@playwright/test";
 const browserExecutable = process.env.PLAYWRIGHT_EXECUTABLE_PATH?.trim();
 export default defineConfig({
   testDir: "./tests/smoke",
-  testMatch: ["client-portal-race.spec.ts", "agency-report-currency.spec.ts", "dashboard-currency.spec.ts"],
+  testMatch: ["client-portal-race.spec.ts", "agency-report-currency.spec.ts", "dashboard-currency.spec.ts", "envidicy-entry.spec.ts"],
   workers: 1,
   timeout: 45_000,
   retries: 0,

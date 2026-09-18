@@ -28,6 +28,17 @@ from app.services.meta_connection import (
 from app.services.providers import google_ads, meta, tiktok
 from app.services.ad_stats import AdStatsStore
 from app.services.provider_metrics import ProviderPayloadValidationError, provider_count, provider_money
+from app.services.sync_diagnostics import (
+    META_RECONNECT_MESSAGES,
+    safe_meta_reconnect_code,
+    safe_sync_error_message,
+)
+
+
+def _public_sync_job(job: AdAccountSyncJobOut) -> AdAccountSyncJobOut:
+    if job.error_message is None:
+        return job
+    return job.model_copy(update={"error_message": safe_sync_error_message(job.error_code, job.error_message)})
 
 
 class AdAccountSyncJobStore(Protocol):
@@ -54,7 +65,10 @@ class SqliteAdAccountSyncJobStore:
             started_at=datetime.fromisoformat(row["started_at"]),
             finished_at=datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None,
             records_synced=int(row["records_synced"] or 0),
-            error_message=row["error_message"],
+            error_message=(
+                safe_sync_error_message(row["error_code"] if "error_code" in row.keys() else None, row["error_message"])
+                if row["error_message"] is not None else None
+            ),
             error_code=row["error_code"] if "error_code" in row.keys() else None,
             error_category=row["error_category"] if "error_category" in row.keys() else None,
             retryable=bool(row["retryable"]) if "retryable" in row.keys() and row["retryable"] is not None else False,
@@ -191,7 +205,7 @@ class InMemoryAdAccountSyncJobStore:
 
     def create(self, job: AdAccountSyncJobOut) -> AdAccountSyncJobOut:
         self.items[job.id] = job
-        return job
+        return _public_sync_job(job)
 
     def list(self, *, account_id: Optional[UUID] = None, status: Optional[str] = None, limit: int = 50) -> List[AdAccountSyncJobOut]:
         rows = list(self.items.values())
@@ -200,7 +214,7 @@ class InMemoryAdAccountSyncJobStore:
         if status and status != "all":
             rows = [r for r in rows if r.status == status]
         rows.sort(key=lambda x: x.started_at, reverse=True)
-        return rows[: max(1, min(limit, 500))]
+        return [_public_sync_job(row) for row in rows[: max(1, min(limit, 500))]]
 
     def latest_by_account_ids(self, account_ids: List[UUID]) -> Dict[UUID, AdAccountSyncJobOut]:
         result: Dict[UUID, AdAccountSyncJobOut] = {}
@@ -208,7 +222,7 @@ class InMemoryAdAccountSyncJobStore:
         wanted = set(account_ids)
         for row in rows:
             if row.ad_account_id in wanted and row.ad_account_id not in result:
-                result[row.ad_account_id] = row
+                result[row.ad_account_id] = _public_sync_job(row)
         return result
 
     def acquire_lease(self, *, lease_key: str, now: datetime, ttl_seconds: int) -> Optional[str]:
@@ -438,6 +452,16 @@ class AdAccountSyncService:
 
     @staticmethod
     def _to_error_message(exc: Exception) -> str:
+        # Never persist exception strings: HTTP/SDK errors may contain request
+        # URLs, Authorization headers, credentials or arbitrary response bodies.
+        if isinstance(exc, MetaCredentialReconnectRequiredError):
+            return META_RECONNECT_MESSAGES[safe_meta_reconnect_code(exc.code)]
+        code, _category, _retryable = AdAccountSyncService._classify_error(exc)
+        return safe_sync_error_message(code, AdAccountSyncService._classification_text(exc))
+
+    @staticmethod
+    def _classification_text(exc: Exception) -> str:
+        """Transient matching input only; never log, persist or return this text."""
         if isinstance(exc, HTTPException):
             detail = exc.detail
             if isinstance(detail, dict):
@@ -453,7 +477,7 @@ class AdAccountSyncService:
             return ("provider_credentials_missing", "configuration", False)
         if isinstance(exc, MetaCredentialReconnectRequiredError):
             return ("provider_reconnect_required", "auth", False)
-        raw = AdAccountSyncService._to_error_message(exc).lower()
+        raw = AdAccountSyncService._classification_text(exc).lower()
         if isinstance(exc, HTTPException):
             status = int(exc.status_code or 0)
             if status in {401, 403}:
@@ -638,10 +662,9 @@ class AdAccountSyncService:
             used_meta_diagnostic: Optional[MetaCredentialDiagnostic] = None
             meta_diagnostic_code: Optional[str] = None
             if not fetcher:
-                err = f"Provider not supported: {provider}"
                 status = "error"
                 records = 0
-                error_message = err
+                error_message = safe_sync_error_message("provider_not_supported")
                 error_code = "provider_not_supported"
                 error_category = "configuration"
                 retryable = False
@@ -760,7 +783,7 @@ class AdAccountSyncService:
                     error_message = self._to_error_message(exc)
                     error_code, error_category, retryable = self._classify_error(exc)
                     if isinstance(exc, MetaCredentialReconnectRequiredError):
-                        meta_diagnostic_code = exc.code
+                        meta_diagnostic_code = safe_meta_reconnect_code(exc.code)
                     next_retry_at = self._next_retry_at(now=s_at, attempt=attempt) if retryable else None
 
             f_at = _utcnow()

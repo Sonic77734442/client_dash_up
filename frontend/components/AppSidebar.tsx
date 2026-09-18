@@ -8,6 +8,7 @@ import { useLocale } from "../hooks/useLocale";
 import { t } from "../lib/i18n";
 import { resolveApiBase } from "../lib/apiBase";
 import { clearSessionToken, getSessionToken } from "../lib/sessionToken";
+import { canManageEnvidicyBudgets, ENVIDICY_MY_URL } from "../lib/envidicyAuth";
 
 export type SidebarSection =
   | "dashboard"
@@ -246,6 +247,8 @@ export function AppSidebar({
     : "agency";
   const role = (agencyContext.role || inferredRole) as Role;
   const groups = menuForRole(role);
+  const isEnvidicySession = agencyContext.sessionContext?.auth_source === "envidicy_id";
+  const envidicyBudgetPath = canManageEnvidicyBudgets(agencyContext.sessionContext) ? "/budgets" : "/portal/billing";
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const roleSubtitle =
@@ -347,6 +350,22 @@ export function AppSidebar({
             })}
           </div>
         ))}
+        {isEnvidicySession ? (
+          <div className="role-menu-group">
+            <div className="role-menu-label">Envidicy ID</div>
+            {role === "client" ? (
+              <Link className={`role-menu-item ${pathname === envidicyBudgetPath ? "active" : ""}`}
+                href={envidicyBudgetPath} aria-current={pathname === envidicyBudgetPath ? "page" : undefined}>
+                <span className="role-menu-icon"><SidebarIcon name="budgets" /></span>
+                <span>Плановые бюджеты</span>
+              </Link>
+            ) : null}
+            <a className="role-menu-item" href={ENVIDICY_MY_URL}>
+              <span className="role-menu-icon"><SidebarIcon name="access" /></span>
+              <span>My Envidicy</span>
+            </a>
+          </div>
+        ) : null}
       </nav>
 
       <div className="sidebar-footer role-sidebar-footer">

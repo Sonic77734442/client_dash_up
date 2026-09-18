@@ -13,6 +13,7 @@ import {
 } from "../../lib/authRedirect";
 import { oauthErrorMessage } from "../../lib/oauthError";
 import { oauthRelayLaunchPath } from "../../lib/oauthLaunchRelay";
+import { envidicyLoginPolicy, envidicyLoginPath, type EnvidicyLoginPolicy } from "../../lib/envidicyAuth";
 import { clearSessionToken, setSessionToken } from "../../lib/sessionToken";
 import styles from "./login.module.css";
 
@@ -96,6 +97,9 @@ function LoginPageContent() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [loginPolicy, setLoginPolicy] = useState<EnvidicyLoginPolicy | null>(null);
+  const [policyState, setPolicyState] = useState<"loading" | "ready" | "unavailable">("loading");
+  const [policyAttempt, setPolicyAttempt] = useState(0);
   const { locale, setLocale } = useLocale();
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
@@ -107,6 +111,9 @@ function LoginPageContent() {
   const oauthError = useMemo(() => oauthErrorMessage(oauthErrorCode), [oauthErrorCode]);
   const needsFacebookMigration = oauthErrorCode === "facebook_migration_required";
   const tr = (en: string, ru: string) => locale === "en" ? en : ru;
+  const localAuthEnabled = policyState === "ready" && loginPolicy?.localAuthEnabled === true;
+  const envidicyEnabled = policyState === "ready" && loginPolicy?.idEnabled === true;
+  const showInvite = localAuthEnabled && Boolean(inviteToken);
 
   function redirectAfterLogin(payload: unknown) {
     const role = readRole(payload);
@@ -118,7 +125,31 @@ function LoginPageContent() {
     setApiBase(base);
   }, [defaultApiBase]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setPolicyState("loading");
+    setLoginPolicy(null);
+    const timeout = window.setTimeout(() => {
+      controller.abort();
+      if (active) setPolicyState("unavailable");
+    }, 10_000);
+    void fetch("/api/backend/auth/envidicy/config", {
+      credentials: "include", cache: "no-store", signal: controller.signal,
+    }).then(async (response) => {
+      const config: unknown = response.status === 200 ? await response.json() : null;
+      if (!active || controller.signal.aborted) return;
+      const policy = envidicyLoginPolicy(config, response.status);
+      setLoginPolicy(policy);
+      setPolicyState(policy ? "ready" : "unavailable");
+    }).catch(() => {
+      if (active) setPolicyState("unavailable");
+    }).finally(() => window.clearTimeout(timeout));
+    return () => { active = false; window.clearTimeout(timeout); controller.abort(); };
+  }, [policyAttempt]);
+
   async function signInWithToken() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const t = token.trim();
     if (!base || !t) {
@@ -149,6 +180,7 @@ function LoginPageContent() {
   }
 
   async function acceptInvite() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     if (!base || !inviteToken) {
       setError("В приглашении отсутствует токен");
@@ -184,6 +216,7 @@ function LoginPageContent() {
   }
 
   async function signInWithPassword() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const em = email.trim().toLowerCase();
     if (!base || !em || password.length < 8) {
@@ -219,6 +252,7 @@ function LoginPageContent() {
     provider: "facebook" | "google",
     intent: "login" | "migrate" = "login",
   ) {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     localStorage.setItem(LS_API_BASE, base);
     clearSessionToken();
@@ -256,7 +290,15 @@ function LoginPageContent() {
     },
   ];
 
-  const statusMessage = error || oauthError;
+  const statusMessage = error || (localAuthEnabled || oauthErrorCode.startsWith("envidicy_") ? oauthError : "");
+  const envidicyEntry = envidicyEnabled ? (
+    <a className={styles.providerButton} href={envidicyLoginPath(search.get("next"))} onClick={() => {
+      clearSessionToken();
+      window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+    }}>
+      {tr("Sign in with Envidicy ID", "Войти через Envidicy ID")}
+    </a>
+  ) : null;
 
   return (
     <div className={styles.page} data-i18n-skip>
@@ -319,10 +361,10 @@ function LoginPageContent() {
             <div>
               <p className={styles.eyebrow}>Dash Envidicy</p>
               <h2 className={styles.panelTitle}>
-                {inviteToken ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
+                {showInvite ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
               </h2>
               <p className={styles.panelText}>
-                {inviteToken
+                {showInvite
                   ? tr("Create a password to join the workspace.", "Создайте пароль, чтобы войти в рабочее пространство.")
                   : tr("Enter your details to access the advertising operations center.", "Войдите в операционный центр управления рекламой.")}
               </p>
@@ -340,8 +382,26 @@ function LoginPageContent() {
             </label>
           </div>
 
-          <section className={styles.card} aria-label={inviteToken ? tr("Invitation", "Приглашение") : tr("Sign in form", "Форма входа")}>
-            {inviteToken ? (
+          <section className={styles.card} aria-label={showInvite ? tr("Invitation", "Приглашение") : tr("Sign in form", "Форма входа")}>
+            {!localAuthEnabled ? (
+              <div className={styles.form}>
+                <p className={styles.oauthHint} role={policyState === "loading" || envidicyEnabled ? "status" : "alert"}>
+                  {policyState === "loading"
+                    ? tr("Checking sign-in options…", "Проверяем способ входа…")
+                    : envidicyEnabled
+                      ? tr("Sign in and recover access through Envidicy ID. Local passwords and invitations are no longer used here.", "Вход и восстановление доступа выполняются через Envidicy ID. Локальные пароли и приглашения здесь больше не используются.")
+                      : policyState === "unavailable"
+                        ? tr("Unable to check sign-in options. Retry the check; local sign-in may be disabled.", "Не удалось проверить способ входа. Повторите проверку: локальный вход может быть отключён.")
+                        : tr("Envidicy ID sign-in is temporarily unavailable. Local sign-in is disabled. Retry the check or contact your administrator.", "Вход через Envidicy ID временно недоступен. Локальный вход отключён. Повторите проверку или обратитесь к администратору.")}
+                </p>
+                {envidicyEntry}
+                {policyState !== "loading" && !envidicyEnabled ? (
+                  <button className={styles.providerButton} type="button" onClick={() => setPolicyAttempt((attempt) => attempt + 1)}>
+                    {tr("Check sign-in again", "Повторить проверку входа")}
+                  </button>
+                ) : null}
+              </div>
+            ) : showInvite ? (
               <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void acceptInvite(); }}>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("Name", "Имя")}</span>
@@ -412,6 +472,8 @@ function LoginPageContent() {
 
                 <div className={styles.divider}><span>{tr("or", "или")}</span></div>
 
+                {envidicyEntry}
+
                 <p className={styles.oauthHint}>
                   {tr(
                     "Your first Facebook sign-in creates a client workspace immediately, without approval. Facebook and Google are used only to sign in; advertising accounts are connected later in Advertising sources.",
@@ -463,7 +525,7 @@ function LoginPageContent() {
               </form>
             )}
 
-            {tokenLoginEnabled ? (
+            {localAuthEnabled && tokenLoginEnabled ? (
               <div className={styles.tokenTools}>
                 <div className={styles.divider}><span>{tr("internal access", "внутренний доступ")}</span></div>
                 <label className={styles.field}>
@@ -491,7 +553,7 @@ function LoginPageContent() {
             ) : null}
           </section>
 
-          <div className={styles.bottomLinks}>
+          {localAuthEnabled ? <div className={styles.bottomLinks}>
             <button
               type="button"
               onClick={() => setError(tr("Open the password setup link from your invitation.", "Откройте ссылку установки пароля из приглашения."))}
@@ -507,7 +569,7 @@ function LoginPageContent() {
               <span>{tr("Need access?", "Нужен доступ?")}</span>
               <ChevronIcon />
             </button>
-          </div>
+          </div> : null}
 
           <p className={`${styles.status} ${statusMessage ? styles.statusVisible : ""}`} role={statusMessage ? "alert" : undefined}>
             {statusMessage || ""}

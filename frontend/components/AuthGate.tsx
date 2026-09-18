@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "../hooks/useAuth";
+import { EnvidicyAccessGate } from "./EnvidicyAccessGate";
+import { canManageEnvidicyBudgets, envidicyAccessIssue } from "../lib/envidicyAuth";
 import {
   type AppRole,
   destinationForRole,
@@ -16,16 +18,20 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
-  const { ready, authenticated, role, error, refresh } = useAuth(defaultApiBase);
+  const { ready, authenticated, role, me, error, refresh, logout } = useAuth(defaultApiBase);
   const [retrying, setRetrying] = useState(false);
 
   const currentPath = pathname || "";
   const isPublic = isPublicPath(currentPath);
   const currentRole: AppRole | null = isAppRole(role) ? role : null;
-  const roleAllowed = Boolean(currentRole && isPathAllowedForRole(currentRole, currentPath));
+  const canManageLocalBudgets = canManageEnvidicyBudgets(me?.session);
+  const roleAllowed = Boolean(currentRole && isPathAllowedForRole(currentRole, currentPath))
+    || (canManageLocalBudgets && currentPath === "/budgets");
+  const envidicyIssue = envidicyAccessIssue(me?.session);
 
   useEffect(() => {
     if (!ready) return;
+    if (envidicyIssue && !isPublic) return;
 
     if (error) {
       // A transient API failure is not proof that the session is invalid.
@@ -47,14 +53,20 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
     if (isPublic) {
       const requestedPath = new URLSearchParams(window.location.search).get("next");
-      router.replace(destinationForRole(currentRole, requestedPath));
+      const safePath = safeRelativePath(requestedPath, "/portal");
+      const budgetDestination = canManageLocalBudgets && new URL(safePath, window.location.origin).pathname === "/budgets";
+      router.replace(budgetDestination ? safePath : destinationForRole(currentRole, requestedPath));
       return;
     }
 
     if (!roleAllowed) {
       router.replace(destinationForRole(currentRole));
     }
-  }, [ready, authenticated, currentPath, currentRole, error, isPublic, roleAllowed, router]);
+  }, [ready, authenticated, canManageLocalBudgets, currentPath, currentRole, envidicyIssue, error, isPublic, roleAllowed, router]);
+
+  if (ready && envidicyIssue && !isPublic) {
+    return <EnvidicyAccessGate issue={envidicyIssue} refresh={refresh} logout={logout} />;
+  }
 
   if ((ready && error && !authenticated && !isPublic) || (retrying && !isPublic)) {
     return (

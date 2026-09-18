@@ -254,6 +254,53 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TEXT NOT NULL
 );
 
+-- New identity projections never claim an existing email or migrate a user.
+CREATE TABLE IF NOT EXISTS envidicy_id_principals (
+  user_id TEXT PRIMARY KEY REFERENCES users(id),
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(issuer, subject)
+);
+
+CREATE TABLE IF NOT EXISTS envidicy_project_bindings (
+  project_id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL,
+  client_id TEXT NOT NULL UNIQUE REFERENCES clients(id),
+  status TEXT NOT NULL CHECK (status IN ('active','inactive')),
+  operator_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS envidicy_identity_migration_audit (
+  run_id TEXT NOT NULL,
+  row_number INTEGER NOT NULL CHECK (row_number > 0),
+  manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+  row_sha256 TEXT NOT NULL CHECK (length(row_sha256) = 64),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  operator_ref TEXT NOT NULL,
+  provenance_ref TEXT NOT NULL,
+  validation_ref TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('linked','confirmed')),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, row_number),
+  UNIQUE (run_id, user_id),
+  UNIQUE (run_id, issuer, subject)
+);
+
+CREATE TABLE IF NOT EXISTS envidicy_login_transactions (
+  state_hash TEXT PRIMARY KEY,
+  browser_hash TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  code_verifier TEXT NOT NULL,
+  next_path TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('login','logout')),
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_envidicy_login_expiry ON envidicy_login_transactions(expires_at);
+
 CREATE TABLE IF NOT EXISTS auth_identities (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,

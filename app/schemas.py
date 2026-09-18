@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
 
 def _normalize_currency_code(value: str) -> str:
@@ -1014,6 +1014,9 @@ class SessionValidationResponse(BaseModel):
     user_id: Optional[UUID] = None
     user_role: Optional[Literal["admin", "agency", "client", "solo_client"]] = None
     expires_at: Optional[datetime] = None
+    # Stored server provenance; not an input claim or part of the public response.
+    auth_method: Optional[Literal["envidicy_id"]] = Field(default=None, exclude=True)
+    issued_at: Optional[datetime] = Field(default=None, exclude=True)
 
 
 class SessionValidateRequest(BaseModel):
@@ -1145,6 +1148,18 @@ class SessionContextResponse(BaseModel):
     access_scope: Optional[Literal["all", "assigned"]] = None
     accessible_client_ids: List[UUID] = Field(default_factory=list)
     expires_at: Optional[datetime] = None
+    auth_method: Optional[Literal["envidicy_id"]] = Field(default=None, exclude=True)
+    issued_at: Optional[datetime] = Field(default=None, exclude=True)
+    auth_source: Optional[Literal["envidicy_id"]] = None
+    authority: Optional[Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_contract(self, handler):
+        data = handler(self)
+        if self.auth_source is None:
+            data.pop("auth_source", None)
+            data.pop("authority", None)
+        return data
 
 
 class AuthMeResponse(BaseModel):
