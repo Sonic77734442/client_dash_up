@@ -32,3 +32,8 @@ frontend/*.tsbuildinfo
 playwright-report/
 test-results/
 coverage/
+
+# Local coordination notes are not part of the published source distribution.
+/AGENTS.md
+/docs/envidicy-integration.md
+/docs/platform-cutover/

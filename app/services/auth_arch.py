@@ -39,6 +39,44 @@ def _utcnow() -> datetime:
     return datetime.utcnow()
 
 
+ENVIDICY_AUTH_METHOD = "envidicy_id"
+ENVIDICY_SESSION_TTL_MINUTES = 15
+
+
+def _reject_reserved_session_metadata(metadata: Optional[dict]) -> None:
+    if isinstance(metadata, dict) and metadata.get("auth_method") == ENVIDICY_AUTH_METHOD:
+        raise HTTPException(status_code=400, detail={
+            "code": "reserved_session_auth_method",
+            "message": "ID sessions must be issued by the verified OIDC callback",
+        })
+
+
+def _session_provenance(metadata: object, created_at: object) -> tuple[Optional[str], Optional[datetime]]:
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            metadata = None
+    method = ENVIDICY_AUTH_METHOD if isinstance(metadata, dict) and metadata.get("auth_method") == ENVIDICY_AUTH_METHOD else None
+    try:
+        issued_at = created_at if isinstance(created_at, datetime) else datetime.fromisoformat(str(created_at))
+        if issued_at.tzinfo is not None:
+            issued_at = issued_at.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        issued_at = None
+    return method, issued_at
+
+
+def _bounded_session_expiry(expires_at: datetime, method: Optional[str], issued_at: Optional[datetime], now: datetime) -> Optional[datetime]:
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+    if method != ENVIDICY_AUTH_METHOD:
+        return expires_at
+    if issued_at is None or issued_at > now + timedelta(seconds=5):
+        return None
+    return min(expires_at, issued_at + timedelta(minutes=ENVIDICY_SESSION_TTL_MINUTES))
+
+
 ROLE_ACCESS_MODEL = {
     "admin": {
         "scope": "global",
@@ -76,6 +114,7 @@ class AuthStore(Protocol):
     def list_client_access(self, user_id: Optional[UUID] = None) -> List[UserClientAccessOut]: ...
     def remove_client_access(self, user_id: UUID, client_id: UUID) -> None: ...
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse: ...
+    def issue_envidicy_session(self, user_id: UUID) -> SessionIssueResponse: ...
     def validate_session(self, token: str) -> SessionValidationResponse: ...
     def refresh_session(self, token: str, ttl_minutes: int) -> SessionValidationResponse: ...
     def revoke_session(self, token: str) -> Dict[str, object]: ...
@@ -650,6 +689,14 @@ class SqliteAuthStore:
             conn.commit()
 
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
+        _reject_reserved_session_metadata(payload.metadata)
+        return self._issue_session(payload)
+
+    def issue_envidicy_session(self, user_id: UUID) -> SessionIssueResponse:
+        return self._issue_session(SessionIssueRequest(user_id=user_id, ttl_minutes=ENVIDICY_SESSION_TTL_MINUTES,
+                                                      metadata={"auth_method": ENVIDICY_AUTH_METHOD}))
+
+    def _issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
         user = self.get_user(payload.user_id)
         if not user or user.status != "active":
             raise HTTPException(status_code=400, detail="cannot issue session for inactive/missing user")
@@ -695,7 +742,10 @@ class SqliteAuthStore:
             if row["revoked_at"]:
                 return SessionValidationResponse(valid=False, reason="revoked")
 
-            expires_at = datetime.fromisoformat(row["expires_at"])
+            auth_method, issued_at = _session_provenance(row["metadata"], row["created_at"])
+            expires_at = _bounded_session_expiry(datetime.fromisoformat(row["expires_at"]), auth_method, issued_at, now)
+            if expires_at is None:
+                return SessionValidationResponse(valid=False, reason="envidicy_reauthentication_required")
             if expires_at <= now:
                 return SessionValidationResponse(valid=False, reason="expired")
 
@@ -711,6 +761,8 @@ class SqliteAuthStore:
                 user_id=UUID(row["user_id"]),
                 user_role=user["role"],
                 expires_at=expires_at,
+                auth_method=auth_method,
+                issued_at=issued_at,
             )
 
     def revoke_session(self, token: str) -> Dict[str, object]:
@@ -727,6 +779,8 @@ class SqliteAuthStore:
         current = self.validate_session(token)
         if not current.valid or not current.session_id:
             return current
+        if current.auth_method == ENVIDICY_AUTH_METHOD:
+            return SessionValidationResponse(valid=False, reason="envidicy_reauthentication_required")
         now = _utcnow()
         new_exp = now + timedelta(minutes=ttl_minutes)
         with runtime_conn(self.db_path) as conn:
@@ -735,14 +789,7 @@ class SqliteAuthStore:
                 (new_exp.isoformat(), now.isoformat(), str(current.session_id)),
             )
             conn.commit()
-        return SessionValidationResponse(
-            valid=True,
-            reason=None,
-            session_id=current.session_id,
-            user_id=current.user_id,
-            user_role=current.user_role,
-            expires_at=new_exp,
-        )
+        return current.model_copy(update={"expires_at": new_exp})
 
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut:
         now = _utcnow().isoformat()
@@ -1060,6 +1107,14 @@ class InMemoryAuthStore:
         self.access.pop(f"{user_id}:{client_id}", None)
 
     def issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
+        _reject_reserved_session_metadata(payload.metadata)
+        return self._issue_session(payload)
+
+    def issue_envidicy_session(self, user_id: UUID) -> SessionIssueResponse:
+        return self._issue_session(SessionIssueRequest(user_id=user_id, ttl_minutes=ENVIDICY_SESSION_TTL_MINUTES,
+                                                      metadata={"auth_method": ENVIDICY_AUTH_METHOD}))
+
+    def _issue_session(self, payload: SessionIssueRequest) -> SessionIssueResponse:
         user = self.users.get(payload.user_id)
         if not user or user.status != "active":
             raise HTTPException(status_code=400, detail="cannot issue session for inactive/missing user")
@@ -1072,6 +1127,8 @@ class InMemoryAuthStore:
             "user_id": payload.user_id,
             "expires_at": exp,
             "revoked": False,
+            "metadata": dict(payload.metadata) if payload.metadata else None,
+            "created_at": now,
         }
         return SessionIssueResponse(token=token, session_id=sid, user_id=payload.user_id, expires_at=exp)
 
@@ -1082,12 +1139,17 @@ class InMemoryAuthStore:
             return SessionValidationResponse(valid=False, reason="not_found")
         if s["revoked"]:
             return SessionValidationResponse(valid=False, reason="revoked")
-        if s["expires_at"] <= now:
+        auth_method, issued_at = _session_provenance(s.get("metadata"), s.get("created_at"))
+        expires_at = _bounded_session_expiry(s["expires_at"], auth_method, issued_at, now)
+        if expires_at is None:
+            return SessionValidationResponse(valid=False, reason="envidicy_reauthentication_required")
+        if expires_at <= now:
             return SessionValidationResponse(valid=False, reason="expired")
         u = self.users.get(s["user_id"])
         if not u or u.status != "active":
             return SessionValidationResponse(valid=False, reason="user_inactive")
-        return SessionValidationResponse(valid=True, reason=None, session_id=s["session_id"], user_id=u.id, user_role=u.role, expires_at=s["expires_at"])
+        return SessionValidationResponse(valid=True, reason=None, session_id=s["session_id"], user_id=u.id,
+                                         user_role=u.role, expires_at=expires_at, auth_method=auth_method, issued_at=issued_at)
 
     def revoke_session(self, token: str) -> Dict[str, object]:
         s = self.sessions.get(_token_hash(token))
@@ -1100,19 +1162,14 @@ class InMemoryAuthStore:
         current = self.validate_session(token)
         if not current.valid or not current.session_id:
             return current
+        if current.auth_method == ENVIDICY_AUTH_METHOD:
+            return SessionValidationResponse(valid=False, reason="envidicy_reauthentication_required")
         now = _utcnow()
         new_exp = now + timedelta(minutes=ttl_minutes)
         key = _token_hash(token)
         if key in self.sessions:
             self.sessions[key]["expires_at"] = new_exp
-        return SessionValidationResponse(
-            valid=True,
-            reason=None,
-            session_id=current.session_id,
-            user_id=current.user_id,
-            user_role=current.user_role,
-            expires_at=new_exp,
-        )
+        return current.model_copy(update={"expires_at": new_exp})
 
     def upsert_provider_config(self, payload: AuthProviderConfigCreate) -> AuthProviderConfigOut:
         now = _utcnow()

@@ -19,6 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.responses import Response
+from app.services.auth_cutover import enforce_session_origin, id_only_enabled, require_legacy_auth_enabled
 
 
 def _utcnow() -> datetime:
@@ -432,7 +433,7 @@ oauth_adapters: dict[str, OAuthProviderAdapter] = {
     "facebook": FacebookOAuthAdapter(),
     "google": GoogleOAuthAdapter(),
 }
-auth_facade = AuthFacadeService(auth_store=auth_store)
+auth_facade = AuthFacadeService(auth_store=auth_store, context_resolver=lambda context: _envidicy_bridge().project_session(context))
 
 app.state.client_store = client_store
 app.state.ad_account_store = ad_account_store
@@ -1101,7 +1102,7 @@ def use_inmemory_stores():
     )
     app.state.oauth_state_store = oauth_states
     app.state.oauth_adapters = {"facebook": FacebookOAuthAdapter(), "google": GoogleOAuthAdapter()}
-    app.state.auth_facade = AuthFacadeService(auth_store=auth)
+    app.state.auth_facade = AuthFacadeService(auth_store=auth, context_resolver=lambda context: _envidicy_bridge().project_session(context))
     app.state.overview_service = OverviewService(ad_stats_store=s, ad_account_store=a, budget_store=b)
     app.state.operational_insights_service = OperationalInsightsService(rules=settings.operational_insights_rules)
     app.state.operational_action_store = InMemoryOperationalActionStore()
@@ -1174,6 +1175,16 @@ def _active_client_ids() -> set[UUID]:
 
 def _auth_facade() -> AuthFacadeService:
     return app.state.auth_facade
+
+
+def _envidicy_bridge():
+    from app.services.envidicy_bridge import EnvidicyBridge, MemoryEnvidicyStore, SqlEnvidicyStore
+    current = getattr(app.state, "envidicy_bridge", None)
+    if current is None or current.store.auth_store is not _auth_store():
+        store = SqlEnvidicyStore(_auth_store()) if hasattr(_auth_store(), "db_path") else MemoryEnvidicyStore(_auth_store())
+        current = EnvidicyBridge(store, _client_store())
+        app.state.envidicy_bridge = current
+    return current
 
 
 def _operational_insights_service() -> OperationalInsightsService:
@@ -2535,6 +2546,11 @@ def _link_facebook_identity_to_proven_user(
     This helper never resolves by email and never reassigns an identity.
     """
 
+    if _envidicy_bridge().store.principal(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "envidicy_operation_not_available", "message": "ID identities cannot be linked through legacy login"},
+        )
     user = _auth_store().get_user(user_id)
     if not user or user.status != "active":
         raise HTTPException(
@@ -2838,6 +2854,21 @@ def _restrict_archived_client_scope(session: SessionContextResponse) -> SessionC
     return session.model_copy(update={"accessible_client_ids": accessible})
 
 
+def _envidicy_request_context(request: Request, session: SessionContextResponse) -> None:
+    enforce_session_origin(session)
+    if session.auth_source != "envidicy_id":
+        return
+    authority = session.authority or {}
+    if authority.get("access_state") != "ready":
+        status = 503 if authority.get("access_state") == "context_unavailable" else 403
+        raise HTTPException(status_code=status, detail={"code": "envidicy_access_required", "message": "Dash access must be confirmed in My"})
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        # Pilot capability: local plan budgets only. No agency/admin, account
+        # provisioning, credentials, provider writes, invites or migration.
+        if "dash.analytics.manage" not in authority.get("permissions", []) or not re.fullmatch(r"/budgets(?:/[^/]+(?:/transfer)?)?", request.url.path):
+            raise HTTPException(status_code=403, detail={"code": "envidicy_operation_not_available", "message": "This operation is not enabled for Envidicy ID access"})
+
+
 def auth_context(
     request: Request,
     authorization: Optional[str] = Header(default=None),
@@ -2859,11 +2890,14 @@ def auth_context(
                 "details": {"reason": session.reason},
             },
         )
+    _envidicy_request_context(request, session)
     return RequestContext(
         user_id=session.user_id,
         role=session.role,
         global_access=bool(session.global_access),
         accessible_client_ids=set(session.accessible_client_ids),
+        auth_source=session.auth_source,
+        permissions=frozenset((session.authority or {}).get("permissions", [])),
     )
 
 
@@ -2893,11 +2927,14 @@ def optional_auth_context(
             )
         # Local/dev behavior: ignore stale/invalid token for optional admin plumbing.
         return None
+    _envidicy_request_context(request, session)
     return RequestContext(
         user_id=session.user_id,
         role=session.role,
         global_access=bool(session.global_access),
         accessible_client_ids=set(session.accessible_client_ids),
+        auth_source=session.auth_source,
+        permissions=frozenset((session.authority or {}).get("permissions", [])),
     )
 
 
@@ -2928,6 +2965,7 @@ def invite_optional_auth_context(
     session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
     if not session.valid or not session.user_id or not session.role:
         return None
+    _envidicy_request_context(request, session)
     return RequestContext(
         user_id=session.user_id,
         role=session.role,
@@ -2937,10 +2975,12 @@ def invite_optional_auth_context(
 
 
 def _internal_admin_required() -> bool:
-    return settings.app_env.lower() in {"prod", "production"}
+    return id_only_enabled() or settings.app_env.lower() in {"prod", "production"}
 
 
 def _enforce_internal_admin(ctx: Optional[RequestContext]) -> None:
+    if ctx and ctx.auth_source == "envidicy_id":
+        ensure_admin(ctx)
     if not _internal_admin_required():
         return
     if not ctx:
@@ -2963,6 +3003,7 @@ def session_token(
 
 def current_session_context(token: str = Depends(session_token)) -> SessionContextResponse:
     session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
+    enforce_session_origin(session)
     if not session.valid:
         raise HTTPException(
             status_code=401,
@@ -3153,6 +3194,7 @@ def _meta_budget_live_request_context(
     )
     session = _restrict_archived_client_scope(_auth_facade().get_session_context(token))
     user = _auth_store().get_user(ctx.user_id)
+    enforce_session_origin(session)
     if user is None or user.status != "active":
         raise HTTPException(
             status_code=403,
@@ -4020,7 +4062,8 @@ def metrics(request: Request):
                 required=False,
             )
             session = _auth_facade().get_session_context(token) if token else None
-            admin_ok = bool(session and session.valid and session.role == "admin")
+            admin_ok = bool(session and session.valid and session.role == "admin"
+                            and (not id_only_enabled() or session.auth_method == "envidicy_id"))
         if not service_token_ok and not admin_ok:
             raise HTTPException(status_code=404, detail="Not found")
     snap = _runtime_metrics().snapshot()
@@ -4309,6 +4352,7 @@ def auth_issue_session(
     background_tasks: BackgroundTasks,
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
+    require_legacy_auth_enabled()
     _enforce_internal_admin(ctx)
     issued = _auth_store().issue_session(payload)
     session_ctx = _restrict_archived_client_scope(_auth_facade().get_session_context(issued.token))
@@ -4360,6 +4404,7 @@ def auth_facade_resolve_external(
     payload: ExternalIdentityResolveRequest,
     ctx: Optional[RequestContext] = Depends(optional_auth_context),
 ):
+    require_legacy_auth_enabled()
     _enforce_internal_admin(ctx)
     return _auth_facade().resolve_or_create_from_external_identity(payload)
 
@@ -4390,6 +4435,8 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     user = _auth_store().get_user(session.user_id)
     if not user:
         raise HTTPException(status_code=401, detail="Session user not found")
+    if session.auth_source == "envidicy_id":
+        user = user.model_copy(update={"role": "client"})
     return AuthMeResponse(user=user, session=session)
 
 
@@ -4400,6 +4447,7 @@ def auth_me(session: SessionContextResponse = Depends(current_session_context)):
     description="Authenticates user by email/password and issues backend session cookie.",
 )
 def auth_password_login(payload: AuthPasswordLoginRequest, background_tasks: BackgroundTasks):
+    require_legacy_auth_enabled()
     user = _auth_store().authenticate_password(payload.email, payload.password)
     if not user:
         raise HTTPException(
@@ -4477,6 +4525,10 @@ def auth_logout(token: str = Depends(session_token)):
     description="Extends active session expiry using backend refresh policy.",
 )
 def auth_refresh_session(request: Request, token: str = Depends(session_token)):
+    validated = _auth_store().validate_session(token)
+    enforce_session_origin(validated)
+    if validated.auth_method == "envidicy_id":
+        raise HTTPException(status_code=401, detail={"code": "envidicy_reauthentication_required", "message": "Refresh the short ID session through Envidicy ID"})
     refreshed = _auth_store().refresh_session(token, ttl_minutes=settings.oauth_session_refresh_ttl_minutes)
     if not refreshed.valid:
         raise HTTPException(
@@ -4508,6 +4560,13 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
     return response
 
 
+from app.envidicy_routes import register_envidicy_routes
+
+register_envidicy_routes(app, get_bridge=_envidicy_bridge, get_auth=_auth_store,
+                        get_context=lambda token: _auth_facade().get_session_context(token),
+                        settings=settings, set_csrf=_set_csrf_cookie)
+
+
 @app.get(
     "/auth/{provider}/start",
     summary="Start OAuth login",
@@ -4523,6 +4582,8 @@ def auth_oauth_start(
     agency_id: Optional[UUID] = Query(default=None),
     client_id: Optional[UUID] = Query(default=None),
 ):
+    if intent != "connect":
+        require_legacy_auth_enabled()
     adapters = _oauth_adapters()
     adapter = adapters.get(provider)
     if not adapter:
@@ -4558,6 +4619,12 @@ def auth_oauth_start(
                 },
             )
         initiator_user_id = current_ctx.user_id
+        enforce_session_origin(current_ctx)
+        if current_ctx.auth_source == "envidicy_id":
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "envidicy_operation_not_available", "message": "Legacy identity linking and provider connections are not enabled for ID access"},
+            )
     if intent == "link":
         if agency_id is not None or client_id is not None or connection_key is not None:
             raise HTTPException(
@@ -4691,6 +4758,11 @@ def auth_oauth_callback(
         requested_client_id,
         requested_meta_config_id,
     ) = _extract_oauth_connect_options(consumed.next_path or "/")
+    if oauth_intent != "connect":
+        # Consume old transactions, but never exchange their codes or create a
+        # local user/session after cutover. Provider connection is a separate
+        # authenticated operation, not a human-login fallback.
+        require_legacy_auth_enabled()
     current_ctx = None
     if oauth_intent in {"connect", "link"}:
         current_token = _get_session_token(
@@ -4708,6 +4780,9 @@ def auth_oauth_callback(
             or current_ctx.user_id != consumed.initiator_user_id
         ):
             return _oauth_error_redirect("session_mismatch")
+        enforce_session_origin(current_ctx)
+        if current_ctx.auth_source == "envidicy_id":
+            return _oauth_error_redirect("access_denied")
         if oauth_intent == "connect" and current_ctx.role == "solo_client":
             try:
                 current_client_id = _solo_owner_client_id_for_user(
@@ -4722,6 +4797,8 @@ def auth_oauth_callback(
                 return _oauth_error_redirect("access_denied")
         elif oauth_intent == "connect" and requested_client_id is not None:
             return _oauth_error_redirect("access_denied")
+    if oauth_intent == "migrate_primary" and consumed.initiator_user_id and _envidicy_bridge().store.principal(consumed.initiator_user_id):
+        return _oauth_error_redirect("access_denied")
     if error:
         return _oauth_error_redirect(error)
     if not code:
@@ -5404,6 +5481,7 @@ def auth_accept_agency_invite(
     payload: AgencyInviteAcceptRequest,
     ctx: Optional[RequestContext] = Depends(invite_optional_auth_context),
 ):
+    require_legacy_auth_enabled()
     try:
         accepted = _platform_admin_store().accept_invite(
             payload,
@@ -7011,7 +7089,7 @@ def resolve_unknown_meta_budget_change(
 )
 def create_budget(payload: BudgetCreate, ctx: RequestContext = Depends(auth_context)):
     _ensure_budget_write_access(ctx)
-    if ctx.role == "solo_client":
+    if ctx.role == "solo_client" or ctx.auth_source == "envidicy_id":
         payload = payload.model_copy(update={"created_by": ctx.user_id})
     ensure_client_access(ctx, payload.client_id)
     _ensure_client_currency(payload.client_id, payload.currency, resource="Budget")
@@ -7103,7 +7181,7 @@ def get_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
 )
 def patch_budget(budget_id: UUID, payload: BudgetPatch, ctx: RequestContext = Depends(auth_context)):
     _ensure_budget_write_access(ctx)
-    if ctx.role == "solo_client":
+    if ctx.role == "solo_client" or ctx.auth_source == "envidicy_id":
         payload = payload.model_copy(update={"changed_by": ctx.user_id})
     existing = _budget_store().get(budget_id)
     if not existing:
@@ -7182,7 +7260,7 @@ def delete_budget(budget_id: UUID, ctx: RequestContext = Depends(auth_context)):
 @app.post("/budgets/{budget_id}/transfer", response_model=BudgetTransferResponse, summary="Transfer budget between accounts")
 def transfer_budget(budget_id: UUID, payload: BudgetTransferRequest, ctx: RequestContext = Depends(auth_context)):
     _ensure_budget_write_access(ctx)
-    if ctx.role == "solo_client":
+    if ctx.role == "solo_client" or ctx.auth_source == "envidicy_id":
         payload = payload.model_copy(update={"changed_by": ctx.user_id})
     source = _budget_store().get(budget_id)
     if not source:

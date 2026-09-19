@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from app.runtime_db import init_runtime_database, runtime_conn
 from app.schemas import AdAccountCreate, AdAccountOut, AdAccountPatch
 from app.services.clients import ClientStore
+from app.services.sync_diagnostics import safe_sync_error_message, safe_sync_metadata
 
 
 def normalize_account_platform(value: object) -> str:
@@ -91,7 +92,7 @@ class SqliteAdAccountStore:
 
     @staticmethod
     def _to_account(row) -> AdAccountOut:
-        metadata = json.loads(row["metadata"]) if row["metadata"] else None
+        metadata = safe_sync_metadata(json.loads(row["metadata"]) if row["metadata"] else None)
         last_sync_at_raw = metadata.get("last_sync_at") if isinstance(metadata, dict) else None
         sync_status_raw = metadata.get("sync_status") if isinstance(metadata, dict) else None
         sync_error_raw = metadata.get("sync_error") if isinstance(metadata, dict) else None
@@ -371,6 +372,14 @@ class InMemoryAdAccountStore:
         self.client_store = client_store
         self.items = {}
 
+    @staticmethod
+    def _public_account(account: AdAccountOut) -> AdAccountOut:
+        metadata = safe_sync_metadata(account.metadata)
+        error = account.sync_error
+        if error is not None:
+            error = safe_sync_error_message(account.sync_error_code, error)
+        return account.model_copy(update={"metadata": metadata, "sync_error": error})
+
     def _assert_client_exists(self, client_id: UUID | str) -> None:
         resolved = client_id
         if isinstance(client_id, str):
@@ -476,7 +485,7 @@ class InMemoryAdAccountStore:
             updated_at=now,
         )
         self.items[rec.id] = rec
-        return rec
+        return self._public_account(rec)
 
     def list(self, *, client_id: Optional[UUID] = None, status: Optional[str] = None) -> List[AdAccountOut]:
         rows = list(self.items.values())
@@ -486,18 +495,19 @@ class InMemoryAdAccountStore:
         if effective_status != "all":
             rows = [x for x in rows if x.status == effective_status]
         rows.sort(key=lambda x: x.updated_at, reverse=True)
-        return rows
+        return [self._public_account(row) for row in rows]
 
     def get(self, account_id: UUID) -> Optional[AdAccountOut]:
-        return self.items.get(account_id)
+        account = self.items.get(account_id)
+        return self._public_account(account) if account is not None else None
 
     def patch(self, account_id: UUID, payload: AdAccountPatch) -> AdAccountOut:
-        existing = self.get(account_id)
+        existing = self.items.get(account_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Ad account not found")
         patch = payload.model_dump(exclude_unset=True)
         if not patch:
-            return existing
+            return self._public_account(existing)
         merged = {**existing.model_dump(), **patch}
         if "platform" in patch:
             merged["platform"] = normalize_account_platform(merged["platform"])
@@ -527,14 +537,14 @@ class InMemoryAdAccountStore:
             normalized_patch["external_account_id"] = merged["external_account_id"]
         rec = existing.model_copy(update={**normalized_patch, **sync_fields, "updated_at": _utcnow()})
         self.items[account_id] = rec
-        return rec
+        return self._public_account(rec)
 
     def archive(self, account_id: UUID) -> AdAccountOut:
-        existing = self.get(account_id)
+        existing = self.items.get(account_id)
         if not existing:
             raise HTTPException(status_code=404, detail="Ad account not found")
         rec = existing.model_copy(update={"status": "archived", "updated_at": _utcnow()})
         self.items[account_id] = rec
-        return rec
+        return self._public_account(rec)
 
 

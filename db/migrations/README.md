@@ -26,6 +26,8 @@ error.
 19. `0019_encrypt_integration_credentials_and_bind_accounts.sql`
 20. `0020_create_provider_budget_command_ledger.sql`
 21. `0021_runtime_postgres_parity.sql`
+22. `0022_envidicy_identity_and_project_bindings.sql`
+23. `0023_envidicy_identity_migration_audit.sql`
 
 ## PostgreSQL
 

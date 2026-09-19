@@ -351,6 +351,16 @@ export type AlertOut = {
   resolved_at?: string | null;
 };
 
+export type EnvidicyAuthority = {
+  access_state: "ready" | "not_granted" | "project_unlinked" | "context_unavailable";
+  organization_id: string | null;
+  project_id: string | null;
+  permissions: string[];
+  product: "dash.analytics";
+  my_url?: string;
+  redirect_to_my?: boolean;
+};
+
 export type SessionContext = {
   valid: boolean;
   reason?: string | null;
@@ -361,6 +371,8 @@ export type SessionContext = {
   access_scope?: "all" | "assigned" | null;
   accessible_client_ids: string[];
   expires_at?: string | null;
+  auth_source?: string;
+  authority?: EnvidicyAuthority | null;
 };
 
 export type AuthUser = {

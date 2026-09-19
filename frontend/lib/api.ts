@@ -131,6 +131,7 @@ const CSRF_COOKIE_NAME = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
 const CSRF_HEADER_NAME = process.env.NEXT_PUBLIC_CSRF_HEADER_NAME || "X-CSRF-Token";
 
 let csrfMemoryToken = "";
+let lastEnvidicyAuthorityRefresh = 0;
 
 function readStoredCsrfToken(): string {
   return csrfMemoryToken;
@@ -232,6 +233,14 @@ export async function fetchJson<T>(
   if (!res.ok) {
     const envelope = body as ApiErrorEnvelope;
     const code = String(envelope?.error?.code || "").trim();
+    if (code === "envidicy_access_required" && typeof window !== "undefined"
+      && normalizedPath.split("?")[0] !== "/auth/me"
+      && Date.now() - lastEnvidicyAuthorityRefresh > 5_000) {
+      // Coalesce concurrent denied reads. /auth/me returns the new authority
+      // state and must never recursively trigger its own refresh.
+      lastEnvidicyAuthorityRefresh = Date.now();
+      window.dispatchEvent(new Event("ops-session-updated"));
+    }
     const fallbackMessage = envelope?.error?.message || `Запрос завершился ошибкой (${res.status})`;
     const msg = code === "selection_required"
       ? agencySelectionRequiredMessage()

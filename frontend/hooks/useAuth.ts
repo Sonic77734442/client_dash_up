@@ -6,11 +6,12 @@ import { resolveApiBase } from "../lib/apiBase";
 import { isAppRole } from "../lib/authRedirect";
 import { clearSessionToken } from "../lib/sessionToken";
 import { useSessionContext } from "./useSessionContext";
+import { suppressEnvidicyAutoLogin } from "../lib/envidicyAuth";
 
 const SESSION_UPDATED_EVENT = "ops-session-updated";
 
 export function useAuth(defaultApiBase: string) {
-  const { context, me, loading, error, refresh } = useSessionContext();
+  const { context, me, loading, error, status, refresh } = useSessionContext();
   const role = isAppRole(context?.role) ? context.role : null;
   const authenticated = Boolean(context?.valid && role);
   const ready = !loading;
@@ -24,9 +25,10 @@ export function useAuth(defaultApiBase: string) {
     } catch {
       // noop
     }
+    suppressEnvidicyAutoLogin();
     clearSessionToken();
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
   }, [defaultApiBase]);
 
-  return { ready, authenticated, role, me, error, refresh, logout };
+  return { ready, authenticated, role, me, error, status, refresh, logout };
 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -28,6 +28,7 @@ class ExternalAuthAdapter(Protocol):
 @dataclass
 class AuthFacadeService:
     auth_store: AuthStore
+    context_resolver: Optional[Callable[[SessionContextResponse], SessionContextResponse]] = None
 
     def resolve_or_create_from_external_identity(
         self,
@@ -127,7 +128,7 @@ class AuthFacadeService:
             scope = "assigned"
             global_access = False
 
-        return SessionContextResponse(
+        context = SessionContextResponse(
             valid=True,
             reason=None,
             session_id=valid.session_id,
@@ -137,7 +138,10 @@ class AuthFacadeService:
             access_scope=scope,
             accessible_client_ids=client_ids,
             expires_at=valid.expires_at,
+            auth_method=valid.auth_method,
+            issued_at=valid.issued_at,
         )
+        return self.context_resolver(context) if self.context_resolver else context
 
 
 class AdapterRegistry:

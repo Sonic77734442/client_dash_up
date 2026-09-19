@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useLocale } from "../../hooks/useLocale";
+import { useAuth } from "../../hooks/useAuth";
 import { type Locale } from "../../lib/i18n";
 import { DEFAULT_API_BASE, normalizeApiBase, resolveApiBase } from "../../lib/apiBase";
 import {
@@ -13,6 +14,7 @@ import {
 } from "../../lib/authRedirect";
 import { oauthErrorMessage } from "../../lib/oauthError";
 import { oauthRelayLaunchPath } from "../../lib/oauthLaunchRelay";
+import { beginEnvidicyAutoLogin, clearEnvidicyAutoLogin, envidicyLoginPolicy, envidicyLoginPath, type EnvidicyLoginPolicy } from "../../lib/envidicyAuth";
 import { clearSessionToken, setSessionToken } from "../../lib/sessionToken";
 import styles from "./login.module.css";
 
@@ -86,6 +88,7 @@ function LoginPageContent() {
   const search = useSearchParams();
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
+  const { ready: authReady, authenticated, error: authError, status: authStatus, refresh } = useAuth(defaultApiBase);
 
   const [apiBase, setApiBase] = useState(normalizeApiBase(defaultApiBase, DEFAULT_API_BASE));
   const [token, setToken] = useState("");
@@ -96,6 +99,10 @@ function LoginPageContent() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [loginPolicy, setLoginPolicy] = useState<EnvidicyLoginPolicy | null>(null);
+  const [policyState, setPolicyState] = useState<"loading" | "ready" | "unavailable">("loading");
+  const [policyAttempt, setPolicyAttempt] = useState(0);
+  const [autoLoginPaused, setAutoLoginPaused] = useState(false);
   const { locale, setLocale } = useLocale();
 
   const inviteToken = useMemo(() => search.get("invite_token") || "", [search]);
@@ -107,6 +114,26 @@ function LoginPageContent() {
   const oauthError = useMemo(() => oauthErrorMessage(oauthErrorCode), [oauthErrorCode]);
   const needsFacebookMigration = oauthErrorCode === "facebook_migration_required";
   const tr = (en: string, ru: string) => locale === "en" ? en : ru;
+  const localAuthEnabled = policyState === "ready" && loginPolicy?.localAuthEnabled === true;
+  const envidicyEnabled = policyState === "ready" && loginPolicy?.idEnabled === true;
+  const legacyRequested = localAuthEnabled && search.get("legacy") === "1";
+  const showLocalAuth = localAuthEnabled && (!loginPolicy?.autoLogin || legacyRequested);
+  const showInvite = showLocalAuth && Boolean(inviteToken);
+  const idLoginPath = envidicyLoginPath(search.get("next"));
+  const legacyParams = new URLSearchParams({ next: requestedNext, legacy: "1" });
+  if (inviteToken) legacyParams.set("invite_token", inviteToken);
+
+  useEffect(() => {
+    if (!authReady || authenticated || authError || authStatus !== 401
+      || policyState !== "ready" || !loginPolicy?.autoLogin
+      || legacyRequested || search.has("oauth_error")) return;
+    if (!beginEnvidicyAutoLogin()) {
+      setAutoLoginPaused(true);
+      return;
+    }
+    clearSessionToken();
+    window.location.replace(idLoginPath);
+  }, [authReady, authenticated, authError, authStatus, idLoginPath, legacyRequested, loginPolicy, policyState, search]);
 
   function redirectAfterLogin(payload: unknown) {
     const role = readRole(payload);
@@ -118,7 +145,31 @@ function LoginPageContent() {
     setApiBase(base);
   }, [defaultApiBase]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setPolicyState("loading");
+    setLoginPolicy(null);
+    const timeout = window.setTimeout(() => {
+      controller.abort();
+      if (active) setPolicyState("unavailable");
+    }, 10_000);
+    void fetch("/api/backend/auth/envidicy/config", {
+      credentials: "include", cache: "no-store", signal: controller.signal,
+    }).then(async (response) => {
+      const config: unknown = response.status === 200 ? await response.json() : null;
+      if (!active || controller.signal.aborted) return;
+      const policy = envidicyLoginPolicy(config, response.status);
+      setLoginPolicy(policy);
+      setPolicyState(policy ? "ready" : "unavailable");
+    }).catch(() => {
+      if (active) setPolicyState("unavailable");
+    }).finally(() => window.clearTimeout(timeout));
+    return () => { active = false; window.clearTimeout(timeout); controller.abort(); };
+  }, [policyAttempt]);
+
   async function signInWithToken() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const t = token.trim();
     if (!base || !t) {
@@ -149,6 +200,7 @@ function LoginPageContent() {
   }
 
   async function acceptInvite() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     if (!base || !inviteToken) {
       setError("В приглашении отсутствует токен");
@@ -184,6 +236,7 @@ function LoginPageContent() {
   }
 
   async function signInWithPassword() {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     const em = email.trim().toLowerCase();
     if (!base || !em || password.length < 8) {
@@ -219,6 +272,7 @@ function LoginPageContent() {
     provider: "facebook" | "google",
     intent: "login" | "migrate" = "login",
   ) {
+    if (!localAuthEnabled) return;
     const base = normalizeApiBase(apiBase, defaultApiBase);
     localStorage.setItem(LS_API_BASE, base);
     clearSessionToken();
@@ -257,6 +311,18 @@ function LoginPageContent() {
   ];
 
   const statusMessage = error || oauthError;
+  const envidicyEntry = envidicyEnabled ? (
+    <a className={styles.providerButton} href={idLoginPath} onClick={() => {
+      clearEnvidicyAutoLogin();
+      // A manual retry is always allowed, but its callback must not start an
+      // automatic loop if the browser rejects the resulting session cookie.
+      beginEnvidicyAutoLogin();
+      clearSessionToken();
+      window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+    }}>
+      {tr("Sign in with Envidicy ID", "Войти через Envidicy ID")}
+    </a>
+  ) : null;
 
   return (
     <div className={styles.page} data-i18n-skip>
@@ -319,10 +385,10 @@ function LoginPageContent() {
             <div>
               <p className={styles.eyebrow}>Dash Envidicy</p>
               <h2 className={styles.panelTitle}>
-                {inviteToken ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
+                {showInvite ? tr("Accept invitation", "Принять приглашение") : tr("Sign in", "Войти")}
               </h2>
               <p className={styles.panelText}>
-                {inviteToken
+                {showInvite
                   ? tr("Create a password to join the workspace.", "Создайте пароль, чтобы войти в рабочее пространство.")
                   : tr("Enter your details to access the advertising operations center.", "Войдите в операционный центр управления рекламой.")}
               </p>
@@ -340,8 +406,46 @@ function LoginPageContent() {
             </label>
           </div>
 
-          <section className={styles.card} aria-label={inviteToken ? tr("Invitation", "Приглашение") : tr("Sign in form", "Форма входа")}>
-            {inviteToken ? (
+          <section className={styles.card} aria-label={showInvite ? tr("Invitation", "Приглашение") : tr("Sign in form", "Форма входа")}>
+            {!showLocalAuth ? (
+              <div className={styles.form}>
+                <p className={styles.oauthHint} role={policyState === "loading" || envidicyEnabled ? "status" : "alert"}>
+                  {policyState === "loading"
+                    ? tr("Checking sign-in options…", "Проверяем способ входа…")
+                    : envidicyEnabled
+                      ? localAuthEnabled
+                        ? tr("Sign in or register with Envidicy ID. Your existing Dash sign-in remains available during the transition.", "Вход и регистрация выполняются через Envidicy ID. На время перехода прежний вход в Dash остаётся доступен.")
+                        : tr("Sign in, register and recover access through Envidicy ID. Local passwords and invitations are no longer used here.", "Вход, регистрация и восстановление доступа выполняются через Envidicy ID. Локальные пароли и приглашения здесь больше не используются.")
+                      : policyState === "unavailable"
+                        ? tr("Unable to check sign-in options. Retry the check; local sign-in may be disabled.", "Не удалось проверить способ входа. Повторите проверку: локальный вход может быть отключён.")
+                        : tr("Envidicy ID sign-in is temporarily unavailable. Local sign-in is disabled. Retry the check or contact your administrator.", "Вход через Envidicy ID временно недоступен. Локальный вход отключён. Повторите проверку или обратитесь к администратору.")}
+                </p>
+                {envidicyEntry}
+                {localAuthEnabled && envidicyEnabled ? (
+                  <Link className={styles.providerButton} href={`/login?${legacyParams}`}>
+                    {tr("Use existing Dash sign-in", "Использовать прежний вход в Dash")}
+                  </Link>
+                ) : null}
+                {autoLoginPaused && loginPolicy?.autoLogin ? (
+                  <p className={styles.oauthHint} role="status">
+                    {tr("Automatic sign-in is paused. Continue with Envidicy ID to retry manually.", "Автоматический вход приостановлен. Нажмите «Войти через Envidicy ID», чтобы продолжить вручную.")}
+                  </p>
+                ) : null}
+                {authError && loginPolicy?.autoLogin ? (
+                  <div role="alert">
+                    <p>{tr("Unable to check your session. Automatic sign-in is paused.", "Не удалось проверить сессию. Автоматический вход приостановлен.")}</p>
+                    <button className={styles.providerButton} type="button" disabled={!authReady} onClick={() => void refresh()}>
+                      {tr("Retry session check", "Повторить проверку сессии")}
+                    </button>
+                  </div>
+                ) : null}
+                {policyState !== "loading" && !envidicyEnabled ? (
+                  <button className={styles.providerButton} type="button" onClick={() => setPolicyAttempt((attempt) => attempt + 1)}>
+                    {tr("Check sign-in again", "Повторить проверку входа")}
+                  </button>
+                ) : null}
+              </div>
+            ) : showInvite ? (
               <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void acceptInvite(); }}>
                 <label className={styles.field}>
                   <span className={styles.fieldLabel}>{tr("Name", "Имя")}</span>
@@ -412,6 +516,8 @@ function LoginPageContent() {
 
                 <div className={styles.divider}><span>{tr("or", "или")}</span></div>
 
+                {envidicyEntry}
+
                 <p className={styles.oauthHint}>
                   {tr(
                     "Your first Facebook sign-in creates a client workspace immediately, without approval. Facebook and Google are used only to sign in; advertising accounts are connected later in Advertising sources.",
@@ -463,7 +569,7 @@ function LoginPageContent() {
               </form>
             )}
 
-            {tokenLoginEnabled ? (
+            {showLocalAuth && tokenLoginEnabled ? (
               <div className={styles.tokenTools}>
                 <div className={styles.divider}><span>{tr("internal access", "внутренний доступ")}</span></div>
                 <label className={styles.field}>
@@ -491,7 +597,7 @@ function LoginPageContent() {
             ) : null}
           </section>
 
-          <div className={styles.bottomLinks}>
+          {showLocalAuth ? <div className={styles.bottomLinks}>
             <button
               type="button"
               onClick={() => setError(tr("Open the password setup link from your invitation.", "Откройте ссылку установки пароля из приглашения."))}
@@ -507,7 +613,7 @@ function LoginPageContent() {
               <span>{tr("Need access?", "Нужен доступ?")}</span>
               <ChevronIcon />
             </button>
-          </div>
+          </div> : null}
 
           <p className={`${styles.status} ${statusMessage ? styles.statusVisible : ""}`} role={statusMessage ? "alert" : undefined}>
             {statusMessage || ""}
