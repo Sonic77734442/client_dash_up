@@ -194,8 +194,8 @@ test("Facebook button starts a platform login flow, not an ads connection", asyn
   expect(oauthUrl.searchParams.get("next")).toBe("/");
 });
 
-test("legacy production host redirects to the canonical OAuth cookie domain", () => {
-  const redirected = middleware(
+test("legacy production host redirects to the canonical OAuth cookie domain", async () => {
+  const redirected = await middleware(
     new NextRequest("https://client-dash-up.vercel.app/login?next=%2Fbudgets"),
   );
   expect(redirected.status).toBe(308);
@@ -203,7 +203,7 @@ test("legacy production host redirects to the canonical OAuth cookie domain", ()
     "https://dash.envidicy.kz/login?next=%2Fbudgets",
   );
 
-  const canonical = middleware(new NextRequest("https://dash.envidicy.kz/login"));
+  const canonical = await middleware(new NextRequest("https://dash.envidicy.kz/login/success"));
   expect(canonical.status).toBe(200);
   expect(canonical.headers.get("location")).toBeNull();
 });

@@ -1,12 +1,13 @@
 """Default-off cutover policy; isolated stores and no provider/ID network calls."""
 from dataclasses import replace
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import HTTPException
 import pytest
 
 from app.schemas import SessionIssueRequest
-from app.services.auth_cutover import auto_login_enabled, id_only_enabled
+from app.services.auth_cutover import auto_login_enabled, id_only_enabled, redirect_legacy_credentials
 from test_envidicy_routes import api, csrf, login  # shared isolated API fixture
 
 
@@ -57,9 +58,84 @@ def only_id(api):
 def test_local_login_and_onboarding_are_closed(api, path, body):
     only_id(api)
     result = api.browser.post(path, json=body)
-    assert result.status_code == 410, result.text
-    assert result.json()["error"]["code"] == "envidicy_id_login_required"
+    assert result.status_code == 303, result.text
+    assert result.headers["location"] == "/api/backend/auth/envidicy/start?next=%2Fportal"
+    assert result.headers["cache-control"] == "no-store"
+    assert result.headers["referrer-policy"] == "no-referrer"
+    assert "set-cookie" not in result.headers
     assert not api.browser.cookies.get(api.main.settings.auth_cookie_name)
+
+
+@pytest.mark.parametrize("path", ["/auth/password/login", "/auth/invites/accept"])
+@pytest.mark.parametrize("suffix", ["", "/", "///"])
+@pytest.mark.parametrize("content_type,body", [
+    ("application/json", b'{"password":"discard-this-password",bad-json'),
+    ("application/x-www-form-urlencoded", b"password=discard-this-password&token=discard-this-invite"),
+])
+def test_closed_credentials_redirect_before_body_validation_or_authentication(api, path, suffix, content_type, body):
+    only_id(api)
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("Closed credentials must not reach stores or session dependencies")
+    api.monkeypatch.setattr(api.auth, "authenticate_password", unexpected)
+    api.monkeypatch.setattr(api.auth, "issue_session", unexpected)
+    api.monkeypatch.setattr(api.main._auth_facade(), "get_session_context", unexpected)
+    api.monkeypatch.setattr(api.main._platform_admin_store(), "accept_invite", unexpected)
+    api.monkeypatch.setattr(api.main, "_accept_client_invite", unexpected)
+    api.browser.cookies.set(api.main.settings.auth_cookie_name, "stale-cookie", domain="dash.envidicy.kz", path="/")
+    response = api.browser.post(
+        path + suffix + "?password=discard-query-password&next=https://external.example.test&state=discard-state",
+        content=body, headers={"Content-Type": content_type},
+    )
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/api/backend/auth/envidicy/start?next=%2Fportal"
+    assert "discard" not in response.headers["location"]
+    assert "set-cookie" not in response.headers
+    assert api.browser.cookies.get(api.main.settings.auth_cookie_name) == "stale-cookie"
+    assert not api.exchange_calls and not api.authority_calls
+
+
+@pytest.mark.parametrize("path", ["/auth/password/login", "/auth/invites/accept"])
+def test_malformed_cutover_policy_returns_503_before_invalid_credentials_payload(api, path):
+    api.monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", "typo")
+    response = api.browser.post(path, content=b"not-json", headers={"Content-Type": "application/json"})
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "envidicy_cutover_configuration_invalid"
+    assert "location" not in response.headers and "set-cookie" not in response.headers
+
+
+def test_credential_redirect_does_not_replace_preflight_or_rate_limiting(api):
+    only_id(api)
+    api.monkeypatch.setattr(api.main, "settings", replace(
+        api.main.settings, auth_rate_limit_enabled=True, auth_rate_limit_auth_max_requests=1,
+    ))
+    assert api.browser.options("/auth/password/login").status_code == 204
+    assert api.browser.post("/auth/password/login", json={}).status_code == 303
+    throttled = api.browser.post("/auth/password/login", json={})
+    assert throttled.status_code == 429 and "location" not in throttled.headers
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/auth/password/login"), ("POST", "/auth/password/login/extra"),
+    ("POST", "/auth/internal/sessions/issue"), ("POST", "/auth/internal/facade/external/resolve"),
+    ("POST", "/auth/session/refresh"), ("POST", "/auth/logout"),
+    ("POST", "/auth/envidicy/logout"), ("POST", "/ad-accounts/sync/due"),
+])
+def test_credential_redirect_is_not_a_global_auth_policy(api, method, path):
+    only_id(api)
+    assert redirect_legacy_credentials(method, path) is False
+
+
+def test_default_dual_login_keeps_password_authentication_and_validation(api):
+    assert not redirect_legacy_credentials("POST", "/auth/password/login")
+    invalid = api.browser.post("/auth/password/login", content=b"not-json",
+                               headers={"Content-Type": "application/json"})
+    assert invalid.status_code == 422 and "location" not in invalid.headers
+    response = api.browser.post("/auth/password/login", json={
+        "email": api.legacy.email, "password": "test-local-password-123!",
+    })
+    assert response.status_code == 200, response.text
+    assert api.auth.validate_session(api.browser.cookies.get(api.main.settings.auth_cookie_name)).valid
+    assert not api.exchange_calls and not api.authority_calls
 
 
 @pytest.mark.parametrize("path", ["/auth/me", "/auth/csrf", "/clients", "/auth/internal/users"])
@@ -111,8 +187,32 @@ def test_internal_mint_and_dev_admin_bypass_are_closed(api):
 @pytest.mark.parametrize("intent", ["login", "link", "migrate"])
 def test_legacy_social_starts_are_closed_before_provider_access(api, intent):
     only_id(api)
-    response = api.browser.get("/auth/facebook/start", params={"intent": intent})
-    assert response.status_code == 410
+    def unexpected():
+        raise AssertionError("Closed social login must not load provider adapters")
+    api.monkeypatch.setattr(api.main, "_oauth_adapters", unexpected)
+    response = api.browser.get("/auth/facebook/start", params={"intent": intent,
+        "next": "/portal/reports?period=month#totals", "code": "discard-code", "state": "discard-state"})
+    assert response.status_code == 303
+    target = urlsplit(response.headers["location"])
+    assert target.path == "/api/backend/auth/envidicy/start"
+    assert parse_qs(target.query) == {"next": ["/portal/reports?period=month#totals"]}
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.parametrize("next_path", ["https://external.example.test", "//external.example.test",
+                                      "/auth/envidicy/start", "/x/%2e%2e/register", "/x/../api"])
+def test_closed_social_entry_rejects_unsafe_or_recursive_return(api, next_path):
+    only_id(api)
+    response = api.browser.get("/auth/facebook/start", params={"next": next_path})
+    assert response.status_code == 303
+    assert response.headers["location"] == "/api/backend/auth/envidicy/start?next=%2Fportal"
+
+
+def test_closed_social_entry_defaults_to_portal_without_forwarding_query(api):
+    only_id(api)
+    response = api.browser.get("/auth/facebook/start?email=discard-email&password=discard-password")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/api/backend/auth/envidicy/start?next=%2Fportal"
 
 
 def test_old_social_callback_consumes_state_without_exchange_or_session(api):
@@ -123,12 +223,18 @@ def test_old_social_callback_consumes_state_without_exchange_or_session(api):
             raise AssertionError("Legacy callback must not exchange after cutover")
     api.main.app.state.oauth_adapters["facebook"] = Adapter()
     nonce = "old-social-browser-nonce"
-    state = api.main._oauth_state_store().create_state(provider="facebook", next_path="/portal", nonce=nonce,
+    state = api.main._oauth_state_store().create_state(provider="facebook", next_path="/portal/reports?period=month#totals", nonce=nonce,
                                                        ttl_minutes=5)
     api.browser.cookies.set(api.main.settings.oauth_nonce_cookie_name, nonce, domain="dash.envidicy.kz", path="/")
     only_id(api)
     response = api.browser.get("/auth/facebook/callback", params={"state": state.state, "code": "old-code"})
-    assert response.status_code == 410, response.text
+    assert response.status_code == 303, response.text
+    target = urlsplit(response.headers["location"])
+    assert target.path == "/api/backend/auth/envidicy/start"
+    # The legacy OAuth state parser has always removed URL fragments.
+    assert parse_qs(target.query) == {"next": ["/portal/reports?period=month"]}
+    assert "old-code" not in response.headers["location"] and state.state not in response.headers["location"]
+    assert "set-cookie" not in response.headers
     assert not calls and not api.browser.cookies.get(api.main.settings.auth_cookie_name)
     replay = api.browser.get("/auth/facebook/callback", params={"state": state.state, "code": "old-code"})
     assert replay.status_code == 302 and "oauth_error=" in replay.headers["location"]
@@ -140,6 +246,32 @@ def test_provider_connect_does_not_accept_closed_human_session(api):
     response = api.browser.get("/auth/facebook/start", params={"intent": "connect"},
                                headers={"Authorization": "Bearer " + token})
     assert response.status_code == 401
+
+
+def test_pending_provider_connect_callback_is_not_reclassified_as_human_login(api):
+    token = local_token(api)
+    calls = []
+    class Adapter:
+        def fetch_identity(self, *_args):
+            calls.append(True)
+            raise AssertionError("A closed initiator cannot exchange provider codes")
+    api.main.app.state.oauth_adapters["facebook"] = Adapter()
+    nonce = "old-connect-browser-nonce"
+    next_path = api.main._with_oauth_connect_options(
+        "/portal", intent="connect", connect_mode="add", connection_key=None,
+        agency_id=None, client_id=None, meta_config_id=None,
+    )
+    state = api.main._oauth_state_store().create_state(
+        provider="facebook", next_path=next_path, nonce=nonce, ttl_minutes=5,
+        initiator_user_id=api.legacy.id,
+    )
+    api.browser.cookies.set(api.main.settings.oauth_nonce_cookie_name, nonce, domain="dash.envidicy.kz", path="/")
+    only_id(api)
+    response = api.browser.get("/auth/facebook/callback", params={"state": state.state, "code": "old-connect-code"},
+                               headers={"Authorization": "Bearer " + token})
+    assert response.status_code == 401 and "location" not in response.headers
+    assert not calls and "set-cookie" not in response.headers
+    assert api.auth.validate_session(token).valid
 
 
 def test_id_only_keeps_id_and_my_fail_closed_behavior(api):
@@ -174,7 +306,7 @@ def test_broken_id_configuration_never_reopens_legacy_login(api, failure):
     assert api.browser.get("/clients", headers={"Authorization": "Bearer " + token}).status_code in {401, 503}
     assert api.browser.post("/auth/password/login", json={
         "email": api.legacy.email, "password": "test-local-password-123!",
-    }).status_code in {410, 503}
+    }).status_code == (503 if failure == "bad_switch" else 303)
 
 
 def test_dedicated_metrics_and_cron_auth_survive_cutover(api):

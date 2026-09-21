@@ -19,7 +19,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.responses import Response
-from app.services.auth_cutover import enforce_session_origin, id_only_enabled, require_legacy_auth_enabled
+from app.services.auth_cutover import (
+    enforce_session_origin, id_only_enabled, redirect_legacy_credentials, require_legacy_auth_enabled,
+)
 
 
 def _utcnow() -> datetime:
@@ -921,6 +923,19 @@ async def auth_security_middleware(request: Request, call_next):
                     ),
                     headers={"Retry-After": str(decision.retry_after_seconds)},
                 ))
+
+    # Never parse, validate or forward old credentials after cutover. This gate
+    # is intentionally limited to public login/onboarding, not API auth errors.
+    try:
+        if redirect_legacy_credentials(method, path):
+            return finalize(_envidicy_entry_redirect())
+    except HTTPException as exc:
+        # Middleware runs outside FastAPI's HTTPException handler.
+        return finalize(JSONResponse(
+            status_code=exc.status_code,
+            content=_error_envelope(exc.status_code, exc.detail),
+            headers={"Cache-Control": "no-store"},
+        ))
 
     if settings.csrf_enforce_cookie_auth and method in {"POST", "PATCH", "PUT", "DELETE"}:
         csrf_exempt = {
@@ -4560,11 +4575,20 @@ def auth_refresh_session(request: Request, token: str = Depends(session_token)):
     return response
 
 
-from app.envidicy_routes import register_envidicy_routes
+from app.envidicy_routes import register_envidicy_routes, safe_next
 
 register_envidicy_routes(app, get_bridge=_envidicy_bridge, get_auth=_auth_store,
                         get_context=lambda token: _auth_facade().get_session_context(token),
                         settings=settings, set_csrf=_set_csrf_cookie)
+
+
+def _envidicy_entry_redirect(next_path: Optional[str] = None) -> RedirectResponse:
+    # 303 changes credential POST to GET; never forward its body or query.
+    return RedirectResponse(
+        "/api/backend/auth/envidicy/start?" + urlencode({"next": safe_next(next_path)}),
+        status_code=303,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
 
 
 @app.get(
@@ -4582,8 +4606,8 @@ def auth_oauth_start(
     agency_id: Optional[UUID] = Query(default=None),
     client_id: Optional[UUID] = Query(default=None),
 ):
-    if intent != "connect":
-        require_legacy_auth_enabled()
+    if intent != "connect" and id_only_enabled():
+        return _envidicy_entry_redirect(next_path if "next" in request.query_params else None)
     adapters = _oauth_adapters()
     adapter = adapters.get(provider)
     if not adapter:
@@ -4758,11 +4782,11 @@ def auth_oauth_callback(
         requested_client_id,
         requested_meta_config_id,
     ) = _extract_oauth_connect_options(consumed.next_path or "/")
-    if oauth_intent != "connect":
+    if oauth_intent != "connect" and id_only_enabled():
         # Consume old transactions, but never exchange their codes or create a
         # local user/session after cutover. Provider connection is a separate
         # authenticated operation, not a human-login fallback.
-        require_legacy_auth_enabled()
+        return _envidicy_entry_redirect(redirect_next)
     current_ctx = None
     if oauth_intent in {"connect", "link"}:
         current_token = _get_session_token(

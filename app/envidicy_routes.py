@@ -80,6 +80,8 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, get_context, settings
             enabled = False
         return JSONResponse({"enabled": enabled, "local_auth_enabled": local_auth_enabled,
                              "auto_login": enabled and (auto_login or id_only),
+                             "server_entry_ready": True,
+                             "session_cookie_name": settings.auth_cookie_name,
                              "login_url": "/api/backend/auth/envidicy/start", "my_url": MY_URL},
                             headers={"Cache-Control": "no-store"})
 
@@ -156,7 +158,10 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, get_context, settings
         # Only a fully validated My decision may trigger an external handoff.
         # Pilot exclusion, an unbound project and an outage remain local gates.
         confirmed_denial = authority.get("access_state") == "not_granted" and authority.get("redirect_to_my") is True
-        destination = MY_URL if confirmed_denial else next_path
+        # A public completion page checks that the browser actually accepted its
+        # session before entering a protected document. Otherwise server-side
+        # entry would loop through ID when cookies are blocked or rejected.
+        destination = MY_URL if confirmed_denial else "/login/success?" + urlencode({"next": next_path})
         response = finish(RedirectResponse(destination, status_code=303))
         # Revoke the old browser session only after a complete successful exchange.
         old_token = request.cookies.get(settings.auth_cookie_name)
@@ -189,7 +194,7 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, get_context, settings
             url = oidc.logout_url(cfg, state=transaction.state)
             response = remember(JSONResponse({"logout_url": url}), browser)
         except (oidc.EnvidicyOidcError, PilotConfigurationError):
-            response = JSONResponse({"logout_url": "/login"}, headers={"Cache-Control": "no-store"})
+            response = JSONResponse({"logout_url": "/login?logged_out=1"}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(settings.auth_cookie_name, path="/")
         response.delete_cookie(settings.csrf_cookie_name, path="/")
         return response
@@ -200,4 +205,4 @@ def register_envidicy_routes(app, *, get_bridge, get_auth, get_context, settings
         browser = request.cookies.get(TRANSACTION_COOKIE, "")
         if len(request.query_params.getlist("state")) != 1 or not OPAQUE.fullmatch(state) or not OPAQUE.fullmatch(browser) or not get_bridge().store.consume_transaction(state, browser, kind="logout"):
             return failed()
-        return finish(RedirectResponse("/login", status_code=303))
+        return finish(RedirectResponse("/login?logged_out=1", status_code=303))

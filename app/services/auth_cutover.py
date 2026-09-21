@@ -34,6 +34,19 @@ def auto_login_enabled(environment: Mapping[str, str] | None = None) -> bool:
     return _enabled("ENVIDICY_ID_AUTO_LOGIN_ENABLED", environment)
 
 
+def redirect_legacy_credentials(method: str, path: str) -> bool:
+    """Close only public human credential entry, before parsing its body.
+
+    Include slash variants so the router cannot return a body-preserving 307.
+    Internal session administration, logout and service auth are not entries.
+    """
+    return (
+        method == "POST"
+        and path.rstrip("/") in {"/auth/password/login", "/auth/invites/accept"}
+        and id_only_enabled()
+    )
+
+
 def require_legacy_auth_enabled() -> None:
     if id_only_enabled():
         raise HTTPException(status_code=410, detail={

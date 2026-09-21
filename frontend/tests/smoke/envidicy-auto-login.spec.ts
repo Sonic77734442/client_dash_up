@@ -219,10 +219,119 @@ for (const state of ["ready", "project_unlinked"]) {
     await page.goto("/portal/billing");
     await page.getByRole("button", { name: state === "ready" ? "Выйти" : "Выйти из Dash", exact: true }).click();
     await expect(page.getByText(/Автоматический вход приостановлен/)).toBeVisible();
-    await expect(page).toHaveURL(/\/login(?:\?|$)/);
+    await expect(page).toHaveURL(/\/login\?logged_out=1$/);
     expect(mock.starts).toHaveLength(0);
     await page.reload();
     await expect(page.getByText(/Автоматический вход приостановлен/)).toBeVisible();
+    expect(mock.starts).toHaveLength(0);
+  });
+}
+
+test("callback completion verifies a fresh session before restoring an ID deep link", async ({ page }) => {
+  let release: () => void = () => {};
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  const mock = await mockApi(page, { me: idSession(), meStatus: 200, beforeMe: () => waiting });
+  const next = "/portal/billing?period=30#spend";
+  await page.goto(`/login/success?${new URLSearchParams({ next })}`, { waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "Завершаем вход" })).toBeVisible();
+  await expect(page).toHaveURL(/\/login\/success\?/);
+  expect(mock.dataRequests).toBe(0);
+  release();
+  await expect(page.getByRole("navigation", { name: "Основная навигация" })).toBeVisible();
+  await expect(page).toHaveURL(/\/portal\/billing\?period=30#spend$/);
+  expect(mock.starts).toHaveLength(0);
+});
+
+test("callback without any cookie or sessionStorage remains terminal after reload and manual retry", async ({ page, context }) => {
+  await context.clearCookies();
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "sessionStorage", { configurable: true, get() { throw new Error("Storage blocked"); } });
+    Object.defineProperty(document, "cookie", { configurable: true, get() { return ""; }, set() {} });
+  });
+  const mock = await mockApi(page);
+  const terminal = `/login/success?${new URLSearchParams({ next: "/portal/billing?period=30" })}`;
+  mock.onStart = async (route) => route.fulfill({ status: 303, headers: { Location: terminal } });
+  await page.goto(terminal);
+  await expect(page.getByText(/Браузер не передал действующую сессию/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "Использовать прежний вход в Dash" })).toHaveCount(0);
+  expect(mock.starts).toHaveLength(0);
+  expect(mock.dataRequests).toBe(0);
+  await page.reload();
+  await expect(page.getByText(/Браузер не передал действующую сессию/)).toBeVisible();
+  expect(mock.starts).toHaveLength(0);
+  await page.getByRole("link", { name: "Войти через Envidicy ID" }).click();
+  await expect(page.getByText(/Браузер не передал действующую сессию/)).toBeVisible();
+  expect(mock.starts).toHaveLength(1);
+  await expect(page).toHaveURL(/\/login\/success\?/);
+});
+
+test("callback session outage stays on the terminal page and can recover through manual recheck", async ({ page }) => {
+  const mock = await mockApi(page, { meStatus: 503 });
+  await page.goto("/login/success?next=%2Fportal%2Fbilling");
+  await expect(page.getByRole("button", { name: "Повторить проверку сессии" })).toBeVisible();
+  await expect(page).toHaveURL(/\/login\/success\?/);
+  expect(mock.starts).toHaveLength(0);
+  mock.me = idSession();
+  mock.meStatus = 200;
+  await page.getByRole("button", { name: "Повторить проверку сессии" }).click();
+  await expect(page).toHaveURL(/\/portal\/billing$/);
+});
+
+test("legacy OAuth completion still restores its role-safe target while local auth is enabled", async ({ page }) => {
+  const me = idSession();
+  me.session.auth_source = "legacy";
+  const mock = await mockApi(page, { me, meStatus: 200, localAuth: true });
+  await page.goto("/login/success?next=%2Fportal%2Fbilling");
+  await expect(page.getByRole("navigation", { name: "Основная навигация" })).toBeVisible();
+  await expect(page).toHaveURL(/\/portal\/billing$/);
+  expect(mock.starts).toHaveLength(0);
+});
+
+test("callback completion rejects nested or encoded auth return loops", async ({ page }) => {
+  const mock = await mockApi(page, { me: idSession(), meStatus: 200 });
+  for (const next of ["/login/success?next=%2Fportal", "/portal/%2e%2e/auth/envidicy", "/%72egister"]) {
+    await page.goto(`/login/success?${new URLSearchParams({ next })}`);
+    await expect(page).toHaveURL(/\/portal$/);
+  }
+  expect(mock.starts).toHaveLength(0);
+});
+
+test("the explicit logout URL suppresses automatic login even without browser storage", async ({ page }) => {
+  await page.addInitScript(() => Object.defineProperty(window, "sessionStorage", { configurable: true, get() { throw new Error("Storage blocked"); } }));
+  const mock = await mockApi(page);
+  await page.goto("/login?logged_out=1");
+  await expect(page.getByRole("link", { name: "Войти через Envidicy ID" })).toBeVisible();
+  expect(mock.starts).toHaveLength(0);
+  await page.reload();
+  await expect(page.getByRole("link", { name: "Войти через Envidicy ID" })).toBeVisible();
+  expect(mock.starts).toHaveLength(0);
+});
+
+for (const state of ["ready", "project_unlinked"]) {
+  test(`failed logout from ${state === "ready" ? "the sidebar" : "the access gate"} preserves the session and offers a retry`, async ({ page }) => {
+    const mock = await mockApi(page, { me: idSession(state), meStatus: 200 });
+    let attempts = 0;
+    await page.route("**/api/backend/auth/logout", async (route) => {
+      attempts += 1;
+      if (attempts === 1) return route.fulfill({ status: 500, json: { error: { code: "internal_error" } } });
+      mock.me = null;
+      mock.meStatus = 401;
+      return route.fulfill({ status: 200, json: { status: "ok" } });
+    });
+    await page.goto("/portal/billing");
+    const logout = page.getByRole("button", { name: state === "ready" ? "Выйти" : "Выйти из Dash", exact: true });
+    await expect(logout).toBeEnabled();
+    await page.evaluate((key) => sessionStorage.setItem(key, "unchanged-on-failure"), ENVIDICY_AUTO_LOGIN_KEY);
+    await logout.click();
+    await expect(page.getByRole("alert")).toHaveText("Не удалось подтвердить выход из Dash. Повторите попытку.");
+    await expect(page).toHaveURL(/\/portal\/billing$/);
+    await expect(logout).toBeEnabled();
+    expect(mock.meStatus).toBe(200);
+    expect(mock.starts).toHaveLength(0);
+    expect(await page.evaluate((key) => sessionStorage.getItem(key), ENVIDICY_AUTO_LOGIN_KEY)).toBe("unchanged-on-failure");
+    await logout.click();
+    await expect(page).toHaveURL(/\/login\?logged_out=1$/);
+    expect(attempts).toBe(2);
     expect(mock.starts).toHaveLength(0);
   });
 }

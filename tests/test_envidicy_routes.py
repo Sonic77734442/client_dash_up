@@ -106,8 +106,17 @@ def start(api, next_path="/portal"):
 def login(api, next_path="/portal"):
     params, browser = start(api, next_path)
     response = api.browser.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "code-from-id"})
-    assert response.status_code == 303 and response.headers["location"] == next_path
+    assert_completed_return(response, next_path)
     return response, params, browser
+
+
+def assert_completed_return(response, destination):
+    location = urlsplit(response.headers["location"])
+    assert response.status_code == 303
+    assert not location.scheme and not location.netloc and not location.fragment
+    assert location.path == "/login/success"
+    # No OIDC code, state, token or identity is forwarded to the public page.
+    assert parse_qs(location.query) == {"next": [destination]}
 
 
 def csrf(api):
@@ -150,7 +159,8 @@ def test_callback_cannot_be_completed_from_a_different_browser(api):
         rejected = stranger.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "stolen-code"})
         assert "oauth_error=" in rejected.headers["location"] and not api.exchange_calls
         accepted = api.browser.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "correct-code"})
-        assert accepted.headers["location"] == "/portal" and len(api.exchange_calls) == 1
+        assert_completed_return(accepted, "/portal")
+        assert len(api.exchange_calls) == 1
     finally:
         stranger.close()
 
@@ -273,7 +283,7 @@ def test_invalid_callbacks_issue_no_session(api, problem):
 def test_login_next_cannot_escape_origin_or_loop_into_auth(api, next_path):
     params, _browser = start(api, next_path)
     result = api.browser.get("/auth/envidicy/callback", params={"state": params["state"][0], "code": "id-code"})
-    assert result.headers["location"] == "/portal"
+    assert_completed_return(result, "/portal")
 
 
 def test_feature_off_keeps_legacy_login_me_and_refresh_working_without_my(api):
@@ -295,7 +305,7 @@ def test_feature_off_keeps_legacy_login_me_and_refresh_working_without_my(api):
 @pytest.mark.parametrize("destination", ["/budgets?view=history#entries", "/reports/../portal/reports?view=history#entries"])
 def test_id_callback_preserves_safe_query_and_fragment(api, destination):
     response, _params, _browser = login(api, destination)
-    assert response.headers["location"] == destination
+    assert_completed_return(response, destination)
 
 
 @pytest.mark.parametrize("access,expected_status", [("ready", 200), ("not_granted", 403), ("project_unlinked", 403), ("context_unavailable", 503)])
@@ -431,7 +441,7 @@ def test_logout_requires_csrf_revokes_local_session_and_has_bound_one_time_callb
     browser = api.browser.cookies.get("ops_envidicy_tx")
     assert query["post_logout_redirect_uri"] == ["https://dash.envidicy.kz/api/backend/auth/envidicy/logout/callback"]
     accepted = api.browser.get("/auth/envidicy/logout/callback", params={"state": state})
-    assert accepted.headers["location"] == "/login"
+    assert accepted.headers["location"] == "/login?logged_out=1"
     api.browser.cookies.set("ops_envidicy_tx", browser, domain="dash.envidicy.kz", path="/")
     replay = api.browser.get("/auth/envidicy/logout/callback", params={"state": state})
     assert "oauth_error=" in replay.headers["location"]
@@ -442,7 +452,7 @@ def test_logout_still_revokes_cookie_session_when_id_configuration_breaks(api):
     token = api.browser.cookies.get(api.main.settings.auth_cookie_name)
     api.monkeypatch.setenv("ENVIDICY_ID_CLIENT_SECRET", "bad")
     response = api.browser.post("/auth/envidicy/logout", headers=csrf(api))
-    assert response.status_code == 200 and response.json()["logout_url"] == "/login"
+    assert response.status_code == 200 and response.json()["logout_url"] == "/login?logged_out=1"
     assert not api.auth.validate_session(token).valid
     assert api.browser.get("/auth/me").status_code == 401
 
@@ -555,6 +565,8 @@ def test_auto_login_config_is_opt_in_and_never_changes_legacy_policy(api, enable
     assert response.status_code == 200
     assert response.json()["enabled"] is enabled
     assert response.json()["auto_login"] is expected_auto
+    assert response.json()["server_entry_ready"] is True
+    assert response.json()["session_cookie_name"] == api.main.settings.auth_cookie_name
     assert response.json()["local_auth_enabled"] is (not id_only)
     assert response.headers["cache-control"] == "no-store"
     assert not api.authority_calls
@@ -569,7 +581,7 @@ def test_invalid_auto_login_policy_is_503_without_reopening_id_only_login(api, v
     assert "envidicy_cutover_configuration_invalid" in response.text
     assert api.browser.post("/auth/password/login", json={
         "email": api.legacy.email, "password": "test-local-password-123!",
-    }).status_code == 410
+    }).status_code == 303
 
 
 def test_callback_confirmed_my_denial_hands_off_to_fixed_my_url_with_short_id_session(api):

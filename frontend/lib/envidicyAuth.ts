@@ -4,7 +4,7 @@ import type { SessionContext } from "./types";
 export const ENVIDICY_START_PATH = "/api/backend/auth/envidicy/start";
 export const ENVIDICY_MY_URL = "https://my.envidicy.com/products";
 
-export function envidicyLoginPath(next?: string | null): string {
+export function safeEnvidicyReturnPath(next?: string | null): string {
   let destination = safeRelativePath(next, "/portal");
   try {
     let decoded = destination;
@@ -23,7 +23,11 @@ export function envidicyLoginPath(next?: string | null): string {
       || pathname === "/auth" || pathname.startsWith("/auth/")
       || pathname === "/api" || pathname.startsWith("/api/")) destination = "/portal";
   } catch { destination = "/portal"; }
-  return `${ENVIDICY_START_PATH}?${new URLSearchParams({ next: destination })}`;
+  return destination;
+}
+
+export function envidicyLoginPath(next?: string | null): string {
+  return `${ENVIDICY_START_PATH}?${new URLSearchParams({ next: safeEnvidicyReturnPath(next) })}`;
 }
 
 export function envidicyLoginEnabled(payload: unknown): boolean {

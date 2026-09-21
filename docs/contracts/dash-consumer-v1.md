@@ -52,7 +52,7 @@ below are backend paths; browser callers prefix them with `/api/backend`.
 | `GET /auth/envidicy/start` | Creates a browser-bound OIDC transaction, then redirects to ID. |
 | `GET /auth/envidicy/callback` | Consumes the transaction once, validates ID exchange, issues a Dash session and checks My before choosing the browser destination. |
 | `POST /auth/envidicy/logout` | Revokes the selected Dash session and returns `logout_url`; cookie authentication requires CSRF protection. |
-| `GET /auth/envidicy/logout/callback` | Consumes the logout transaction and redirects to `/login`. |
+| `GET /auth/envidicy/logout/callback` | Consumes the logout transaction and redirects to `/login?logged_out=1`, without automatic re-entry. |
 | `GET /auth/me` | Existing user/session response with additive ID authority context. |
 | `POST /auth/logout` | Existing local Dash logout remains available. |
 
@@ -63,6 +63,8 @@ The configuration response has these fields:
   "enabled": false,
   "auto_login": false,
   "local_auth_enabled": true,
+  "server_entry_ready": true,
+  "session_cookie_name": "ops_session",
   "login_url": "/api/backend/auth/envidicy/start",
   "my_url": "https://my.envidicy.com/products"
 }
@@ -82,9 +84,26 @@ entry switch defaults off and does not close legacy authentication. A missing
 `auto_login` field on an older backend keeps manual entry; malformed policy does
 not trigger authentication or restore local login.
 
-For an unauthenticated browser, opening Dash preserves the requested local path,
-query and fragment and starts the existing ID authorization flow after both
-session and policy checks complete. Existing valid sessions are not restarted.
+When `server_entry_ready` is true, protected document GET/HEAD requests check
+policy and session on the server. An unauthenticated request under automatic
+entry returns 303 through the existing same-origin OIDC entry, preserving its
+safe relative path and query. An HTTP request does not contain a URL fragment;
+client-initiated entry can still preserve a fragment. Existing valid sessions
+are not restarted. Static resources, API/service requests and OIDC callbacks
+are not intercepted by the document gate. Backend transport or policy errors
+produce a closed retry response, not a fresh authorization loop.
+
+`server_entry_ready` is a compatibility capability, not another environment
+switch. A new frontend preserves the older client entry behavior until its
+backend advertises this capability. `session_cookie_name` is non-secret metadata
+used to forward only the configured session cookie to the trusted API upstream.
+It is not a cookie value or proof of authentication.
+
+Except for a confirmed My denial, the ID callback returns through the public
+`/login/success?next=...` completion page. It checks the actual browser session
+before entering a protected document, so a rejected cookie stops at a manual
+retry instead of repeatedly returning to ID. The completion URL contains only
+the validated return path, never an OIDC code, state, identity or token.
 Login and registration belong to ID; Dash does not create a separate password
 registration flow or grant access to newly registered identities.
 
@@ -235,6 +254,16 @@ configuration returns HTTP 503.
 When ID-only is on, local human login/mint/refresh and old human sessions cannot
 bypass it. Dedicated service authentication remains separate. No change to the
 15-minute ID-session policy is required for these states.
+
+Closed public password/invite POST entry returns 303 to the same-origin ID start
+before parsing credentials or accepting an invite, including trailing-slash
+variants. The body and arbitrary query parameters are not forwarded. Ordinary
+legacy social login also hands off to ID without exchanging a provider code;
+already-issued callback transactions are consumed once. Authenticated provider
+connection, service credentials, logout and protected API 401/403 semantics
+remain separate. Internal legacy session minting remains closed, not redirected.
+No runtime switch default, database schema or identity mapping is changed by
+the document-entry implementation.
 
 The test-cohort configuration is `ENVIDICY_ID_PILOT_SUBJECTS`, a backend-only JSON
 array of exact verified ID subject strings under the fixed issuer. An absent
