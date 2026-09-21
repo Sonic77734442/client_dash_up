@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import { useAgencyContext } from "../hooks/useAgencyContext";
 import { useLocale } from "../hooks/useLocale";
@@ -250,6 +250,8 @@ export function AppSidebar({
   const isEnvidicySession = agencyContext.sessionContext?.auth_source === "envidicy_id";
   const envidicyBudgetPath = canManageEnvidicyBudgets(agencyContext.sessionContext) ? "/budgets" : "/portal/billing";
   const defaultApiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/backend";
+  const [logoutPending, setLogoutPending] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
   const tokenLoginEnabled = process.env.NEXT_PUBLIC_ENABLE_TOKEN_LOGIN === "true";
   const roleSubtitle =
     subtitle ||
@@ -262,6 +264,8 @@ export function AppSidebar({
       : "Рабочее пространство агентства");
 
   async function handleLogout() {
+    setLogoutPending(true);
+    setLogoutError("");
     try {
       const apiBase = resolveApiBase(defaultApiBase);
       const token = tokenLoginEnabled ? getSessionToken() : "";
@@ -271,20 +275,22 @@ export function AppSidebar({
       const csrfCookieName = process.env.NEXT_PUBLIC_CSRF_COOKIE_NAME || "ops_csrf";
       const csrfToken = readCookie(csrfCookieName);
       if (csrfToken) headers[csrfHeaderName] = csrfToken;
-      await fetch(`${apiBase}/auth/logout`, {
+      const response = await fetch(`${apiBase}/auth/logout`, {
         method: "POST",
         headers,
         credentials: "include",
       });
+      if (!response.ok) throw new Error("Session revocation failed");
     } catch {
-      // The local session must still be cleared when the backend is unavailable.
-    } finally {
-      suppressEnvidicyAutoLogin();
-      clearSessionToken();
-      localStorage.removeItem("ops_api_base");
-      window.dispatchEvent(new Event("ops-session-updated"));
-      window.location.replace("/login");
+      setLogoutError("Не удалось подтвердить выход из Dash. Повторите попытку.");
+      setLogoutPending(false);
+      return;
     }
+    suppressEnvidicyAutoLogin();
+    clearSessionToken();
+    try { localStorage.removeItem("ops_api_base"); } catch { /* Server revocation already succeeded. */ }
+    window.dispatchEvent(new Event("ops-session-updated"));
+    window.location.replace("/login?logged_out=1");
   }
 
   return (
@@ -370,10 +376,11 @@ export function AppSidebar({
       </nav>
 
       <div className="sidebar-footer role-sidebar-footer">
-        <button className="role-menu-item role-logout" onClick={() => void handleLogout()}>
+        <button className="role-menu-item role-logout" disabled={logoutPending} onClick={() => void handleLogout()}>
           <span className="role-menu-icon"><SidebarIcon name="logout" /></span>
           <span>{t(locale, "sidebar_logout", "Выйти")}</span>
         </button>
+        {logoutError && <p role="alert">{logoutError}</p>}
       </div>
     </aside>
   );

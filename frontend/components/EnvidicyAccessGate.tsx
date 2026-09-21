@@ -9,6 +9,7 @@ export function EnvidicyAccessGate({ issue, refresh, logout }: {
   logout: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
   const unavailable = issue === "context_unavailable";
   return (
     <main className="auth-outage-shell" role="status" aria-live="polite">
@@ -30,9 +31,13 @@ export function EnvidicyAccessGate({ issue, refresh, logout }: {
           }}>{busy ? "Проверяем…" : "Повторить проверку доступа"}</button>
           <button className="ghost-btn" type="button" disabled={busy} onClick={() => {
             setBusy(true);
-            void logout().finally(() => setBusy(false));
+            setLogoutError("");
+            void logout().catch(() => {
+              setLogoutError("Не удалось подтвердить выход из Dash. Повторите попытку.");
+            }).finally(() => setBusy(false));
           }}>Выйти из Dash</button>
         </div>
+        {logoutError && <p role="alert">{logoutError}</p>}
       </section>
     </main>
   );

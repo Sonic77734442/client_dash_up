@@ -18,16 +18,14 @@ export function useAuth(defaultApiBase: string) {
 
   const logout = useCallback(async () => {
     const apiBase = resolveApiBase(defaultApiBase);
-    try {
-      await fetchJson<{ status: string }>(apiBase, "/auth/logout", "", {
-        method: "POST",
-      });
-    } catch {
-      // noop
-    }
+    // Do not discard local session state until the server confirms revocation.
+    await fetchJson<{ status: string }>(apiBase, "/auth/logout", "", {
+      method: "POST",
+    });
     suppressEnvidicyAutoLogin();
     clearSessionToken();
     window.dispatchEvent(new Event(SESSION_UPDATED_EVENT));
+    window.location.replace("/login?logged_out=1");
   }, [defaultApiBase]);
 
   return { ready, authenticated, role, me, error, status, refresh, logout };

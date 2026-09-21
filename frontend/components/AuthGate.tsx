@@ -36,6 +36,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!ready) return;
+    // This callback terminal force-checks the actual session before any return or My handoff.
+    if (currentPath === "/login/success") return;
     if (!error && redirectToMy) {
       window.location.replace(ENVIDICY_MY_URL);
       return;
@@ -72,6 +74,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       router.replace(destinationForRole(currentRole));
     }
   }, [ready, authenticated, canManageLocalBudgets, currentPath, currentRole, envidicyIssue, error, isPublic, redirectToMy, roleAllowed, router]);
+
+  if (currentPath === "/login/success") return <>{children}</>;
 
   if (ready && redirectToMy && !error) {
     return <main className="auth-outage-shell" role="status">Открываем My для настройки доступа…</main>;

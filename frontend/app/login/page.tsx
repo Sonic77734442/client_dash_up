@@ -124,6 +124,10 @@ function LoginPageContent() {
   if (inviteToken) legacyParams.set("invite_token", inviteToken);
 
   useEffect(() => {
+    if (search.get("logged_out") === "1") {
+      setAutoLoginPaused(true);
+      return;
+    }
     if (!authReady || authenticated || authError || authStatus !== 401
       || policyState !== "ready" || !loginPolicy?.autoLogin
       || legacyRequested || search.has("oauth_error")) return;
