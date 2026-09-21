@@ -1,4 +1,4 @@
-"""Default-off cutover policy; isolated stores and no provider/ID network calls."""
+"""Production-forced/local-opt-in policy; isolated stores and no network calls."""
 from dataclasses import replace
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -29,6 +29,29 @@ def test_invalid_policy_fails_closed(value):
     assert error.value.status_code == 503
 
 
+@pytest.mark.parametrize("app_env", ["prod", "production", " Production "])
+@pytest.mark.parametrize("switch", [None, "false", "0", "off", "no", "true"])
+def test_production_forces_id_even_with_a_historical_false_switch(app_env, switch):
+    environment = {"APP_ENV": app_env}
+    if switch is not None:
+        environment["ENVIDICY_ID_ONLY_ENABLED"] = switch
+    assert id_only_enabled(environment) is True
+
+
+@pytest.mark.parametrize("value", ["", "treu", "enabled", "2"])
+def test_production_does_not_mask_a_malformed_switch(value):
+    with pytest.raises(HTTPException) as error:
+        id_only_enabled({"APP_ENV": "production", "ENVIDICY_ID_ONLY_ENABLED": value})
+    assert error.value.status_code == 503
+
+
+@pytest.mark.parametrize("app_env", ["development", "test", "staging", ""])
+def test_nonproduction_retains_default_off_and_explicit_opt_in(app_env):
+    assert id_only_enabled({"APP_ENV": app_env}) is False
+    assert id_only_enabled({"APP_ENV": app_env, "ENVIDICY_ID_ONLY_ENABLED": "false"}) is False
+    assert id_only_enabled({"APP_ENV": app_env, "ENVIDICY_ID_ONLY_ENABLED": "true"}) is True
+
+
 @pytest.mark.parametrize("value,expected", [("false", False), ("0", False), ("off", False), ("no", False),
                                            ("true", True), ("1", True), ("on", True), ("yes", True), (" TRUE ", True)])
 def test_auto_login_policy_is_explicit_and_default_off(value, expected):
@@ -49,6 +72,31 @@ def local_token(api):
 
 def only_id(api):
     api.monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", "true")
+
+
+def production_id(api):
+    api.monkeypatch.setenv("APP_ENV", "production")
+    api.monkeypatch.setenv("ENVIDICY_ID_ONLY_ENABLED", "false")
+    api.monkeypatch.setattr(api.main, "settings", replace(api.main.settings, app_env="production"))
+
+
+def test_production_readiness_rejects_legacy_even_when_old_switch_is_false(api):
+    token = local_token(api)
+    production_id(api)
+    api.monkeypatch.setenv("ENVIDICY_ID_AUTO_LOGIN_ENABLED", "false")
+    public = api.browser.get("/auth/envidicy/config")
+    assert public.status_code == 200
+    assert public.json()["enabled"] is True
+    assert public.json()["local_auth_enabled"] is False
+    assert public.json()["auto_login"] is True
+    assert public.json()["server_entry_ready"] is True
+    assert api.browser.post("/auth/password/login", json={}).status_code == 303
+    assert api.browser.post("/auth/invites/accept", json={}).status_code == 303
+    assert api.browser.get("/auth/me", headers={"Authorization": "Bearer " + token}).status_code == 401
+    assert api.browser.post("/auth/internal/sessions/issue", json={"user_id": str(api.legacy.id)}).status_code == 410
+    assert api.auth.get_user(api.legacy.id).role == "admin"
+    assert api.auth.validate_session(token).valid
+    assert not api.exchange_calls and not api.authority_calls
 
 
 @pytest.mark.parametrize("path,body", [
@@ -286,10 +334,11 @@ def test_id_only_keeps_id_and_my_fail_closed_behavior(api):
     assert api.browser.post("/auth/session/refresh", headers=csrf(api)).status_code == 401
 
 
+@pytest.mark.parametrize("production", [False, True])
 @pytest.mark.parametrize("failure", ["disabled", "bad_secret", "bad_switch"])
-def test_broken_id_configuration_never_reopens_legacy_login(api, failure):
+def test_broken_id_configuration_never_reopens_legacy_login(api, failure, production):
     token = local_token(api)
-    only_id(api)
+    production_id(api) if production else only_id(api)
     if failure == "disabled":
         api.monkeypatch.setenv("ENVIDICY_ID_ENABLED", "false")
     elif failure == "bad_secret":
@@ -309,9 +358,10 @@ def test_broken_id_configuration_never_reopens_legacy_login(api, failure):
     }).status_code == (503 if failure == "bad_switch" else 303)
 
 
-def test_dedicated_metrics_and_cron_auth_survive_cutover(api):
+@pytest.mark.parametrize("production", [False, True])
+def test_dedicated_metrics_and_cron_auth_survive_cutover(api, production):
     token = local_token(api)
-    only_id(api)
+    production_id(api) if production else only_id(api)
     api.monkeypatch.setattr(api.main, "settings", replace(api.main.settings, observability_public=False,
                                                         metrics_bearer_token="isolated-metrics-service"))
     assert api.browser.get("/metrics", headers={"Authorization": "Bearer " + token}).status_code == 404

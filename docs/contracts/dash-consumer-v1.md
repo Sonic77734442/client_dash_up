@@ -7,9 +7,9 @@ or credentials.
 
 ## Status and boundaries
 
-- ID login and My authority consumption are implemented behind default-off
-  switches. Implementation, local tests, deployment and production acceptance
-  are separate states.
+- Production requires ID-only human entry. Local development retains explicit
+  opt-in switches. Implementation, local tests, deployment and production
+  acceptance are separate states.
 - Confirmation of the deployed My provider contract is pending. The authority
   schema below is the schema Dash currently validates, not a claim that a
   particular My deployment already supplies it.
@@ -18,10 +18,10 @@ or credentials.
 - Preservation of all legacy admin, agency and solo-client capabilities through
   My roles is pending. The current ID scope is a single project/client scope;
   it is not a general role migration.
-- Deploy compatible preparation and test only with an explicitly admitted test
-  cohort before a separately reviewed real-user migration. Keep legacy login
-  enabled during that phase. A server-enforced cohort boundary is a pilot
-  precondition; hiding a login button or limiting My grants is insufficient.
+- Real-user identity migration is a separate reviewed operation; production
+  ID-only entry does not merge identities or infer access. Isolated test-only
+  pilots must use a server-enforced cohort boundary; hiding a login button or
+  limiting My grants is insufficient.
 
 ## Addresses and browser entry
 
@@ -242,15 +242,24 @@ Unsupported writes return HTTP 403 `envidicy_operation_not_available`.
 
 ## Deployment states and configuration
 
+`APP_ENV=prod` or `production` enforces ID-only human entry in source, including
+when an older deployment still has `ENVIDICY_ID_ONLY_ENABLED=false`. Missing or
+invalid ID readiness fails closed; it never reopens local login. There is no
+new secret or runtime switch for this production policy. The existing ID and
+My credentials must already be installed. Returning to dual login in production
+requires a reviewed compatible code rollback, not changing that historical flag.
+
+The following switch matrix applies to non-production development/test:
+
 | `ENVIDICY_ID_ENABLED` | `ENVIDICY_ID_ONLY_ENABLED` | State |
 | --- | --- | --- |
 | false | false | Compatible preparation; legacy login stays open. |
 | true | false | Dual-login pilot, only after server-side test-cohort admission is verified. |
-| true | true | Later ID-only cutover, only after migration and role/access acceptance. |
+| true | true | ID-only development/test entry. |
 | false | true | ID unavailable and local login still closed; no implicit fallback. |
 
-All login switches default off. Invalid ID-only or automatic-entry policy
-configuration returns HTTP 503.
+In non-production these switches default off. Invalid ID-only or automatic-entry
+policy configuration returns HTTP 503, including in production.
 When ID-only is on, local human login/mint/refresh and old human sessions cannot
 bypass it. Dedicated service authentication remains separate. No change to the
 15-minute ID-session policy is required for these states.
@@ -262,8 +271,8 @@ legacy social login also hands off to ID without exchanging a provider code;
 already-issued callback transactions are consumed once. Authenticated provider
 connection, service credentials, logout and protected API 401/403 semantics
 remain separate. Internal legacy session minting remains closed, not redirected.
-No runtime switch default, database schema or identity mapping is changed by
-the document-entry implementation.
+Production ID-only activation changes the human-entry policy only; database
+schema, identity mapping, My grants and session lifetime are unchanged.
 
 The test-cohort configuration is `ENVIDICY_ID_PILOT_SUBJECTS`, a backend-only JSON
 array of exact verified ID subject strings under the fixed issuer. An absent
@@ -381,7 +390,7 @@ entries, automatic projection removal or an old database restored over live data
 Existing local regression suites cover OIDC validation, transactions/replay,
 explicit identity/project binding, trusted session origin, 15-minute expiry,
 refresh rejection, My denial/outage/revocation, tenant boundaries, local-budget
-permissions and default-off/ID-only login behavior:
+permissions and development/production ID-only login behavior:
 
 - `tests/test_envidicy_oidc.py`
 - `tests/test_envidicy_bridge.py`

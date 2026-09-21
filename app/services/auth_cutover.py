@@ -1,8 +1,9 @@
-"""Default-off closure of legacy *human* authentication after verified cutover.
+"""Production ID-only policy for *human* authentication.
 
 This policy does not gate service credentials or provider API calls. Invalid
 configuration fails closed; an ID outage must never reopen local authentication.
-The rollout switch is independent of ID availability and authorization in My.
+Production cannot opt back into local login through a stale rollout switch.
+Non-production keeps the explicit, default-off switch for local development.
 """
 from __future__ import annotations
 
@@ -26,7 +27,11 @@ def _enabled(name: str, environment: Mapping[str, str] | None = None) -> bool:
 
 
 def id_only_enabled(environment: Mapping[str, str] | None = None) -> bool:
-    return _enabled("ENVIDICY_ID_ONLY_ENABLED", environment)
+    environment = os.environ if environment is None else environment
+    # Validate even when production forces ID, so an operator typo is visible.
+    configured = _enabled("ENVIDICY_ID_ONLY_ENABLED", environment)
+    production = str(environment.get("APP_ENV", "development")).strip().lower() in {"prod", "production"}
+    return production or configured
 
 
 def auto_login_enabled(environment: Mapping[str, str] | None = None) -> bool:
