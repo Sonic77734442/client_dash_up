@@ -323,7 +323,8 @@ for (const state of ["ready", "project_unlinked"]) {
     await expect(logout).toBeEnabled();
     await page.evaluate((key) => sessionStorage.setItem(key, "unchanged-on-failure"), ENVIDICY_AUTO_LOGIN_KEY);
     await logout.click();
-    await expect(page.getByRole("alert")).toHaveText("Не удалось подтвердить выход из Dash. Повторите попытку.");
+    await expect(page.getByRole("alert").filter({ hasText: "Не удалось подтвердить выход из Dash." }))
+      .toHaveText("Не удалось подтвердить выход из Dash. Повторите попытку.");
     await expect(page).toHaveURL(/\/portal\/billing$/);
     await expect(logout).toBeEnabled();
     expect(mock.meStatus).toBe(200);
